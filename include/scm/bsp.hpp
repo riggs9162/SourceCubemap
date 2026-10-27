@@ -7,6 +7,7 @@ namespace scm {
 struct Lump { uint32_t offset, length, version, uncompressed; };
 struct Probe { glm::ivec3 origin; uint32_t resolution; std::string name() const; };
 struct GameLump { uint16_t version; Bytes bytes; };
+void validateVtf(std::span<const std::byte> data, std::string_view name);
 
 class Bsp {
 public:
@@ -15,6 +16,7 @@ public:
     std::optional<GameLump> gameLump(uint32_t signature) const;
     Json inspect() const;
     void validateTextures() const;
+    void validateDestination(const fs::path& output, bool overwrite, bool inPlace) const;
     std::optional<Bytes> embedded(std::string_view name) const;
     void writeCubemaps(const std::map<std::string, Bytes>& textures, const fs::path& output, bool overwrite, bool inPlace) const;
     void verifyPreserved(const Bsp& source, const std::map<std::string, Bytes>& replacements = {}) const;
