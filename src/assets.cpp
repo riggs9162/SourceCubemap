@@ -159,8 +159,12 @@ MaterialDefinition readMaterial(Assets& assets, std::string name, bool hdr, unsi
         if (key == "proxies") { for (const auto& proxy : entry) { result.proxies.emplace_back(proxy.getKey()); } }
         else if (entry.getChildCount() == 0) { result.parameters[key] = std::string(entry.getValue()); }
         else if (key.ends_with("_dx6") || key.ends_with("_dx7") || key.ends_with("_dx8") || key == "<dx90") { continue; }
-        else if (key == ">=dx90" || key == ">=dx90_20b" || key == ">=dx95") {
-            for (const auto& child : entry) { result.parameters[lower(std::string(child.getKey()))] = std::string(child.getValue()); }
+        else if (key == ">=dx90" || key == ">=dx90_20b" || key == ">=dx95" || key == result.shader + "_dx9" || key == result.shader + "_dx90" || key == result.shader + "_dx95") {
+            for (const auto& child : entry) {
+                auto childKey = lower(std::string(child.getKey()));
+                if (childKey == "proxies") { for (const auto& proxy : child) { result.proxies.emplace_back(proxy.getKey()); } }
+                else { require(child.getChildCount() == 0, std::format("Unsupported nested material block '{}' in {}.", childKey, name)); result.parameters[childKey] = std::string(child.getValue()); }
+            }
         }
         else { throw Error(std::format("Unsupported material fallback block '{}' in {}.", key, name)); }
     }
