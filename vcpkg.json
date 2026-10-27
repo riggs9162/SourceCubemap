@@ -1,0 +1,6 @@
+{
+  "name": "sourcecubemap",
+  "version-semver": "0.1.0",
+  "builtin-baseline": "9126c6f1ff834e12372c5711ff3bdbca1921541c",
+  "dependencies": ["vulkan-headers", "volk", "vulkan-memory-allocator", "glm", "cli11", "spdlog", "nlohmann-json", "xxhash"]
+}

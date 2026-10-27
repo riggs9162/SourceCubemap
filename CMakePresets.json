@@ -1,0 +1,28 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}
+    }
+  ],
+  "buildPresets": [
+    {"name": "release", "configurePreset": "release", "jobs": 8},
+    {"name": "debug", "configurePreset": "debug", "jobs": 8}
+  ]
+}
