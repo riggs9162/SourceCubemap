@@ -4,6 +4,8 @@ SourceCubemap's own code is licensed under MIT. Build dependencies retain their 
 
 Direct dependencies include SourcePP (MIT), Vulkan headers (Apache-2.0), Volk (MIT), Vulkan Memory Allocator (MIT), GLM (MIT), CLI11 (BSD-3-Clause), spdlog (MIT), nlohmann/json (MIT), and xxHash (BSD-2-Clause). SourcePP additionally builds archive, compression, texture conversion, and model support libraries with their own notices. Distribution packages must retain the licenses of linked dependencies, including transitive dependencies; source downloads and vcpkg package directories contain their authoritative notices.
 
+The build downloads Microsoft's DirectX Shader Compiler v1.9.2609 with a verified SHA-256 hash. DXC is used at build time only; its upstream LLVM/Microsoft notices are included in the downloaded release. The executable runs precompiled SPIR-V and does not require DXC at runtime. A SPIR-V-capable local compiler can be selected with `SCM_DXC_EXECUTABLE`.
+
 Technical references:
 
 - [Valve Source SDK 2013](https://github.com/ValveSoftware/source-sdk-2013): BSP definitions, public VTF interface, cubemap naming and defaults, view rendering, lightmap conventions, and Source shader behavior. Its SDK license does not license this application's code. No Valve implementation is copied into the project.

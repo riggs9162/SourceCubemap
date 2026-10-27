@@ -6,11 +6,13 @@
 namespace scm {
 struct Lump { uint32_t offset, length, version, uncompressed; };
 struct Probe { glm::ivec3 origin; uint32_t resolution; std::string name() const; };
+struct GameLump { uint16_t version; Bytes bytes; };
 
 class Bsp {
 public:
     explicit Bsp(const fs::path& filename);
     Bytes lump(int index) const;
+    std::optional<GameLump> gameLump(uint32_t signature) const;
     Json inspect() const;
     void validateTextures() const;
     std::optional<Bytes> embedded(std::string_view name) const;

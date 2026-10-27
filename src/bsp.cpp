@@ -3,6 +3,7 @@
 #include <set>
 #include <vtfpp/VTF.h>
 #include <vpkpp/format/ZIP.h>
+#include <sourcepp/compression/LZMA.h>
 
 namespace scm {
 std::string Probe::name() const { return std::format("c{}_{}_{}", origin.x, origin.y, origin.z); }
@@ -68,10 +69,43 @@ std::optional<Bytes> Bsp::embedded(std::string_view name) const {
     return data;
 }
 
+std::optional<GameLump> Bsp::gameLump(uint32_t signature) const {
+    if (!lumps[35].length) { return {}; }
+    require(lumps[35].uncompressed == 0, "An outer-compressed game-lump directory is not supported.");
+    Reader file(bytes, "BSP game-lump payload"), directory(file.slice(lumps[35].offset, lumps[35].length), "game-lump directory");
+    auto count = directory.at<uint32_t>(0);
+    directory.slice(4, size_t(count) * 16);
+    std::optional<GameLump> result;
+    for (uint32_t i = 0; i < count; ++i) {
+        size_t entry = 4 + size_t(i) * 16;
+        if (directory.at<uint32_t>(entry) != signature) { continue; }
+        require(!result, "Duplicate game-lump signature.");
+        auto flags = directory.at<uint16_t>(entry + 4), version = directory.at<uint16_t>(entry + 6);
+        auto offset = directory.at<uint32_t>(entry + 8), length = directory.at<uint32_t>(entry + 12);
+        require(flags <= 1 && length <= (1u << 30), "Unsupported game-lump flags or size.");
+        size_t end = size_t(lumps[35].offset) + lumps[35].length;
+        if (i + 1 < count) { end = directory.at<uint32_t>(entry + 24); }
+        require(offset >= lumps[35].offset + 4 + size_t(count) * 16 && offset <= end && end <= size_t(lumps[35].offset) + lumps[35].length, "Game-lump offsets are outside their container.");
+        auto payload = file.slice(offset, flags ? end - offset : length);
+        if (flags) {
+            auto decoded = sourcepp::compression::decompressValveLZMA(payload);
+            require(decoded && decoded->size() == length, "Game-lump decompression failed.");
+            result = GameLump{version, std::move(*decoded)};
+        } else { require(length <= end - offset, "Game lumps overlap."); result = GameLump{version, Bytes(payload.begin(), payload.end())}; }
+    }
+    return result;
+}
+
 Json Bsp::inspect() const {
     Json result{{"path", path.string()}, {"version", 20}, {"bytes", bytes.size()}, {"map_revision", source->getMapRevision()}, {"pak_entries", pakNames.size()}, {"has_ldr", lumps[8].length != 0}, {"has_hdr", lumps[53].length != 0}, {"probes", Json::array()}, {"lumps", Json::array()}};
     for (const auto& p : probes) { result["probes"].push_back({{"name", p.name()}, {"origin", {p.origin.x, p.origin.y, p.origin.z}}, {"resolution", p.resolution}}); }
     for (size_t i = 0; i < lumps.size(); ++i) { const auto& l = lumps[i]; if (l.length) { result["lumps"].push_back({{"id", i}, {"offset", l.offset}, {"bytes", l.length}, {"version", l.version}, {"uncompressed_bytes", l.uncompressed}}); } }
+    if (auto props = gameLump(0x73707270)) {
+        Reader reader(props->bytes, "static props"); auto count = reader.take<uint32_t>(); Json models = Json::array();
+        for (uint32_t i = 0; i < count; ++i) { models.push_back(reader.string(reader.cursor, 128)); reader.cursor += 128; }
+        auto leaves = reader.take<uint32_t>(); reader.slice(reader.cursor, size_t(leaves) * 2); reader.cursor += size_t(leaves) * 2;
+        result["static_props"] = {{"version", props->version}, {"models", models}, {"instances", reader.take<uint32_t>()}};
+    }
     return result;
 }
 
