@@ -20,7 +20,7 @@ struct Vertex {
 };
 enum MaterialFlags : uint32_t {
     Unlit = 1, Blend = 2, AlphaTest = 4, NormalMap = 8, BumpLight = 16,
-    SelfIllum = 32, Detail = 64, VertexLit = 128, Sky = 256
+    SelfIllum = 32, Detail = 64, VertexLit = 128, Sky = 256, VertexAlpha = 512, SSBump = 1024
 };
 struct Material {
     std::string name;
@@ -30,12 +30,15 @@ struct Material {
     glm::vec4 tint{1};
     float alphaReference = 0.5f, detailScale = 4, detailFactor = 1;
     int detailMode = 0;
-    bool translucent = false, additive = false, noCull = false;
+    bool translucent = false, additive = false, noCull = false, noFog = false;
 };
 struct Draw {
     uint32_t firstIndex = 0, indexCount = 0, material = 0;
     std::array<uint32_t, 4> lightmaps{};
     bool skyWorld = false, skyBox = false;
+    std::vector<uint64_t> visibility;
+    glm::vec3 center{};
+    float radius = 0;
 };
 struct Scene {
     std::vector<Vertex> vertices;
@@ -43,13 +46,16 @@ struct Scene {
     std::vector<Material> materials;
     std::vector<Image> images;
     std::vector<Draw> draws;
+    std::vector<Probe> probes;
     glm::vec3 skyOrigin{};
     float skyScale = 0;
     glm::vec3 fogColor{};
     float fogStart = 0, fogEnd = 0;
+    glm::vec3 skyFogColor{};
+    float skyFogStart = 0, skyFogEnd = 0;
     bool hdr = false;
     Json diagnostics;
 };
-struct SceneOptions { bool hdr = false; double time = 0; fs::path cache; bool useCache = true; bool experimental = false; };
+struct SceneOptions { bool hdr = false; double time = 0; fs::path cache; bool useCache = true; bool experimental = false; bool defaultSky = false; };
 Scene loadScene(const Bsp& bsp, Assets& assets, const SceneOptions& options);
 }
