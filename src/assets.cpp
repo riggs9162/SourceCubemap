@@ -109,12 +109,12 @@ std::shared_ptr<const Asset> Assets::get(std::string name, std::string_view requ
     throw Error(std::format("Missing asset '{}' requested by '{}'. Searched:\n  {}", name, requestedBy, searched));
 }
 Json Assets::report() const {
-    Json result{{"mounts", Json::array()}, {"resolved", Json::array()}};
+    Json result{{"mounts", Json::array()}, {"resolved", Json::array()}, {"unresolved_lookups", Json::array()}};
     for (const auto& source : sources) { result["mounts"].push_back(source.path.string()); }
     std::vector<std::string> names;
-    for (const auto& [name, value] : cache) { if (value) { names.push_back(name); } }
+    for (const auto& [name, value] : cache) { names.push_back(name); }
     std::sort(names.begin(), names.end());
-    for (const auto& name : names) { const auto& value = cache.at(name); result["resolved"].push_back({{"path", name}, {"source", value->origin}, {"hash", digest(value->bytes)}}); }
+    for (const auto& name : names) { const auto& value = cache.at(name); if (value) { result["resolved"].push_back({{"path", name}, {"source", value->origin}, {"hash", digest(value->bytes)}}); } else { result["unresolved_lookups"].push_back(name); } }
     return result;
 }
 std::string MaterialDefinition::value(std::string_view key, std::string fallback) const {

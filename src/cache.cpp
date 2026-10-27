@@ -4,7 +4,7 @@
 
 namespace scm {
 namespace {
-constexpr uint32_t cacheVersion = 9;
+constexpr uint32_t cacheVersion = 10;
 Json vector3(glm::vec3 value) { return {value.x, value.y, value.z}; }
 Json vector4(glm::vec4 value) { return {value.x, value.y, value.z, value.w}; }
 glm::vec3 read3(const Json& value) { return {value.at(0).get<float>(), value.at(1).get<float>(), value.at(2).get<float>()}; }
@@ -53,6 +53,7 @@ std::optional<Scene> readSceneCache(const fs::path& file, Assets& assets) {
         auto metadata = Json::parse(textOf(description));
         require(metadata.at("vertex_stride").get<size_t>() == sizeof(Vertex), "Cache vertex layout changed.");
         if (metadata.at("assets").at("mounts") != assets.report().at("mounts")) { return {}; }
+        for (const auto& dependency : metadata.at("assets").at("unresolved_lookups")) { if (assets.find(dependency.get<std::string>())) { return {}; } }
         for (const auto& dependency : metadata.at("assets").at("resolved")) {
             auto current = assets.find(dependency.at("path").get<std::string>());
             if (!current || current->origin != dependency.at("source").get<std::string>() || digest(current->bytes) != dependency.at("hash").get<std::string>()) { return {}; }
