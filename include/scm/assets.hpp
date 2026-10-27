@@ -12,7 +12,7 @@ public:
     std::shared_ptr<const Asset> find(std::string name);
     std::shared_ptr<const Asset> get(std::string name, std::string_view requestedBy);
     Json report() const;
-    void mount(const fs::path& path, bool required = true);
+    void mount(const fs::path& path, bool required = true, bool scanArchives = true);
 private:
     struct Mount { fs::path path; std::unique_ptr<vpkpp::PackFile> archive; };
     const Bsp& bsp;

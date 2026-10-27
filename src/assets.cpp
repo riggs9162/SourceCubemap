@@ -4,7 +4,7 @@
 #include <spdlog/spdlog.h>
 
 namespace scm {
-void Assets::mount(const fs::path& input, bool required) {
+void Assets::mount(const fs::path& input, bool required, bool scanArchives) {
     auto path = fs::absolute(input).lexically_normal();
     if (!fs::exists(path)) {
         require(!required, std::format("Mount does not exist: {}", path.string()));
@@ -14,6 +14,7 @@ void Assets::mount(const fs::path& input, bool required) {
     if (!mounted.insert(lower(path.string())).second) { return; }
     if (fs::is_directory(path)) {
         sources.push_back({path, {}});
+        if (!scanArchives) { return; }
         std::vector<fs::path> archives;
         for (const auto& entry : fs::directory_iterator(path)) {
             if (entry.is_regular_file() && lower(entry.path().filename().string()).ends_with("_dir.vpk")) { archives.push_back(entry.path()); }
@@ -41,23 +42,37 @@ Assets::Assets(const Bsp& map, const fs::path& game, const std::vector<std::stri
         std::sort(addons.begin(), addons.end());
         for (const auto& path : addons) { mount(path); }
     }
-    mount(game);
+    if (profile == "gmod") { mount(game); }
     auto infoText = textOf(readFile(game / "gameinfo.txt"));
     kvpp::KV1 info(infoText);
     require(info.getChildCount() != 0, "gameinfo.txt is empty or invalid.");
     for (const auto& entry : info[0]["FileSystem"]["SearchPaths"]) {
         auto type = lower(std::string(entry.getKey()));
-        if (type.find("game") == std::string::npos && type.find("mod") == std::string::npos) { continue; }
-        if (type.find("gamebin") != std::string::npos) { continue; }
+        std::set<std::string> identifiers;
+        size_t first = 0;
+        while (first < type.size()) { auto last = type.find('+', first); identifiers.insert(type.substr(first, last == std::string::npos ? last : last - first)); if (last == std::string::npos) { break; } first = last + 1; }
+        if (!identifiers.contains("game") && !identifiers.contains("mod")) { continue; }
         std::string value(entry.getValue());
         std::replace(value.begin(), value.end(), '\\', '/');
         fs::path resolved;
         if (value.starts_with("|gameinfo_path|")) { resolved = game / value.substr(15); }
         else if (value.starts_with("|all_source_engine_paths|")) { resolved = game.parent_path() / value.substr(25); }
         else { resolved = game.parent_path() / value; }
-        if (resolved.filename() == "*") { continue; }
+        if (resolved.filename() == "*") {
+            std::vector<fs::path> entries;
+            if (fs::is_directory(resolved.parent_path())) {
+                for (const auto& entry : fs::directory_iterator(resolved.parent_path())) {
+                    auto extension = lower(entry.path().extension().string()), stem = lower(entry.path().stem().string());
+                    bool chunk = stem.size() >= 4 && stem[stem.size() - 4] == '_' && std::all_of(stem.end() - 3, stem.end(), [](char value) { return value >= '0' && value <= '9'; });
+                    if (entry.is_directory() || (entry.is_regular_file() && ((extension == ".vpk" && !chunk) || extension == ".gma"))) { entries.push_back(entry.path()); }
+                }
+            }
+            std::sort(entries.begin(), entries.end());
+            for (const auto& entry : entries) { mount(entry); }
+            continue;
+        }
         if (resolved.extension() == ".vpk" && !fs::exists(resolved)) { resolved = resolved.parent_path() / (resolved.stem().string() + "_dir.vpk"); }
-        mount(resolved, false);
+        mount(resolved, false, false);
     }
     if (profile == "gmod" && fs::exists(game / "cfg/mount.cfg")) {
         auto text = textOf(readFile(game / "cfg/mount.cfg"));
@@ -96,7 +111,10 @@ std::shared_ptr<const Asset> Assets::get(std::string name, std::string_view requ
 Json Assets::report() const {
     Json result{{"mounts", Json::array()}, {"resolved", Json::array()}};
     for (const auto& source : sources) { result["mounts"].push_back(source.path.string()); }
-    for (const auto& [name, value] : cache) { if (value) { result["resolved"].push_back({{"path", name}, {"source", value->origin}, {"hash", digest(value->bytes)}}); } }
+    std::vector<std::string> names;
+    for (const auto& [name, value] : cache) { if (value) { names.push_back(name); } }
+    std::sort(names.begin(), names.end());
+    for (const auto& name : names) { const auto& value = cache.at(name); result["resolved"].push_back({{"path", name}, {"source", value->origin}, {"hash", digest(value->bytes)}}); }
     return result;
 }
 std::string MaterialDefinition::value(std::string_view key, std::string fallback) const {
@@ -125,7 +143,7 @@ MaterialDefinition readMaterial(Assets& assets, std::string name, bool hdr, unsi
             if (kind == "insert" || kind == "replace") {
                 for (const auto& entry : block) {
                     auto key = lower(std::string(entry.getKey()));
-                    if (kind == "insert" || result.parameters.contains(key)) { result.parameters[key] = std::string(entry.getValue()); }
+                    if ((kind == "insert" && !result.parameters.contains(key)) || (kind == "replace" && result.parameters.contains(key))) { result.parameters[key] = std::string(entry.getValue()); }
                 }
             }
         }
