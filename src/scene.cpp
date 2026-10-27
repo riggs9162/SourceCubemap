@@ -266,6 +266,7 @@ Scene Builder::build() {
     for (const auto& entity : bsp.entities) {
         if (entity["classname"].getValue() == "sky_camera") {
             require(scene.skyScale == 0, "Multiple 3D sky cameras are not supported.");
+            require(!visData.empty(), "A 3D skybox requires compiled visibility data for scene classification.");
             scene.skyOrigin = parseVector(entity["origin"].getValue());
             scene.skyScale = parseFloat(entity["scale"].getValue(), 16);
             require(scene.skyScale > 0 && parseVector(entity["angles"].getValue()) == glm::vec3(0), "3D sky cameras require a positive scale and zero rotation.");
