@@ -13,12 +13,14 @@ struct FragmentInput {
     [[vk::location(1)]] float2 lightUV : TEXCOORD1;
     [[vk::location(2)]] float4 color : COLOR0;
     [[vk::location(3)]] float blend : TEXCOORD2;
+    [[vk::location(4)]] float3 fogPosition : TEXCOORD3;
 };
 struct Constants {
     column_major float4x4 projection;
     float4 tint;
     float4 controls;
     uint4 flags;
+    float4 fog;
 };
 [[vk::push_constant]] Constants parameters;
 [[vk::binding(0)]] Texture2D<float4> baseTexture;
@@ -39,20 +41,27 @@ FragmentInput VSMain(VertexInput input) {
     output.lightUV = input.lightUV;
     output.color = input.color;
     output.blend = input.blend;
+    output.fogPosition = float3(output.position.xy, output.position.w);
     return output;
 }
 
 float4 PSMain(FragmentInput input) : SV_Target0 {
     uint flags = parameters.flags.x;
     float4 base = baseTexture.Sample(materialSampler, input.uv);
+    if ((flags & 512) != 0) { base.a *= input.color.a; }
     if ((flags & 2) != 0) { base = lerp(base, secondTexture.Sample(materialSampler, input.uv), saturate(input.blend)); }
-    if ((flags & 4) != 0) { clip(base.a - parameters.controls.x); }
+    if ((flags & 4) != 0) { clip(base.a * parameters.tint.a - parameters.controls.x); }
     float3 light = lightTexture.Sample(lightSampler, input.lightUV).rgb;
     if ((flags & 24) == 24) {
-        float3 normal = normalize(normalTexture.Sample(materialSampler, input.uv).xyz * 2 - 1);
-        float3 weights = saturate(float3(dot(normal, float3(0.81649658,0,0.57735027)), dot(normal, float3(-0.40824829,0.70710678,0.57735027)), dot(normal, float3(-0.40824829,-0.70710678,0.57735027))));
-        weights *= weights;
-        light = (weights.x * lightTexture1.Sample(lightSampler, input.lightUV).rgb + weights.y * lightTexture2.Sample(lightSampler, input.lightUV).rgb + weights.z * lightTexture3.Sample(lightSampler, input.lightUV).rgb) / max(dot(weights, 1), 0.00001);
+        float3 encoded = normalTexture.Sample(materialSampler, input.uv).xyz;
+        float3 weights = encoded;
+        if ((flags & 1024) == 0) {
+            float3 normal = normalize(encoded * 2 - 1);
+            weights = saturate(float3(dot(normal, float3(0.81649658,0,0.57735027)), dot(normal, float3(-0.40824829,0.70710678,0.57735027)), dot(normal, float3(-0.40824829,-0.70710678,0.57735027))));
+            weights *= weights;
+            weights /= max(dot(weights, 1), 0.00001);
+        }
+        light = weights.x * lightTexture1.Sample(lightSampler, input.lightUV).rgb + weights.y * lightTexture2.Sample(lightSampler, input.lightUV).rgb + weights.z * lightTexture3.Sample(lightSampler, input.lightUV).rgb;
     }
     if ((flags & 128) != 0) { light = input.color.rgb; }
     if ((flags & 1) != 0) { light = 1; }
@@ -62,5 +71,12 @@ float4 PSMain(FragmentInput input) : SV_Target0 {
     }
     float3 result = base.rgb * light;
     if ((flags & 32) != 0) { result = lerp(result, base.rgb, base.a); }
-    return float4(result * parameters.tint.rgb, base.a * parameters.tint.a);
+    if ((flags & 128) == 0) { result *= input.color.rgb; }
+    result *= parameters.tint.rgb;
+    if (parameters.flags.w != 0) {
+        float fogStart = asfloat(parameters.flags.z);
+        float factor = saturate((length(input.fogPosition) - fogStart) / (parameters.controls.w - fogStart));
+        result = lerp(result, parameters.fog.rgb, factor);
+    }
+    return float4(result, base.a * parameters.tint.a);
 }

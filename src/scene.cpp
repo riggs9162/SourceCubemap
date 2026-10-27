@@ -1,4 +1,5 @@
 #include <scm/scene.hpp>
+#include <scm/cache.hpp>
 #include <vtfpp/VTF.h>
 #include <mdlpp/mdlpp.h>
 #include <glm/gtc/matrix_transform.hpp>
@@ -48,6 +49,7 @@ class Builder {
 public:
     Builder(const Bsp& input, Assets& resolver, const SceneOptions& settings) : bsp(input), assets(resolver), options(settings) {
         scene.hdr = options.hdr;
+        scene.probes = bsp.probes;
         scene.images.push_back({"white", 1, 1, false, false, {glm::vec4(1)}});
         scene.images.push_back({"flat normal", 1, 1, false, false, {glm::vec4(0.5f, 0.5f, 1, 1)}});
         scene.diagnostics = {{"unsupported", Json::array()}, {"warnings", Json::array()}};
@@ -60,6 +62,7 @@ public:
         std::string key = name + (srgb ? ":srgb" : ":linear");
         if (textureIds.contains(key)) { return textureIds.at(key); }
         auto asset = assets.get(name, requester);
+        validateVtf(asset->bytes, name);
         vtfpp::VTF vtf(asset->bytes, false, options.hdr);
         require(static_cast<bool>(vtf), std::format("Invalid texture {}.", name));
         require(vtf.getFrameCount() == 1, std::format("Animated VTF is not supported yet: {}", name));
@@ -91,22 +94,30 @@ public:
         if (shader == "unlitgeneric" || shader == "sky" || painted) { material.flags |= Unlit; }
         if (shader == "worldvertextransition") { material.flags |= Blend; }
         if (shader == "vertexlitgeneric") { material.flags |= VertexLit; }
+        for (auto parameter : {"$bumpmap2", "$blendmodulatetexture", "$lightwarptexture", "$selfillummask", "$selfillumfresnel", "$seamless_scale", "$bumptransform", "$basetexturetransform2", "$detailtexturetransform"}) {
+            require(definition.value(parameter).empty() || definition.value(parameter) == "0", std::format("Material parameter '{}' is not implemented for '{}'.", parameter, name));
+        }
+        auto environment = definition.value("$envmap");
+        require(environment.empty() || lower(environment) == "env_cubemap" || assetPath(environment).starts_with("maps/"), std::format("Static environment textures are not implemented for '{}'. Only probe-driven reflection feedback can be suppressed.", name));
         auto base = definition.value(options.hdr ? "$hdrbasetexture" : "$basetexture");
         if (base.empty()) { base = definition.value("$basetexture"); }
         material.base = texture(base, true, name);
         material.second = texture(definition.value("$basetexture2"), true, name);
         if (!definition.value("$bumpmap").empty()) { material.normal = texture(definition.value("$bumpmap"), false, name); material.flags |= NormalMap; }
-        if (!definition.value("$detail").empty()) { material.detail = texture(definition.value("$detail"), true, name); material.flags |= Detail; }
+        if (!definition.value("$detail").empty()) { material.detail = texture(definition.value("$detail"), false, name); material.flags |= Detail; }
         if (definition.flag("$alphatest")) { material.flags |= AlphaTest; }
         if (definition.flag("$selfillum")) { material.flags |= SelfIllum; }
         material.translucent = definition.flag("$translucent"); material.additive = definition.flag("$additive"); material.noCull = definition.flag("$nocull");
+        material.noFog = definition.flag("$nofog");
+        if (definition.flag("$vertexalpha")) { material.flags |= VertexAlpha; material.translucent = true; }
         material.alphaReference = parseFloat(definition.value("$alphatestreference"), 0.5f);
         material.detailScale = parseFloat(definition.value("$detailscale"), 4);
         material.detailFactor = parseFloat(definition.value("$detailblendfactor"), 1);
         material.detailMode = static_cast<int>(parseFloat(definition.value("$detailblendmode"), 0));
         require(!(material.flags & Detail) || material.detailMode == 0, std::format("Detail blend mode {} is not implemented for {}.", material.detailMode, name));
         material.tint = glm::vec4(parseVector(definition.value("$color", definition.value("$color2")), glm::vec3(1)), parseFloat(definition.value("$alpha"), 1));
-        require(!definition.flag("$ssbump"), std::format("SSBump is not implemented for {}.", name));
+        if (definition.flag("$ssbump")) { require(material.flags & NormalMap, "SSBump requires a bump texture."); material.flags |= SSBump; }
+        require(definition.value("$selfillumtint").empty() || parseVector(definition.value("$selfillumtint")) == glm::vec3(1), std::format("Self-illumination tint is not implemented for '{}'.", name));
         if (definition.flag("$phong")) {
             require(options.experimental, std::format("Phong model shading is not implemented for {}. Use --experimental for diffuse-only model rendering.", name));
             scene.diagnostics["warnings"].push_back(std::format("{}: Phong specular is omitted in experimental rendering.", name));
@@ -196,13 +207,27 @@ public:
     SceneOptions options;
     Bytes nodesData, planeData, leafData, leafFaceData, visData, lightData;
     std::set<uint32_t> skyFaces;
+    int skyArea = -1;
     std::map<std::string, uint32_t> textureIds, materialIds;
     std::array<uint32_t, 4> pageIds{};
     uint32_t pageX = 0, pageY = 0, pageRow = 0;
 };
 
 Scene Builder::build() {
+    auto unsupported = [&](std::string message) { require(options.experimental, message + " Use --experimental to explicitly omit this feature."); scene.diagnostics["warnings"].push_back(std::move(message)); };
+    if (bsp.lumps[45].length) { unsupported("Compiled overlays are not rendered."); }
+    for (const auto& entity : bsp.entities) {
+        auto type = std::string(entity["classname"].getValue()), model = std::string(entity["model"].getValue());
+        bool runtimeModel = !model.empty() && model.front() != '*' && type != "worldspawn";
+        bool runtimeEffect = type == "move_rope" || type == "keyframe_rope" || type == "env_sprite" || type == "env_beam" || type == "env_smokestack" || type == "env_fire" || type == "info_particle_system";
+        if (runtimeModel || runtimeEffect) { unsupported(std::format("Runtime-dependent entity '{}' ({}) is not rendered.", type, model.empty() ? std::string(entity["origin"].getValue()) : model)); }
+    }
     require(bsp.lumps[7].version == 1 && bsp.lumps[10].version == 1, "Only face v1 and leaf v1 layouts are supported.");
+    if (options.hdr && bsp.lumps[58].length) { require(bsp.lumps[58].version == 1, "Unsupported HDR face layout."); }
+    for (auto [id, stride] : std::array<std::pair<int, size_t>, 17>{{{1,20},{2,32},{3,12},{5,32},{6,72},{12,4},{13,4},{14,48},{16,2},{26,176},{33,20},{37,10},{38,12},{39,2},{43,1},{44,4},{48,2}}}) {
+        require(bsp.lumps[id].version == 0 && bsp.lump(id).size() % stride == 0, std::format("Unsupported record version or stride in lump {}.", id));
+    }
+    require(bsp.lump(10).size() % 32 == 0, "Leaf data has a partial record.");
     auto faceData = bsp.lump(options.hdr && bsp.lumps[58].length ? 58 : 7);
     auto faces = records<bsppp::BSPFace_v1>(faceData, "faces");
     auto points = bsp.source->getLumpData<bsppp::BSPLump::VERTEXES>();
@@ -211,7 +236,24 @@ Scene Builder::build() {
     auto texInfo = bsp.source->getLumpData<bsppp::BSPLump::TEXINFO>();
     auto texData = bsp.source->getLumpData<bsppp::BSPLump::TEXDATA>();
     auto brushModels = bsp.source->getLumpData<bsppp::BSPLump::MODELS>();
-    require(brushModels.size() == 1, "Brush entities require initial-state reconstruction, which is not implemented yet.");
+    require(!brushModels.empty(), "The BSP has no world model.");
+    struct BrushState { glm::mat4 matrix{1}; glm::vec4 color{1}; bool hidden = false; };
+    std::vector<BrushState> brushStates(brushModels.size());
+    std::vector<uint32_t> faceModels(faces.size(), 0);
+    for (size_t m = 1; m < brushModels.size(); ++m) {
+        auto found = std::find_if(bsp.entities.begin(), bsp.entities.end(), [&](const auto& entity) { return entity["model"].getValue() == "*" + std::to_string(m); });
+        require(found != bsp.entities.end(), "A brush model has no corresponding entity.");
+        auto type = std::string((*found)["classname"].getValue());
+        auto& state = brushStates[m];
+        state.hidden = type.starts_with("trigger_") || type == "func_vehicleclip" || type == "func_clip_vphysics" || parseFloat((*found)["StartDisabled"].getValue()) != 0;
+        require(state.hidden || type == "func_brush" || type == "func_illusionary" || type == "func_wall" || type == "func_button" || type == "func_reflective_glass", std::format("Unsupported initial brush-entity behavior: {}", type));
+        require(state.hidden || (parseFloat((*found)["rendermode"].getValue()) == 0 && parseFloat((*found)["renderfx"].getValue()) == 0), "Brush-entity render effects are not implemented.");
+        state.matrix = transform(parseVector((*found)["origin"].getValue()), parseVector((*found)["angles"].getValue()));
+        state.color = glm::vec4(parseVector((*found)["rendercolor"].getValue(), glm::vec3(255)) / 255.0f, parseFloat((*found)["renderamt"].getValue(), 255) / 255.0f);
+        const auto& model = brushModels[m];
+        require(model.firstFace >= 0 && model.numFaces >= 0 && size_t(model.firstFace) + model.numFaces <= faces.size(), "Brush model face range is invalid.");
+        for (int i = 0; i < model.numFaces; ++i) { faceModels[model.firstFace + i] = static_cast<uint32_t>(m); }
+    }
     nodesData = bsp.lump(5); planeData = bsp.lump(1); leafData = bsp.lump(10); leafFaceData = bsp.lump(16); visData = bsp.lump(4);
     lightData = bsp.lump(options.hdr ? 53 : 8);
     require(!lightData.empty(), "Requested compiled lighting is missing.");
@@ -225,21 +267,57 @@ Scene Builder::build() {
             require(scene.skyScale == 0, "Multiple 3D sky cameras are not supported.");
             scene.skyOrigin = parseVector(entity["origin"].getValue());
             scene.skyScale = parseFloat(entity["scale"].getValue(), 16);
+            require(scene.skyScale > 0 && parseVector(entity["angles"].getValue()) == glm::vec3(0), "3D sky cameras require a positive scale and zero rotation.");
             skyFaces = visibleFaces(scene.skyOrigin);
+            skyArea = Reader(leafData, "sky leaf").at<uint16_t>(size_t(leafAt(scene.skyOrigin)) * 32 + 6) & 511;
+            if (parseFloat(entity["fogenable"].getValue()) != 0) {
+                scene.skyFogColor = parseVector(entity["fogcolor"].getValue()) / 255.0f;
+                scene.skyFogStart = parseFloat(entity["fogstart"].getValue()) / scene.skyScale;
+                scene.skyFogEnd = parseFloat(entity["fogend"].getValue()) / scene.skyScale;
+            }
+        } else if (entity["classname"].getValue() == "env_fog_controller" && parseFloat(entity["fogenable"].getValue()) != 0) {
+            require(scene.fogEnd == 0, "Multiple enabled fog controllers need runtime state selection.");
+            scene.fogColor = parseVector(entity["fogcolor"].getValue()) / 255.0f;
+            scene.fogStart = parseFloat(entity["fogstart"].getValue()); scene.fogEnd = parseFloat(entity["fogend"].getValue());
         }
     }
-    std::map<std::tuple<uint32_t, uint32_t, bool>, std::vector<uint32_t>> batches;
+    std::vector<std::set<uint32_t>> probeFaces;
+    for (const auto& probe : bsp.probes) { probeFaces.push_back(visibleFaces(glm::vec3(probe.origin))); }
+    std::set<uint32_t> referencedFaces;
+    Reader referenced(leafFaceData, "leaf face references");
+    for (size_t i = 0; i < leafFaceData.size(); i += 2) { referencedFaces.insert(referenced.at<uint16_t>(i)); }
+    std::map<std::vector<uint64_t>, uint32_t> visibilityIds;
+    std::vector<std::vector<uint64_t>> visibilityMasks;
+    std::map<std::tuple<uint32_t, uint32_t, bool, uint32_t>, std::vector<uint32_t>> batches;
     for (size_t faceIndex = 0; faceIndex < faces.size(); ++faceIndex) {
         const auto& face = faces[faceIndex];
+        const auto& brush = brushStates[faceModels[faceIndex]];
+        if (brush.hidden) { continue; }
         require(face.texInfo >= 0 && size_t(face.texInfo) < texInfo.size(), "Face references invalid texture information.");
         const auto& info = texInfo.at(face.texInfo);
         if (info.flags & (0x2 | 0x4 | 0x80 | 0x200)) { continue; }
+        bool inSkyWorld = skyFaces.contains(static_cast<uint32_t>(faceIndex));
+        if (face.dispInfo >= 0 && skyArea >= 0) {
+            auto point = disp.at<glm::vec3>(size_t(face.dispInfo) * 176);
+            point += planes.at<glm::vec3>(size_t(face.planeNum) * 20) * (face.side ? -64.0f : 64.0f);
+            auto area = Reader(leafData, "displacement leaf").at<uint16_t>(size_t(leafAt(point)) * 32 + 6) & 511;
+            inSkyWorld = area == skyArea;
+        }
+        std::vector<uint64_t> visible((bsp.probes.size() + 63) / 64);
+        bool anyVisible = false;
+        for (size_t p = 0; p < probeFaces.size(); ++p) {
+            if (faceModels[faceIndex] != 0 || inSkyWorld || !referencedFaces.contains(static_cast<uint32_t>(faceIndex)) || probeFaces[p].contains(static_cast<uint32_t>(faceIndex))) { visible[p / 64] |= uint64_t(1) << (p % 64); anyVisible = true; }
+        }
+        if (!anyVisible) { continue; }
+        auto [foundVisibility, insertedVisibility] = visibilityIds.emplace(visible, static_cast<uint32_t>(visibilityMasks.size()));
+        if (insertedVisibility) { visibilityMasks.push_back(visible); }
         const auto& tex = texData.at(info.textureData);
         uint32_t nameOffset = offsets.at<uint32_t>(size_t(tex.nameStringTableID) * 4);
         auto name = strings.string(nameOffset, stringsData.size() - nameOffset);
         auto materialIndex = material(name);
         const auto& mat = scene.materials[materialIndex];
         bool bumped = (info.flags & 0x800) != 0;
+        require(!(mat.flags & SSBump) || bumped, std::format("SSBump material '{}' has no directional lightmaps.", name));
         auto placement = lightmap(face, bumped);
         std::vector<glm::vec3> polygon;
         for (int i = 0; i < face.numEdges; ++i) {
@@ -251,7 +329,7 @@ Scene Builder::build() {
         auto normal = planes.at<glm::vec3>(size_t(face.planeNum) * 20) * (face.side ? -1.0f : 1.0f);
         auto makeVertex = [&](glm::vec3 position, glm::vec3 uvPosition, float alpha) {
             Vertex vertex;
-            vertex.position = position; vertex.normal = normal;
+            vertex.position = glm::vec3(brush.matrix * glm::vec4(position, 1)); vertex.normal = glm::mat3(brush.matrix) * normal;
             auto tangent = glm::normalize(glm::vec3(vec4(info.textureVector1)));
             vertex.tangent = glm::vec4(tangent, glm::dot(glm::cross(normal, tangent), glm::vec3(vec4(info.textureVector2))) < 0 ? -1 : 1);
             glm::vec4 homogeneous(uvPosition, 1);
@@ -260,6 +338,8 @@ Scene Builder::build() {
             auto luxel = glm::vec2(glm::dot(homogeneous, vec4(info.lightmapVector1)), glm::dot(homogeneous, vec4(info.lightmapVector2)));
             vertex.lightUV = (luxel - glm::vec2(face.lightmapTextureMinsInLuxels[0], face.lightmapTextureMinsInLuxels[1]) + placement.offset + 0.5f) / 1024.0f;
             vertex.blend = alpha;
+            vertex.color = brush.color;
+            if ((mat.flags & VertexAlpha) && face.dispInfo >= 0) { vertex.color.a *= alpha; }
             return vertex;
         };
         std::vector<Vertex> vertices;
@@ -312,23 +392,33 @@ Scene Builder::build() {
                 }
             }
         }
-        auto& batch = batches[{materialIndex, placement.images[0], skyFaces.contains(static_cast<uint32_t>(faceIndex))}];
+        auto& batch = batches[{materialIndex, placement.images[0], inSkyWorld, foundVisibility->second}];
         uint32_t base = static_cast<uint32_t>(scene.vertices.size());
         for (auto index : indices) { batch.push_back(base + index); }
         scene.vertices.insert(scene.vertices.end(), vertices.begin(), vertices.end());
     }
     for (auto& [key, indices] : batches) {
-        auto [materialIndex, page, sky] = key;
+        auto [materialIndex, page, sky, visibilityId] = key;
         Draw draw{static_cast<uint32_t>(scene.indices.size()), static_cast<uint32_t>(indices.size()), materialIndex, {page, page ? page + 1 : 0, page ? page + 2 : 0, page ? page + 3 : 0}, sky};
+        draw.visibility = visibilityMasks.at(visibilityId);
         scene.draws.push_back(draw);
         scene.indices.insert(scene.indices.end(), indices.begin(), indices.end());
     }
     addProps();
     addSky();
+    for (auto& draw : scene.draws) {
+        glm::vec3 minimum(std::numeric_limits<float>::max()), maximum(std::numeric_limits<float>::lowest());
+        for (uint32_t i = 0; i < draw.indexCount; ++i) { auto position = scene.vertices.at(scene.indices.at(draw.firstIndex + i)).position; minimum = glm::min(minimum, position); maximum = glm::max(maximum, position); }
+        draw.center = (minimum + maximum) * 0.5f; draw.radius = glm::length(maximum - minimum) * 0.5f;
+    }
     scene.diagnostics["vertices"] = scene.vertices.size();
     scene.diagnostics["triangles"] = scene.indices.size() / 3;
     scene.diagnostics["draws"] = scene.draws.size();
     scene.diagnostics["sky_world_faces"] = skyFaces.size();
+    glm::vec3 skyMinimum(std::numeric_limits<float>::max()), skyMaximum(std::numeric_limits<float>::lowest());
+    size_t skyTriangles = 0;
+    for (const auto& draw : scene.draws) { if (draw.skyWorld) { skyTriangles += draw.indexCount / 3; for (uint32_t i = 0; i < draw.indexCount; ++i) { auto position = scene.vertices[scene.indices[draw.firstIndex + i]].position; skyMinimum = glm::min(skyMinimum, position); skyMaximum = glm::max(skyMaximum, position); } } }
+    scene.diagnostics["sky_world"] = {{"triangles", skyTriangles}, {"minimum", {skyMinimum.x, skyMinimum.y, skyMinimum.z}}, {"maximum", {skyMaximum.x, skyMaximum.y, skyMaximum.z}}};
     return std::move(scene);
 }
 
@@ -429,7 +519,7 @@ void Builder::addProps() {
 void Builder::addSky() {
     auto info = bsp.source->getLumpData<bsppp::BSPLump::TEXINFO>();
     bool hasSky = std::any_of(info.begin(), info.end(), [](const auto& item) { return (item.flags & 6) != 0; });
-    if (!hasSky) { return; }
+    if (!hasSky && !options.defaultSky) { return; }
     std::string name;
     for (const auto& entity : bsp.entities) { if (entity["classname"].getValue() == "worldspawn") { name = entity["skyname"].getValue(); } }
     require(!name.empty(), "Sky surfaces exist but worldspawn has no skyname.");
@@ -457,5 +547,12 @@ void Builder::addSky() {
     }
 }
 }
-Scene loadScene(const Bsp& bsp, Assets& assets, const SceneOptions& options) { return Builder(bsp, assets, options).build(); }
+Scene loadScene(const Bsp& bsp, Assets& assets, const SceneOptions& options) {
+    auto key = sceneCacheKey(bsp, assets, options);
+    auto file = options.cache / "scenes" / (key + ".bin");
+    if (options.useCache && !options.cache.empty()) { if (auto scene = readSceneCache(file, assets)) { return std::move(*scene); } }
+    auto scene = Builder(bsp, assets, options).build(); scene.diagnostics["scene_cache_hit"] = false;
+    if (options.useCache && !options.cache.empty()) { try { writeSceneCache(file, scene, assets); } catch (const std::exception& error) { spdlog::warn("Scene cache write failed: {}", error.what()); } }
+    return scene;
+}
 }

@@ -15,6 +15,7 @@ struct RenderOptions {
     std::string device;
     std::string quality = "standard";
     fs::path shaderDirectory;
+    fs::path cacheDirectory;
 };
 class Renderer {
 public:
@@ -23,7 +24,7 @@ public:
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
     void prepare(const Scene& scene);
-    Cube capture(const Scene& scene, const Probe& probe);
+    Cube capture(const Scene& scene, const Probe& probe, bool skyOnly = false);
     Json statistics() const;
 private:
     struct Impl;

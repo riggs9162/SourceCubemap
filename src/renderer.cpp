@@ -1,4 +1,5 @@
 #include <scm/capture.hpp>
+#include <scm/cache.hpp>
 #include <volk.h>
 #define VMA_IMPLEMENTATION
 #define VMA_STATIC_VULKAN_FUNCTIONS 0
@@ -6,8 +7,10 @@
 #include <vk_mem_alloc.h>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <glm/gtc/packing.hpp>
 #include <spdlog/spdlog.h>
 #include <bit>
+#include <numeric>
 
 namespace scm {
 namespace {
@@ -15,8 +18,8 @@ void checked(VkResult result, std::string_view operation) { require(result == VK
 float linear(float value) { return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f); }
 struct Buffer { VkBuffer buffer{}; VmaAllocation allocation{}; void* mapping{}; VkDeviceSize size{}; };
 struct GpuImage { VkImage image{}; VmaAllocation allocation{}; VkImageView view{}; uint32_t mips = 1; };
-struct Push { glm::mat4 projection; glm::vec4 tint; glm::vec4 controls; glm::uvec4 flags; };
-static_assert(sizeof(Push) == 112);
+struct Push { glm::mat4 projection; glm::vec4 tint; glm::vec4 controls; glm::uvec4 flags; glm::vec4 fog; };
+static_assert(sizeof(Push) == 128);
 }
 
 struct Renderer::Impl {
@@ -35,6 +38,7 @@ struct Renderer::Impl {
     VkDescriptorPool descriptorPool{};
     VkPipelineLayout pipelineLayout{};
     VkPipelineCache pipelineCache{};
+    fs::path cacheFile;
     VkShaderModule vertexShader{}, fragmentShader{};
     VkSampler wrapSampler{}, clampSampler{};
     VkQueryPool queries{};
@@ -48,10 +52,19 @@ struct Renderer::Impl {
     uint32_t targetSize = 0;
     double gpuSeconds = 0;
     uint64_t captureCount = 0;
+    uint64_t drawCalls = 0, culledDraws = 0;
+    uint64_t textureUploadBytes = 0, uploadSubmissions = 0;
+    double uploadWaitSeconds = 0, uploadTotalSeconds = 0, pipelineSeconds = 0;
 
     explicit Impl(RenderOptions settings) : options(std::move(settings)) {}
     ~Impl() {
         if (device) { vkDeviceWaitIdle(device); }
+        if (device && pipelineCache && !cacheFile.empty()) {
+            try {
+                size_t count = 0; checked(vkGetPipelineCacheData(device, pipelineCache, &count, nullptr), "Read pipeline cache size");
+                if (count <= (64u << 20)) { Bytes data(count); checked(vkGetPipelineCacheData(device, pipelineCache, &count, data.data()), "Read pipeline cache"); data.resize(count); writeCacheFile(cacheFile, data); }
+            } catch (const std::exception& error) { spdlog::warn("Pipeline cache write failed: {}", error.what()); }
+        }
         releaseScene(); releaseTargets();
         for (auto [key, pipeline] : pipelines) { vkDestroyPipeline(device, pipeline, nullptr); }
         if (vertexShader) { vkDestroyShaderModule(device, vertexShader, nullptr); }
@@ -103,13 +116,15 @@ struct Renderer::Impl {
         VkImageView view{}; checked(vkCreateImageView(device, &info, nullptr, &view), "Create image view"); return view;
     }
     GpuImage makeImage(uint32_t width, uint32_t height, uint32_t layers, uint32_t mips, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect) {
+        require(width > 0 && height > 0 && width <= properties.limits.maxImageDimension2D && height <= properties.limits.maxImageDimension2D && layers <= properties.limits.maxImageArrayLayers, "Image dimensions exceed the GPU limits.");
         GpuImage result; result.mips = mips;
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         info.imageType = VK_IMAGE_TYPE_2D; info.format = format; info.extent = {width, height, 1};
         info.mipLevels = mips; info.arrayLayers = layers; info.samples = VK_SAMPLE_COUNT_1_BIT; info.tiling = VK_IMAGE_TILING_OPTIMAL; info.usage = usage;
         VmaAllocationCreateInfo allocation{}; allocation.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
         checked(vmaCreateImage(allocator, &info, &allocation, &result.image, &result.allocation, nullptr), "Create image");
-        result.view = makeView(result.image, format, aspect, 0, layers, mips);
+        try { result.view = makeView(result.image, format, aspect, 0, layers, mips); }
+        catch (...) { destroy(result); throw; }
         return result;
     }
     void begin() {
@@ -158,6 +173,14 @@ struct Renderer::Impl {
             if (score > best) { best = score; physical = candidate; properties = props; }
         }
         require(physical != VK_NULL_HANDLE, "No matching Vulkan 1.3 GPU is available.");
+        for (auto format : {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT}) {
+            VkFormatProperties support{}; vkGetPhysicalDeviceFormatProperties(physical, format, &support);
+            auto required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+            require((support.optimalTilingFeatures & required) == required, "GPU lacks the required floating-point texture filtering formats.");
+            if (format == VK_FORMAT_R32G32B32A32_SFLOAT) { require((support.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0, "GPU lacks floating-point capture targets."); }
+        }
+        VkFormatProperties depthSupport{}; vkGetPhysicalDeviceFormatProperties(physical, VK_FORMAT_D32_SFLOAT, &depthSupport);
+        require((depthSupport.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0, "GPU lacks D32 depth attachments.");
         VkPhysicalDeviceVulkan13Features supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; features.pNext = &supported;
         vkGetPhysicalDeviceFeatures2(physical, &features);
@@ -189,7 +212,20 @@ struct Renderer::Impl {
         VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Push)};
         VkPipelineLayoutCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; pipelineInfo.setLayoutCount = 1; pipelineInfo.pSetLayouts = &descriptorLayout; pipelineInfo.pushConstantRangeCount = 1; pipelineInfo.pPushConstantRanges = &push;
         checked(vkCreatePipelineLayout(device, &pipelineInfo, nullptr, &pipelineLayout), "Create pipeline layout");
-        VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO}; checked(vkCreatePipelineCache(device, &cacheInfo, nullptr, &pipelineCache), "Create pipeline cache");
+        Bytes cachedPipelines;
+        if (!options.cacheDirectory.empty()) {
+            std::string uuid; for (auto value : properties.pipelineCacheUUID) { uuid += std::format("{:02x}", value); }
+            cacheFile = options.cacheDirectory / "pipelines" / (uuid + ".bin");
+            try {
+                if (fs::exists(cacheFile) && fs::file_size(cacheFile) <= (64u << 20)) {
+                    cachedPipelines = readFile(cacheFile); Reader cache(cachedPipelines, "pipeline cache");
+                    bool valid = cachedPipelines.size() >= 32 && cache.at<uint32_t>(0) == 32 && cache.at<uint32_t>(4) == 1 && cache.at<uint32_t>(8) == properties.vendorID && cache.at<uint32_t>(12) == properties.deviceID && std::memcmp(cachedPipelines.data() + 16, properties.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+                    if (!valid) { cachedPipelines.clear(); }
+                }
+            } catch (const std::exception& error) { spdlog::warn("Ignoring pipeline cache: {}", error.what()); cachedPipelines.clear(); }
+        }
+        VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO}; cacheInfo.initialDataSize = cachedPipelines.size(); cacheInfo.pInitialData = cachedPipelines.data();
+        checked(vkCreatePipelineCache(device, &cacheInfo, nullptr, &pipelineCache), "Create pipeline cache");
         vertexShader = shader(options.shaderDirectory / "scene.vert.spv"); fragmentShader = shader(options.shaderDirectory / "scene.frag.spv");
         VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO}; sampler.magFilter = sampler.minFilter = VK_FILTER_LINEAR; sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR; sampler.maxLod = VK_LOD_CLAMP_NONE;
         sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
@@ -228,7 +264,8 @@ struct Renderer::Impl {
         VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
         VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; rendering.colorAttachmentCount = 1; rendering.pColorAttachmentFormats = &format; rendering.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}; info.pNext = &rendering; info.stageCount = 2; info.pStages = stages.data(); info.pVertexInputState = &vertex; info.pInputAssemblyState = &assembly; info.pViewportState = &viewport; info.pRasterizationState = &raster; info.pMultisampleState = &multisample; info.pDepthStencilState = &depthState; info.pColorBlendState = &blendState; info.pDynamicState = &dynamic; info.layout = pipelineLayout;
-        VkPipeline value{}; checked(vkCreateGraphicsPipelines(device, pipelineCache, 1, &info, nullptr, &value), "Create graphics pipeline"); pipelines.emplace(key, value); return value;
+        Stopwatch compiling;
+        VkPipeline value{}; checked(vkCreateGraphicsPipelines(device, pipelineCache, 1, &info, nullptr, &value), "Create graphics pipeline"); pipelineSeconds += compiling.seconds(); pipelines.emplace(key, value); return value;
     }
     void targets(uint32_t size) {
         if (targetSize == size) { return; }
@@ -250,17 +287,39 @@ struct Renderer::Impl {
         indices = makeBuffer(scene.indices.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true);
         std::memcpy(vertices.mapping, scene.vertices.data(), static_cast<size_t>(vertices.size)); std::memcpy(indices.mapping, scene.indices.data(), static_cast<size_t>(indices.size));
         checked(vmaFlushAllocation(allocator, vertices.allocation, 0, VK_WHOLE_SIZE), "Flush vertices"); checked(vmaFlushAllocation(allocator, indices.allocation, 0, VK_WHOLE_SIZE), "Flush indices");
-        for (const auto& source : scene.images) {
-            uint32_t mipCount = source.name.starts_with("lightmap-") ? 1 : std::bit_width(std::max(source.width, source.height));
-            auto image = makeImage(source.width, source.height, 1, mipCount, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
-            auto staging = makeBuffer(source.pixels.size() * sizeof(glm::vec4), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
-            auto* pixels = static_cast<glm::vec4*>(staging.mapping);
+        std::vector<Buffer> uploads;
+        uint64_t batchBytes = 0;
+        Stopwatch uploadTimer;
+        auto flushUploads = [&] { Stopwatch waiting; submit(); uploadWaitSeconds += waiting.seconds(); ++uploadSubmissions; for (auto& buffer : uploads) { destroy(buffer); } uploads.clear(); batchBytes = 0; };
+        try { for (const auto& source : scene.images) {
+            std::vector<glm::vec4> linearPixels(source.pixels.size());
+            bool halfPrecision = true;
             for (size_t i = 0; i < source.pixels.size(); ++i) {
-                pixels[i] = source.pixels[i];
-                if (source.srgb) { pixels[i].r = linear(pixels[i].r); pixels[i].g = linear(pixels[i].g); pixels[i].b = linear(pixels[i].b); }
+                auto pixel = source.pixels[i];
+                if (source.srgb) { pixel.r = linear(pixel.r); pixel.g = linear(pixel.g); pixel.b = linear(pixel.b); }
+                for (unsigned channel = 0; channel < 4; ++channel) {
+                    if (!std::isfinite(pixel[channel])) { throw Error(std::format("Texture '{}' contains non-finite pixels.", source.name)); }
+                    halfPrecision &= std::abs(pixel[channel]) <= 65504.0f;
+                }
+                linearPixels[i] = pixel;
+            }
+            uint32_t mipCount = source.name.starts_with("lightmap-") ? 1 : std::bit_width(std::max(source.width, source.height));
+            auto image = makeImage(source.width, source.height, 1, mipCount, halfPrecision ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+            images.push_back(image);
+            if (uploads.empty()) { begin(); }
+            auto staging = makeBuffer(source.pixels.size() * (halfPrecision ? sizeof(uint32_t) * 2 : sizeof(glm::vec4)), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+            uploads.push_back(staging); batchBytes += staging.size; textureUploadBytes += staging.size;
+            if (halfPrecision) {
+                auto* pixels = static_cast<uint32_t*>(staging.mapping);
+                for (size_t i = 0; i < linearPixels.size(); ++i) {
+                    pixels[i * 2] = glm::packHalf2x16(glm::vec2(linearPixels[i].r, linearPixels[i].g));
+                    pixels[i * 2 + 1] = glm::packHalf2x16(glm::vec2(linearPixels[i].b, linearPixels[i].a));
+                }
+            } else {
+                std::memcpy(staging.mapping, linearPixels.data(), static_cast<size_t>(staging.size));
             }
             checked(vmaFlushAllocation(allocator, staging.allocation, 0, VK_WHOLE_SIZE), "Flush texture staging");
-            begin(); barrier(image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, mipCount, 1);
+            barrier(image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, mipCount, 1);
             VkBufferImageCopy copy{}; copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; copy.imageExtent = {source.width, source.height, 1};
             vkCmdCopyBufferToImage(command, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
             for (uint32_t mip = 1; mip < mipCount; ++mip) {
@@ -272,8 +331,11 @@ struct Renderer::Impl {
                 barrier(image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, mip - 1);
             }
             barrier(image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, mipCount - 1);
-            submit(); destroy(staging); images.push_back(image);
+            if (batchBytes >= (128u << 20)) { flushUploads(); }
         }
+        if (!uploads.empty()) { flushUploads(); }
+        } catch (...) { vkDeviceWaitIdle(device); for (auto& buffer : uploads) { destroy(buffer); } throw; }
+        uploadTotalSeconds += uploadTimer.seconds();
         uint32_t count = static_cast<uint32_t>(scene.draws.size());
         std::array<VkDescriptorPoolSize, 2> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, count * 8}, {VK_DESCRIPTOR_TYPE_SAMPLER, count * 2}}};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; poolInfo.maxSets = count; poolInfo.poolSizeCount = 2; poolInfo.pPoolSizes = sizes.data();
@@ -295,7 +357,7 @@ struct Renderer::Impl {
             pipeline(key);
         }
     }
-    Cube capture(const Scene& scene, const Probe& probe) {
+    Cube capture(const Scene& scene, const Probe& probe, bool skyOnly) {
         uint32_t factor = options.quality == "high" ? 2 : 1;
         uint32_t size = probe.resolution * factor; targets(size);
         begin();
@@ -305,6 +367,8 @@ struct Renderer::Impl {
         const std::array<glm::vec3, 6> forward{{{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}};
         const std::array<glm::vec3, 6> up{{{0,1,0},{0,1,0},{0,0,-1},{0,0,1},{0,1,0},{0,1,0}}};
         auto projection = glm::perspectiveLH_ZO(glm::radians(90.f), 1.f, 1.f, 1000000.f); projection[1][1] *= -1;
+        auto probeFound = std::find_if(scene.probes.begin(), scene.probes.end(), [&](const auto& value) { return value.origin == probe.origin; });
+        size_t probeIndex = static_cast<size_t>(probeFound - scene.probes.begin());
         for (uint32_t face = 0; face < 6; ++face) {
             VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; colorAttachment.imageView = colorViews[face]; colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE; colorAttachment.clearValue.color = {{0,0,0,1}};
             VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; depthAttachment.imageView = depthViews[face]; depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; depthAttachment.clearValue.depthStencil.depth = 1;
@@ -314,22 +378,33 @@ struct Renderer::Impl {
             vkCmdSetViewport(command, 0, 1, &viewport); vkCmdSetScissor(command, 0, 1, &scissor);
             VkDeviceSize offset = 0; vkCmdBindVertexBuffers(command, 0, 1, &vertices.buffer, &offset); vkCmdBindIndexBuffer(command, indices.buffer, 0, VK_INDEX_TYPE_UINT32);
             for (unsigned pass = 0; pass < 3; ++pass) {
+                if (skyOnly && pass != 0) { continue; }
                 if (pass == 2) {
                     VkClearAttachment clear{}; clear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT; clear.clearValue.depthStencil.depth = 1;
                     VkClearRect rectangle{{{0,0},{size,size}},0,1}; vkCmdClearAttachments(command, 1, &clear, 1, &rectangle);
                 }
                 glm::vec3 origin = pass == 0 ? glm::vec3(0) : pass == 1 && scene.skyScale > 0 ? glm::vec3(probe.origin) / scene.skyScale + scene.skyOrigin : glm::vec3(probe.origin);
                 auto viewProjection = projection * glm::lookAtLH(origin, origin + forward[face], up[face]);
+                std::vector<uint32_t> order(scene.draws.size()); std::iota(order.begin(), order.end(), 0u);
+                std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { auto da = scene.draws[a].center - origin, db = scene.draws[b].center - origin; return glm::dot(da, da) > glm::dot(db, db); });
                 for (unsigned transparent = 0; transparent < 2; ++transparent) {
-                    for (uint32_t i = 0; i < scene.draws.size(); ++i) {
+                    for (uint32_t i : order) {
                         const auto& draw = scene.draws[i]; const auto& material = scene.materials[draw.material];
                         if ((draw.skyBox ? 0u : draw.skyWorld ? 1u : 2u) != pass || bool(transparent) != (material.translucent || material.additive)) { continue; }
+                        if (!draw.visibility.empty() && probeIndex < scene.probes.size() && !(draw.visibility.at(probeIndex / 64) & (uint64_t(1) << (probeIndex % 64)))) { ++culledDraws; continue; }
+                        auto relative = draw.center - origin;
+                        float z = glm::dot(relative, forward[face]), x = glm::dot(relative, glm::cross(up[face], forward[face])), y = glm::dot(relative, up[face]);
+                        if (!draw.skyBox && (z + draw.radius < 1 || std::abs(x) - z > draw.radius * 1.414214f || std::abs(y) - z > draw.radius * 1.414214f)) { ++culledDraws; continue; }
                         unsigned key = (material.translucent ? 1u : 0u) | (material.additive ? 2u : 0u) | (material.noCull ? 4u : 0u) | (draw.skyBox ? 8u : 0u);
                         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline(key));
                         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptors[i], 0, nullptr);
-                        Push push{viewProjection, material.tint, {material.alphaReference, material.detailFactor, material.detailScale, 0}, {material.flags | (draw.lightmaps[0] ? BumpLight : 0u), uint32_t(material.detailMode), 0, 0}};
+                        float fogStart = pass == 1 ? scene.skyFogStart : scene.fogStart, fogEnd = pass == 1 ? scene.skyFogEnd : scene.fogEnd;
+                        auto fogColor = pass == 1 ? scene.skyFogColor : scene.fogColor;
+                        bool fogEnabled = pass > 0 && !material.noFog && fogEnd > fogStart;
+                        Push push{viewProjection, material.tint, {material.alphaReference, material.detailFactor, material.detailScale, fogEnd}, {material.flags | (draw.lightmaps[0] ? BumpLight : 0u), uint32_t(material.detailMode), std::bit_cast<uint32_t>(fogStart), fogEnabled ? 1u : 0u}, {linear(fogColor.r), linear(fogColor.g), linear(fogColor.b), 1}};
                         vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
                         vkCmdDrawIndexed(command, draw.indexCount, 1, draw.firstIndex, 0, 0);
+                        ++drawCalls;
                     }
                 }
             }
@@ -361,6 +436,6 @@ struct Renderer::Impl {
 Renderer::Renderer(const RenderOptions& options) : impl(std::make_unique<Impl>(options)) { impl->initialize(); }
 Renderer::~Renderer() = default;
 void Renderer::prepare(const Scene& scene) { impl->prepare(scene); }
-Cube Renderer::capture(const Scene& scene, const Probe& probe) { return impl->capture(scene, probe); }
-Json Renderer::statistics() const { return {{"device", impl->properties.deviceName}, {"driver_version", impl->properties.driverVersion}, {"gpu_seconds", impl->gpuSeconds}, {"captures", impl->captureCount}, {"swapchain", false}}; }
+Cube Renderer::capture(const Scene& scene, const Probe& probe, bool skyOnly) { return impl->capture(scene, probe, skyOnly); }
+Json Renderer::statistics() const { return {{"device", impl->properties.deviceName}, {"driver_version", impl->properties.driverVersion}, {"gpu_seconds", impl->gpuSeconds}, {"captures", impl->captureCount}, {"draw_calls", impl->drawCalls}, {"culled_draws", impl->culledDraws}, {"texture_upload_bytes", impl->textureUploadBytes}, {"upload_submissions", impl->uploadSubmissions}, {"upload_total_seconds", impl->uploadTotalSeconds}, {"upload_wait_seconds", impl->uploadWaitSeconds}, {"pipeline_seconds", impl->pipelineSeconds}, {"swapchain", false}}; }
 }

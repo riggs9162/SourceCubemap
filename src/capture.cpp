@@ -157,6 +157,7 @@ Bytes encodeCube(const Cube& source, bool hdr) {
     auto outputFormat = hdr ? vtfpp::ImageFormat::RGBA16161616F : vtfpp::ImageFormat::DXT1;
     vtf.setFormat(outputFormat);
     auto result = vtf.bake();
+    validateVtf(result, "generated cubemap");
     vtfpp::VTF verified(result);
     require(static_cast<bool>(verified) && verified.getVersion() == 4 && verified.getFaceCount() == 7 && verified.getMipCount() == mipCount && verified.getFormat() == outputFormat, "Encoded VTF failed structural validation.");
     for (uint8_t mip = 0; mip < mipCount; ++mip) { for (uint8_t face = 0; face < 7; ++face) { require(!verified.getImageDataRaw(mip, 0, face).empty(), "Encoded VTF has an empty face or mip."); } }
