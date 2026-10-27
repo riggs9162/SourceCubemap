@@ -1,4 +1,4 @@
-param([ValidateSet('release', 'debug')][string]$Preset = 'release', [switch]$ConfigureOnly, [switch]$Fresh)
+param([ValidateSet('release', 'debug')][string]$Preset = 'release', [switch]$ConfigureOnly, [switch]$Fresh, [switch]$SkipConfigure)
 $ErrorActionPreference = 'Stop'
 $taskVswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 $taskVs = & $taskVswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -16,8 +16,10 @@ Push-Location (Split-Path $PSScriptRoot -Parent)
 try {
     $taskArguments = @('--preset', $Preset)
     if ($Fresh) { $taskArguments += '--fresh' }
-    & $taskCmake @taskArguments
-    if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed ($LASTEXITCODE)." }
+    if (!$SkipConfigure -or $ConfigureOnly -or $Fresh) {
+        & $taskCmake @taskArguments
+        if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed ($LASTEXITCODE)." }
+    }
     if (!$ConfigureOnly) {
         & $taskCmake --build --preset $Preset
         if ($LASTEXITCODE -ne 0) { throw "Compilation failed ($LASTEXITCODE)." }
