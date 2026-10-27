@@ -6,7 +6,7 @@ Recorded on 2026-10-28 using the installed Windows x64 GMod and HL2 assets. Thes
 
 The standalone executable built successfully with MSVC, CMake, Ninja, pinned vcpkg packages, pinned SourcePP, and pinned DXC. Its static executable imports Windows system libraries; Vulkan is loaded from the graphics driver. Generation does not launch a game or load engine binaries.
 
-Seventeen local automated cases passed. They cover malformed BSP/game-lump bounds, compressed geometry, signed/default-size probes, declared and explicit mount precedence, VMT patches and DX9 blocks, missing dependencies, input hardlinks, JSON report aliases, in-place backups, interior PAK preservation, unrelated asset/lump bytes, VTF truncation, capture orientation, default sky references, HDR radiance of 4.0, HDR edge/corner agreement, fallback spheremap content, and dependency/corruption cache invalidation. Tests and compiled fixtures remain locally ignored.
+Eighteen local automated cases passed. They cover malformed BSP/game-lump bounds, compressed geometry, signed/default-size probes, declared and explicit mount precedence, VMT patches and DX9 blocks, missing dependencies, input hardlinks, JSON report aliases, in-place backups, interior PAK preservation, unrelated asset/lump bytes, VTF truncation, capture orientation, default sky references, sky classification without visibility, HDR radiance of 4.0, HDR edge/corner agreement, fallback spheremap content, and dependency/corruption cache invalidation. Tests and compiled fixtures remain locally ignored; the accompanying test log records the results.
 
 Original `gm_flatgrass`, `gm_construct`, and `d1_trainstation_01` passed the production structural validator. A successful validation does not prove complete reconstruction or image parity.
 
@@ -19,7 +19,7 @@ Those sessions used copied maps and a temporary acceptance harness. The owned GM
 
 ## Performance measurements
 
-Hardware: AMD Ryzen 9 7900, 12 cores/24 threads; NVIDIA GeForce RTX 3050, 8 GB; NVIDIA driver 616.56. Standard quality, eight native 256-pixel probes, both LDR/HDR, 16 generated VTF textures per complete run. The GPU was shared with the user's running CS2 session. Cold-run samples reported 99% GPU utilization before generation and approximately 6.5 GiB already allocated. The benchmark source revision is `e69c342`. Subsequent changes add validation, report-path protection, VMT fallback parsing, and packaging; the capture renderer and Flatgrass shading remain unchanged.
+Hardware: AMD Ryzen 9 7900, 12 cores/24 threads; NVIDIA GeForce RTX 3050, 8 GB; NVIDIA driver 616.56. Standard quality, eight native 256-pixel probes, both LDR/HDR, 16 generated VTF textures per complete run. The GPU was shared with the user's running CS2 session. Cold-run samples reported 99% GPU utilization before generation and approximately 6.5 GiB already allocated. The benchmark source revision is `e69c342`. Subsequent changes add validation, report-path protection, VMT fallback parsing, negative-dependency cache checks, and packaging; the capture renderer and Flatgrass shading remain unchanged. The cache schema upgrade requires a fresh first build.
 
 | Mode | Runs | Median build time | p95 build time | Capture work |
 | --- | ---: | ---: | ---: | --- |
