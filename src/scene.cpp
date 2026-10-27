@@ -71,6 +71,7 @@ public:
         Image image;
         image.name = name;
         image.width = vtf.getWidth(); image.height = vtf.getHeight(); image.srgb = srgb && !floating;
+        require(uint64_t(image.width) * image.height * sizeof(glm::vec4) <= (1ull << 30), std::format("Decoded texture '{}' exceeds the 1 GiB limit.", name));
         image.clamp = (vtf.getFlags() & (vtfpp::VTF::FLAG_V0_CLAMP_S | vtfpp::VTF::FLAG_V0_CLAMP_T)) != 0;
         auto pixels = vtf.getImageDataAs(vtfpp::ImageFormat::RGBA32323232F);
         require(pixels.size() == size_t(image.width) * image.height * sizeof(glm::vec4), std::format("Failed to decode {}.", name));

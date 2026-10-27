@@ -17,6 +17,10 @@ struct Options {
     double captureTime = 0;
     unsigned runs = 3;
 };
+bool aliases(const scm::fs::path& first, const scm::fs::path& second) {
+    if (scm::fs::exists(first) && scm::fs::exists(second)) { return scm::fs::equivalent(first, second); }
+    return scm::lower(scm::fs::weakly_canonical(scm::fs::absolute(first)).generic_string()) == scm::lower(scm::fs::weakly_canonical(scm::fs::absolute(second)).generic_string());
+}
 scm::fs::path shaderDirectory() {
     std::wstring path(32768, L'\0');
     auto count = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
@@ -131,7 +135,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
     times["validation"] = validation.seconds();
     times["scene_and_asset_loading"] = assetsSeconds; times["gpu_preparation"] = prepareSeconds;
     times["rendering"] = renderSeconds; times["encoding"] = encodeSeconds; times["total"] = total.seconds();
-    return {{"output", scm::fs::absolute(output).string()}, {"map_namespace", *names.begin()}, {"probes", bsp.probes.size()}, {"textures_written", textures.size()}, {"timings_seconds", times}, {"renderer", renderer.statistics()}, {"scenes", scenes}, {"quality", options.quality}, {"capture_time", options.captureTime}, {"structural_validation", "pass"}, {"native_game_acceptance", "not_performed"}, {"reused_captures", reusedCaptures}, {"cache_mode", options.incremental ? "incremental" : "full_regeneration"}};
+    return {{"output", scm::fs::absolute(output).string()}, {"map_namespace", *names.begin()}, {"probes", bsp.probes.size()}, {"textures_written", textures.size()}, {"timings_seconds", times}, {"renderer", renderer.statistics()}, {"scenes", scenes}, {"quality", options.quality}, {"capture_time", options.captureTime}, {"experimental", options.experimental}, {"rendering_fidelity", options.experimental ? "experimental_approximations" : "supported_subset_not_certified"}, {"structural_validation", "pass"}, {"native_game_acceptance", "not_performed"}, {"reused_captures", reusedCaptures}, {"cache_mode", options.incremental ? "incremental" : "full_regeneration"}};
 }
 }
 
@@ -174,11 +178,13 @@ int main(int argc, char** argv) {
     benchmark->add_option("--runs", options.runs)->check(CLI::Range(1, 100));
     try {
         app.parse(argc, argv);
+        if (!options.report.empty()) { scm::require(!aliases(options.report, options.input), "The JSON report must not replace the input BSP."); }
         spdlog::set_level(options.verbose ? spdlog::level::debug : spdlog::level::info);
         scm::Json report;
         if (*generate) {
             auto output = options.output.empty() ? scm::fs::path(options.input).parent_path() / (scm::fs::path(options.input).stem().string() + "_built.bsp") : scm::fs::path(options.output);
             if (options.inPlace) { scm::require(options.output.empty(), "Use --in-place without --output."); output = options.input; }
+            if (!options.report.empty()) { scm::require(!aliases(options.report, output), "The JSON report and output BSP must use different paths."); }
             report = build(options, output);
         } else if (*benchmark) {
             scm::Json runs = scm::Json::array(); std::vector<double> seconds;

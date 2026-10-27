@@ -14,12 +14,13 @@ void validateVtf(std::span<const std::byte> data, std::string_view name) {
     require(minor <= 5 && header >= (minor >= 2 ? 65u : 64u) && header <= data.size(), std::format("Unsupported or truncated VTF header: {}", name));
     uint32_t width = reader.at<uint16_t>(16), height = reader.at<uint16_t>(18), frames = reader.at<uint16_t>(24), mips = reader.at<uint8_t>(56);
     uint32_t depth = minor >= 2 ? reader.at<uint16_t>(63) : 1;
-    require(width && height && frames && depth && mips && width <= 16384 && height <= 16384 && depth <= 2048 && frames <= 4096 && mips <= std::bit_width(std::max({width, height, depth})), std::format("Invalid VTF image dimensions: {}", name));
+    require(width && height && frames && depth && mips && width <= 16384 && height <= 16384 && depth <= 2048 && frames <= 4096 && mips <= uint32_t(std::bit_width(std::max({width, height, depth}))), std::format("Invalid VTF image dimensions: {}", name));
     auto format = static_cast<vtfpp::ImageFormat>(reader.at<uint32_t>(52));
     uint32_t faces = (reader.at<uint32_t>(20) & 0x4000) ? (minor < 5 && reader.at<uint16_t>(26) != 0xffff ? 7 : 6) : 1;
+    require(faces == 1 || depth == 1, "A VTF cubemap cannot also be a volume texture.");
     uint64_t required = 0;
     for (uint32_t mip = 0; mip < mips; ++mip) {
-        required += uint64_t(vtfpp::ImageFormatDetails::getDataLength(format, uint16_t(std::max(1u, width >> mip)), uint16_t(std::max(1u, height >> mip)), uint16_t(std::max(1u, depth >> mip)))) * faces * frames;
+        required += uint64_t(vtfpp::ImageFormatDetails::getDataLength(format, uint16_t(std::max(1u, width >> mip)), uint16_t(std::max(1u, height >> mip)))) * std::max(1u, depth >> mip) * faces * frames;
     }
     require(required > 0 && required <= (1ull << 30), std::format("Unsupported VTF format or image size: {}", name));
     uint64_t imageOffset = header, imageEnd = data.size();
@@ -37,6 +38,7 @@ void validateVtf(std::span<const std::byte> data, std::string_view name) {
         require(found, "VTF has no high-resolution image resource.");
         for (uint32_t i = 0; i < resources; ++i) {
             auto tag = reader.at<uint32_t>(80 + i * 8), offset = reader.at<uint32_t>(84 + i * 8);
+            require((tag & 0x02000000) || (offset >= header && offset < data.size()), "A VTF resource points outside its payload.");
             if (!(tag & 0x02000000) && offset > imageOffset) { imageEnd = std::min(imageEnd, uint64_t(offset)); }
         }
     } else {
