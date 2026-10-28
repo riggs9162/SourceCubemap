@@ -41,6 +41,7 @@ glm::vec2 transformedUV(glm::vec2 uv, std::string_view description) {
         else if (key == "rotate") { stream >> angle; }
         else if (key == "translate") { stream >> translation.x >> translation.y; }
         else { throw Error(std::format("Unsupported texture transform: {}", description)); }
+        require(!stream.fail() && std::isfinite(center.x) && std::isfinite(center.y) && std::isfinite(scale.x) && std::isfinite(scale.y) && std::isfinite(angle) && std::isfinite(translation.x) && std::isfinite(translation.y), std::format("Invalid texture transform: {}", description));
     }
     uv = (uv - center) * scale;
     float radians = glm::radians(angle);
