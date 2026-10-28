@@ -46,16 +46,26 @@ std::string assetPath(std::string value) {
 }
 std::string digest(std::span<const std::byte> bytes) { return std::format("{:016x}", XXH3_64bits(bytes.data(), bytes.size())); }
 glm::vec3 parseVector(std::string_view value, glm::vec3 fallback) {
+    if (value.empty()) { return fallback; }
     std::string input(value);
     for (char& c : input) { if (c == '[' || c == ']' || c == '{' || c == '}') { c = ' '; } }
     std::istringstream stream(input);
     glm::vec3 result;
-    if (!(stream >> result.x >> result.y >> result.z)) { return fallback; }
+    require(static_cast<bool>(stream >> result.x), std::format("Invalid vector: {}", value));
+    stream >> std::ws;
+    if (stream.eof()) { result.y = result.z = result.x; }
+    else { require(static_cast<bool>(stream >> result.y >> result.z), std::format("Invalid vector: {}", value)); stream >> std::ws; }
+    require(stream.eof() && std::isfinite(result.x) && std::isfinite(result.y) && std::isfinite(result.z), std::format("Invalid or nonfinite vector: {}", value));
     return result;
 }
 float parseFloat(std::string_view value, float fallback) {
     if (value.empty()) { return fallback; }
-    try { return std::stof(std::string(value)); } catch (...) { throw Error(std::format("Invalid number: {}", value)); }
+    std::istringstream stream{std::string(value)};
+    float result = 0;
+    require(static_cast<bool>(stream >> result) && std::isfinite(result), std::format("Invalid or nonfinite number: {}", value));
+    stream >> std::ws;
+    require(stream.eof(), std::format("Unexpected text after number: {}", value));
+    return result;
 }
 std::span<const std::byte> Reader::slice(size_t offset, size_t length) const {
     require(offset <= data.size() && length <= data.size() - offset, std::format("Out-of-bounds range in {}.", label));
