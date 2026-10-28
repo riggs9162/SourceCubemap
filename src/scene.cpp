@@ -296,14 +296,30 @@ Scene Builder::build() {
         require(found != bsp.entities.end(), "A brush model has no corresponding entity.");
         auto type = std::string((*found)["classname"].getValue());
         auto& state = brushStates[m];
-        state.hidden = type.starts_with("trigger_") || type == "func_vehicleclip" || type == "func_clip_vphysics" || parseFloat((*found)["StartDisabled"].getValue()) != 0;
+        state.hidden = type.starts_with("trigger_") || type == "func_vehicleclip" || type == "func_clip_vphysics" || type == "func_occluder" || type == "func_areaportal" || type == "func_areaportalwindow" || parseFloat((*found)["StartDisabled"].getValue()) != 0;
         bool door = type == "func_door" || type == "func_door_rotating";
-        require(!door || !(static_cast<int>(parseFloat((*found)["spawnflags"].getValue())) & 1), "Doors that start open require unsupported spawn transforms.");
         require(state.hidden || door || type == "func_brush" || type == "func_illusionary" || type == "func_wall" || type == "func_button" || type == "func_reflective_glass" || type == "func_breakable", std::format("Unsupported initial brush-entity behavior: {}", type));
         require(state.hidden || (parseFloat((*found)["rendermode"].getValue()) == 0 && parseFloat((*found)["renderfx"].getValue()) == 0), "Brush-entity render effects are not implemented.");
-        state.matrix = transform(parseVector((*found)["origin"].getValue()), parseVector((*found)["angles"].getValue()));
-        state.color = glm::vec4(parseVector((*found)["rendercolor"].getValue(), glm::vec3(255)) / 255.0f, parseFloat((*found)["renderamt"].getValue(), 255) / 255.0f);
+        auto origin = parseVector((*found)["origin"].getValue()), angles = parseVector((*found)["angles"].getValue());
         const auto& model = brushModels[m];
+        if (door) {
+            float flagsValue = parseFloat((*found)["spawnflags"].getValue()), spawn = parseFloat((*found)["spawnpos"].getValue());
+            require(flagsValue >= 0 && flagsValue <= 131071 && std::floor(flagsValue) == flagsValue && (spawn == 0 || spawn == 1), "Invalid initial door state.");
+            auto flags = static_cast<uint32_t>(flagsValue);
+            if ((flags & 1) || spawn == 1) {
+                require((*found)["parentname"].getValue().empty(), "A parented door starting open requires runtime parent transforms.");
+                if (type == "func_door_rotating") {
+                    unsigned axis = (flags & 64) ? 2 : (flags & 128) ? 0 : 1;
+                    angles[axis] += parseFloat((*found)["distance"].getValue()) * ((flags & 2) ? -1.0f : 1.0f);
+                } else {
+                    auto direction = glm::vec3(transform(glm::vec3(0), parseVector((*found)["movedir"].getValue())) * glm::vec4(1,0,0,0));
+                    auto size = vec3(model.max) - vec3(model.min);
+                    origin += direction * (glm::dot(glm::abs(direction), size) - parseFloat((*found)["lip"].getValue()));
+                }
+            }
+        }
+        state.matrix = transform(origin, angles);
+        state.color = glm::vec4(parseVector((*found)["rendercolor"].getValue(), glm::vec3(255)) / 255.0f, parseFloat((*found)["renderamt"].getValue(), 255) / 255.0f);
         require(model.firstFace >= 0 && model.numFaces >= 0 && size_t(model.firstFace) + model.numFaces <= faces.size(), "Brush model face range is invalid.");
         for (int i = 0; i < model.numFaces; ++i) { faceModels[model.firstFace + i] = static_cast<uint32_t>(m); }
     }
@@ -385,7 +401,7 @@ Scene Builder::build() {
             Vertex vertex;
             vertex.position = glm::vec3(brush.matrix * glm::vec4(position, 1)); vertex.normal = glm::mat3(brush.matrix) * normal;
             auto tangent = glm::normalize(glm::vec3(vec4(info.textureVector1)));
-            vertex.tangent = glm::vec4(tangent, glm::dot(glm::cross(normal, tangent), glm::vec3(vec4(info.textureVector2))) < 0 ? -1 : 1);
+            vertex.tangent = glm::vec4(glm::mat3(brush.matrix) * tangent, glm::dot(glm::cross(normal, tangent), glm::vec3(vec4(info.textureVector2))) < 0 ? -1 : 1);
             glm::vec4 homogeneous(uvPosition, 1);
             vertex.uv = {glm::dot(homogeneous, vec4(info.textureVector1)) / tex.width, glm::dot(homogeneous, vec4(info.textureVector2)) / tex.height};
             vertex.uv = transformedUV(vertex.uv, mat.definition.value("$basetexturetransform"));
