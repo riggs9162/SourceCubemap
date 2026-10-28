@@ -313,8 +313,9 @@ struct Renderer::Impl {
                 }
                 linearPixels[i] = pixel;
             }
-            uint32_t mipCount = source.name.starts_with("lightmap-") ? 1 : std::bit_width(std::max(source.width, source.height));
-            auto image = makeImage(source.width, source.height, 1, mipCount, halfPrecision ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+            uint32_t mipCount = source.mipCount;
+            require(mipCount > 0 && mipCount <= std::bit_width(std::max(source.width, source.height)), "Invalid scene texture mip count.");
+            auto image = makeImage(source.width, source.height, 1, mipCount, halfPrecision ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
             images.push_back(image);
             if (uploads.empty()) { begin(); }
             auto staging = makeBuffer(source.pixels.size() * (halfPrecision ? sizeof(uint32_t) * 2 : sizeof(glm::vec4)), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
@@ -330,17 +331,18 @@ struct Renderer::Impl {
             }
             checked(vmaFlushAllocation(allocator, staging.allocation, 0, VK_WHOLE_SIZE), "Flush texture staging");
             barrier(image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, mipCount, 1);
-            VkBufferImageCopy copy{}; copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; copy.imageExtent = {source.width, source.height, 1};
-            vkCmdCopyBufferToImage(command, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-            for (uint32_t mip = 1; mip < mipCount; ++mip) {
-                barrier(image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, mip - 1);
-                VkImageBlit blit{}; blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip - 1, 0, 1}; blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
-                blit.srcOffsets[1] = {int32_t(std::max(1u, source.width >> (mip - 1))), int32_t(std::max(1u, source.height >> (mip - 1))), 1};
-                blit.dstOffsets[1] = {int32_t(std::max(1u, source.width >> mip)), int32_t(std::max(1u, source.height >> mip)), 1};
-                vkCmdBlitImage(command, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
-                barrier(image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, mip - 1);
+            std::vector<VkBufferImageCopy> copies;
+            size_t pixelOffset = 0;
+            for (uint32_t mip = 0; mip < mipCount; ++mip) {
+                VkBufferImageCopy copy{}; copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+                copy.imageExtent = {std::max(1u, source.width >> mip), std::max(1u, source.height >> mip), 1};
+                copy.bufferOffset = pixelOffset * (halfPrecision ? 8 : sizeof(glm::vec4));
+                pixelOffset += size_t(copy.imageExtent.width) * copy.imageExtent.height;
+                copies.push_back(copy);
             }
-            barrier(image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, mipCount - 1);
+            require(pixelOffset == source.pixels.size(), "Scene texture pixels do not match its mip layout.");
+            vkCmdCopyBufferToImage(command, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(copies.size()), copies.data());
+            barrier(image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, mipCount, 1);
             if (batchBytes >= (128u << 20)) { flushUploads(); }
         }
         if (!uploads.empty()) { flushUploads(); }

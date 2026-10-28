@@ -4,7 +4,7 @@
 
 namespace scm {
 namespace {
-constexpr uint32_t cacheVersion = 14;
+constexpr uint32_t cacheVersion = 15;
 Json vector3(glm::vec3 value) { return {value.x, value.y, value.z}; }
 Json vector4(glm::vec4 value) { return {value.x, value.y, value.z, value.w}; }
 glm::vec3 read3(const Json& value) { return {value.at(0).get<float>(), value.at(1).get<float>(), value.at(2).get<float>()}; }
@@ -43,7 +43,7 @@ void writeSceneCache(const fs::path& file, const Scene& scene, const Assets& ass
         metadata["prop_lighting"].push_back(std::move(item));
     }
     for (const auto& draw : scene.draws) { metadata["draws"].push_back({{"first", draw.firstIndex}, {"count", draw.indexCount}, {"material", draw.material}, {"lightmaps", draw.lightmaps}, {"sky_world", draw.skyWorld}, {"sky_box", draw.skyBox}, {"visibility", draw.visibility}, {"center", vector3(draw.center)}, {"radius", draw.radius}, {"lighting", draw.lighting}}); }
-    for (const auto& image : scene.images) { metadata["images"].push_back({{"name", image.name}, {"width", image.width}, {"height", image.height}, {"srgb", image.srgb}, {"clamp", image.clamp}}); }
+    for (const auto& image : scene.images) { metadata["images"].push_back({{"name", image.name}, {"width", image.width}, {"height", image.height}, {"srgb", image.srgb}, {"clamp", image.clamp}, {"mips", image.mipCount}}); }
     for (const auto& probe : scene.probes) { metadata["probes"].push_back({{"origin", {probe.origin.x, probe.origin.y, probe.origin.z}}, {"resolution", probe.resolution}}); }
     Bytes payload; append(payload, std::span(scene.vertices)); append(payload, std::span(scene.indices));
     for (const auto& image : scene.images) { append(payload, std::span(image.pixels)); }
@@ -74,7 +74,11 @@ std::optional<Scene> readSceneCache(const fs::path& file, Assets& assets) {
         for (const auto& item : metadata.at("images")) {
             Image image; image.name = item.at("name"); image.width = item.at("width"); image.height = item.at("height"); image.srgb = item.at("srgb"); image.clamp = item.at("clamp");
             require(image.width > 0 && image.height > 0 && image.width <= 32768 && image.height <= 32768, "Invalid cached image dimensions.");
-            image.pixels = readArray<glm::vec4>(reader, size_t(image.width) * image.height); scene.images.push_back(std::move(image));
+            image.mipCount = item.at("mips");
+            require(image.mipCount > 0 && image.mipCount <= std::bit_width(std::max(image.width, image.height)), "Invalid cached image mip count.");
+            size_t count = 0;
+            for (uint32_t mip = 0; mip < image.mipCount; ++mip) { count += size_t(std::max(1u, image.width >> mip)) * std::max(1u, image.height >> mip); }
+            image.pixels = readArray<glm::vec4>(reader, count); scene.images.push_back(std::move(image));
         }
         require(reader.cursor == data.size(), "Unexpected bytes after cached scene data.");
         for (const auto& item : metadata.at("materials")) {

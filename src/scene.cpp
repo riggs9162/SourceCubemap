@@ -83,12 +83,17 @@ public:
         Image image;
         image.name = name;
         image.width = vtf.getWidth(); image.height = vtf.getHeight(); image.srgb = srgb && !floating;
-        require(uint64_t(image.width) * image.height * sizeof(glm::vec4) <= (1ull << 30), std::format("Decoded texture '{}' exceeds the 1 GiB limit.", name));
+        image.mipCount = vtf.getMipCount();
         image.clamp = (vtf.getFlags() & (vtfpp::VTF::FLAG_V0_CLAMP_S | vtfpp::VTF::FLAG_V0_CLAMP_T)) != 0;
-        auto pixels = vtf.getImageDataAs(vtfpp::ImageFormat::RGBA32323232F);
-        require(pixels.size() == size_t(image.width) * image.height * sizeof(glm::vec4), std::format("Failed to decode {}.", name));
-        image.pixels.resize(size_t(image.width) * image.height);
-        std::memcpy(image.pixels.data(), pixels.data(), pixels.size());
+        image.pixels.clear();
+        for (uint32_t mip = 0; mip < image.mipCount; ++mip) {
+            size_t count = size_t(std::max(1u, image.width >> mip)) * std::max(1u, image.height >> mip);
+            require((image.pixels.size() + count) * sizeof(glm::vec4) <= (1ull << 30), std::format("Decoded texture '{}' exceeds the 1 GiB limit.", name));
+            auto pixels = vtf.getImageDataAs(vtfpp::ImageFormat::RGBA32323232F, static_cast<uint8_t>(mip));
+            require(pixels.size() == count * sizeof(glm::vec4), std::format("Failed to decode mip {} of {}.", mip, name));
+            auto offset = image.pixels.size(); image.pixels.resize(offset + count);
+            std::memcpy(image.pixels.data() + offset, pixels.data(), pixels.size());
+        }
         uint32_t index = static_cast<uint32_t>(scene.images.size());
         scene.images.push_back(std::move(image));
         textureIds.emplace(key, index);

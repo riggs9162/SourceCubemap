@@ -8,6 +8,7 @@ struct Image {
     bool srgb = false;
     bool clamp = false;
     std::vector<glm::vec4> pixels{glm::vec4(1)};
+    uint32_t mipCount = 1;
 };
 struct Vertex {
     glm::vec3 position{};
