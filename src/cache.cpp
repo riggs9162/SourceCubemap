@@ -5,6 +5,31 @@
 namespace scm {
 namespace {
 constexpr uint32_t cacheVersion = 25;
+class CacheMapping {
+    struct Handle {
+        HANDLE value = nullptr;
+        ~Handle() { if (value && value != INVALID_HANDLE_VALUE) { CloseHandle(value); } }
+    } file, mapping;
+    struct View {
+        void* value = nullptr;
+        ~View() { if (value) { UnmapViewOfFile(value); } }
+    } view;
+public:
+    std::span<const std::byte> bytes;
+    explicit CacheMapping(const fs::path& path) {
+        file.value = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        require(file.value != INVALID_HANDLE_VALUE, "Cannot open the scene cache.");
+        LARGE_INTEGER length{};
+        require(GetFileSizeEx(file.value, &length) && length.QuadPart >= 12 && length.QuadPart <= (8ll << 30), "Scene cache size is outside the supported 12-byte to 8-GiB range.");
+        mapping.value = CreateFileMappingW(file.value, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        require(mapping.value != nullptr, "Cannot map the scene cache.");
+        view.value = MapViewOfFile(mapping.value, FILE_MAP_READ, 0, 0, 0);
+        require(view.value != nullptr, "Cannot access the mapped scene cache.");
+        bytes = {static_cast<const std::byte*>(view.value), static_cast<size_t>(length.QuadPart)};
+    }
+    CacheMapping(const CacheMapping&) = delete;
+    CacheMapping& operator=(const CacheMapping&) = delete;
+};
 Json vector3(glm::vec3 value) { return {value.x, value.y, value.z}; }
 Json vector4(glm::vec4 value) { return {value.x, value.y, value.z, value.w}; }
 glm::vec3 read3(const Json& value) { return {value.at(0).get<float>(), value.at(1).get<float>(), value.at(2).get<float>()}; }
@@ -63,9 +88,10 @@ void writeSceneCache(const fs::path& file, const Scene& scene, const Assets& ass
 std::optional<Scene> readSceneCache(const fs::path& file, Assets& assets) {
     if (!fs::exists(file)) { return {}; }
     try {
-        auto data = readFile(file); Reader reader(data, "scene cache");
+        CacheMapping mapped(file); auto data = mapped.bytes; Reader reader(data, "scene cache");
         if (reader.take<uint32_t>() != 0x434d4353 || reader.take<uint32_t>() != cacheVersion) { return {}; }
         auto descriptionLength = reader.take<uint32_t>();
+        require(descriptionLength <= (64u << 20), "Scene cache metadata exceeds the 64 MiB limit.");
         auto description = reader.slice(reader.cursor, descriptionLength); reader.cursor += descriptionLength;
         auto metadata = Json::parse(textOf(description));
         require(metadata.at("vertex_stride").get<size_t>() == sizeof(Vertex), "Cache vertex layout changed.");
