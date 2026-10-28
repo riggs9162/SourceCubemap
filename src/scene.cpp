@@ -260,7 +260,7 @@ Scene Builder::build() {
     for (const auto& entity : bsp.entities) {
         auto type = std::string(entity["classname"].getValue()), model = std::string(entity["model"].getValue());
         bool runtimeModel = !model.empty() && model.front() != '*' && type != "worldspawn";
-        bool runtimeEffect = type == "move_rope" || type == "keyframe_rope" || type == "env_sprite" || type == "env_beam" || type == "env_smokestack" || type == "env_fire" || type == "info_particle_system";
+        bool runtimeEffect = type == "move_rope" || type == "keyframe_rope" || type == "env_sprite" || type == "env_beam" || type == "env_smokestack" || type == "env_fire" || type == "info_particle_system" || type == "func_smokevolume";
         if (runtimeModel || runtimeEffect) { unsupported(std::format("Runtime-dependent entity '{}' ({}) is not rendered.", type, model.empty() ? std::string(entity["origin"].getValue()) : model)); }
     }
     require(bsp.lumps[7].version == 1 && bsp.lumps[10].version == 1, "Only face v1 and leaf v1 layouts are supported.");
@@ -287,6 +287,7 @@ Scene Builder::build() {
         auto type = std::string((*found)["classname"].getValue());
         auto& state = brushStates[m];
         state.hidden = type.starts_with("trigger_") || type == "func_vehicleclip" || type == "func_clip_vphysics" || type == "func_occluder" || type == "func_areaportal" || type == "func_areaportalwindow" || parseFloat((*found)["StartDisabled"].getValue()) != 0;
+        state.hidden = state.hidden || type == "func_smokevolume";
         bool door = type == "func_door" || type == "func_door_rotating";
         require(state.hidden || door || type == "func_brush" || type == "func_illusionary" || type == "func_wall" || type == "func_button" || type == "func_reflective_glass" || type == "func_breakable", std::format("Unsupported initial brush-entity behavior: {}", type));
         require(state.hidden || (parseFloat((*found)["rendermode"].getValue()) == 0 && parseFloat((*found)["renderfx"].getValue()) == 0), "Brush-entity render effects are not implemented.");
