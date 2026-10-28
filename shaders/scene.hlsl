@@ -70,6 +70,13 @@ float3 PaintedSkyColor(float3 direction) {
     float elevation = saturate(direction.z);
     float blend = pow(elevation, max(parameters.skyTop.w, 0.0001));
     float3 color = lerp(parameters.skyBottom.rgb, parameters.skyTop.rgb, blend) * parameters.skyBottom.w;
+    float sunCosine = saturate(dot(direction, normalize(parameters.skySun.xyz)));
+    if (parameters.skySun.w > 0) { color += parameters.skySunColor.rgb * pow(sunCosine, 20 / parameters.skySun.w); }
+    if (parameters.skyDusk.w > 0) {
+        float horizon = pow(max(1 - elevation, 0.000001), max(0.0, (2 - parameters.skyControls.x) * 4.4));
+        float angle = pow(0.75 + 0.25 * sunCosine, 2.2);
+        color += parameters.skyDusk.rgb * horizon * angle * parameters.skyDusk.w * parameters.skyBottom.w;
+    }
     if (parameters.skyControls.y > 0 && elevation > 0) {
         float2 uv = direction.xy / (max(direction.z, 0.001) * max(parameters.stars.x, 0.0001)) + parameters.stars.z;
         float4 cloud = secondTexture.Sample(materialSampler, uv);

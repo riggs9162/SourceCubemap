@@ -683,7 +683,19 @@ void Builder::addSky() {
             sky.fadeBias = number("fadebias", sky.fadeBias); sky.hdrScale = number("hdrscale", sky.hdrScale);
             sky.sunSize = number("sunsize", sky.sunSize); sky.duskScale = number("duskscale", sky.duskScale); sky.duskIntensity = number("duskintensity", sky.duskIntensity);
             require(sky.fadeBias >= 0 && sky.hdrScale >= 0, "Painted sky has invalid fade or HDR parameters.");
-            require(sky.sunSize == 0 && sky.duskIntensity == 0, "Painted sky sun discs and dusk bands are not implemented yet.");
+            require(sky.sunSize >= 0 && sky.duskIntensity >= 0 && sky.duskScale >= 0, "Invalid painted sky sun or dusk parameters.");
+            if (sky.sunSize > 0 || sky.duskIntensity > 0) {
+                require(options.experimental, "Painted sky sun and dusk shading requires --experimental until native parity is certified.");
+                scene.diagnostics["warnings"].push_back("Painted sky sun and dusk shading is experimental; the dusk angular response is approximate.");
+            }
+            for (const auto& sun : bsp.entities) {
+                if (sun["classname"].getValue() != "env_sun") { continue; }
+                require(parseFloat(sun["use_angles"].getValue()) != 0, "Position-based env_sun directions are not implemented.");
+                auto angles = parseVector(sun["angles"].getValue()); angles.x = parseFloat(sun["pitch"].getValue(), angles.x);
+                sky.sunDirection = glm::vec3(transform(glm::vec3(0), angles) * glm::vec4(1,0,0,0));
+                scene.diagnostics["warnings"].push_back("The env_sun sprite overlay is not drawn during experimental sky captures.");
+                break;
+            }
             float layers = number("drawstars", 1) != 0 ? number("starlayers", 1) : 0;
             require(layers == 0 || layers == 1, "Painted skies currently support one star/cloud layer.");
             sky.starLayers = static_cast<uint32_t>(layers);
