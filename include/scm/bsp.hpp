@@ -28,7 +28,6 @@ public:
     std::map<std::string, std::string> pakNames;
     std::unique_ptr<bsppp::BSP> source;
 private:
-    std::unique_ptr<TemporaryFile> pakFile;
-    std::unique_ptr<vpkpp::PackFile> pak;
+    std::map<std::string, Bytes> pakData;
 };
 }

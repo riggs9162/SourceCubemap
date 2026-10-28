@@ -3,8 +3,11 @@
 #include <set>
 #include <bit>
 #include <vtfpp/VTF.h>
-#include <vpkpp/format/ZIP.h>
 #include <sourcepp/compression/LZMA.h>
+#include <mz.h>
+#include <mz_strm.h>
+#include <mz_zip.h>
+#include <mz_zip_rw.h>
 
 namespace scm {
 void validateVtf(std::span<const std::byte> data, std::string_view name) {
@@ -109,14 +112,27 @@ Bsp::Bsp(const fs::path& filename) : path(fs::absolute(filename)), bytes(readFil
     entities = source->getLumpData<bsppp::BSPLump::ENTITIES>();
     auto zip = lump(40);
     if (!zip.empty()) {
-        pakFile = std::make_unique<TemporaryFile>(".zip");
-        writeFile(pakFile->path, zip);
-        pak = vpkpp::ZIP::open(pakFile->path.string(), [this](const std::string& name, const auto&) {
-            auto normalized = assetPath(name);
-            require(!pakNames.contains(normalized), std::format("Duplicate embedded path: {}", name));
-            pakNames.emplace(normalized, name);
-        });
-        require(pak != nullptr, "The embedded ZIP archive cannot be read.");
+        struct ZipReader { void* handle = mz_zip_reader_create(); ~ZipReader() { mz_zip_reader_delete(&handle); } } archive;
+        require(archive.handle && zip.size() <= INT32_MAX && mz_zip_reader_open_buffer(archive.handle, reinterpret_cast<const uint8_t*>(zip.data()), static_cast<int32_t>(zip.size()), 0) == MZ_OK, "The embedded ZIP archive cannot be read.");
+        uint64_t totalSize = 0; auto status = mz_zip_reader_goto_first_entry(archive.handle);
+        for (; status == MZ_OK; status = mz_zip_reader_goto_next_entry(archive.handle)) {
+            if (mz_zip_reader_entry_is_dir(archive.handle) == MZ_OK) { continue; }
+            mz_zip_file* info = nullptr;
+            require(mz_zip_reader_entry_get_info(archive.handle, &info) == MZ_OK && info, "Cannot read an embedded ZIP directory record.");
+            auto name = assetPath(info->filename);
+            require(!pakNames.contains(name), std::format("Duplicate embedded path: {}", name));
+            require(info->uncompressed_size >= 0 && info->uncompressed_size <= (1ll << 30), "An embedded ZIP entry exceeds the 1 GiB memory limit.");
+            totalSize += static_cast<uint64_t>(info->uncompressed_size);
+            require(totalSize <= (2ull << 30), "The expanded BSP PAK exceeds the 2 GiB memory limit.");
+            Bytes payload(static_cast<size_t>(info->uncompressed_size));
+            if (payload.empty()) {
+                require(mz_zip_reader_entry_open(archive.handle) == MZ_OK && mz_zip_reader_entry_close(archive.handle) == MZ_OK, std::format("Embedded ZIP entry failed validation: {}", name));
+            } else {
+                require(mz_zip_reader_entry_save_buffer(archive.handle, payload.data(), static_cast<int32_t>(payload.size())) == MZ_OK, std::format("Embedded ZIP entry failed decompression or checksum validation: {}", name));
+            }
+            pakNames.emplace(name, info->filename); pakData.emplace(std::move(name), std::move(payload));
+        }
+        require(status == MZ_END_OF_LIST, "The embedded ZIP directory is truncated or invalid.");
     }
 }
 
@@ -131,11 +147,9 @@ Bytes Bsp::lump(int index) const {
 
 std::optional<Bytes> Bsp::embedded(std::string_view name) const {
     auto key = assetPath(std::string(name));
-    auto found = pakNames.find(key);
-    if (found == pakNames.end()) { return {}; }
-    auto data = pak->readEntry(found->second);
-    require(data.has_value(), std::format("Cannot decode embedded asset {}.", key));
-    return data;
+    auto found = pakData.find(key);
+    if (found == pakData.end()) { return {}; }
+    return found->second;
 }
 
 std::optional<GameLump> Bsp::gameLump(uint32_t signature) const {
@@ -179,7 +193,6 @@ Json Bsp::inspect() const {
 }
 
 void Bsp::validateTextures() const {
-    if (pak) { require(pak->verifyEntryChecksums().empty(), "Embedded ZIP entry checksum validation failed."); }
     for (const auto& [name, original] : pakNames) {
         if (!name.ends_with(".vtf")) { continue; }
         auto data = embedded(name);
@@ -226,16 +239,24 @@ void Bsp::writeCubemaps(const std::map<std::string, Bytes>& textures, const fs::
     bool same = fs::exists(output) && fs::equivalent(path, output);
     require(!textures.empty(), "No cubemaps were generated; output was not written.");
     TemporaryFile archive(".zip");
-    auto zip = vpkpp::ZIP::create(archive.path.string());
-    require(zip != nullptr, "Cannot create the output PAK archive.");
+    struct ZipWriter { void* handle = mz_zip_writer_create(); ~ZipWriter() { mz_zip_writer_delete(&handle); } } zip;
+    auto archivePath = archive.path.u8string();
+    require(zip.handle && mz_zip_writer_open_file(zip.handle, reinterpret_cast<const char*>(archivePath.c_str()), 0, 0) == MZ_OK, "Cannot create the output PAK archive.");
+    mz_zip_writer_set_compress_method(zip.handle, MZ_COMPRESS_METHOD_STORE);
+    auto add = [&](const std::string& name, std::span<const std::byte> data) {
+        require(name.size() <= UINT16_MAX && data.size() <= INT32_MAX, "An output ZIP entry exceeds its size limit.");
+        mz_zip_file info{}; info.filename = name.c_str(); info.filename_size = static_cast<uint16_t>(name.size());
+        info.flag = MZ_ZIP_FLAG_UTF8; info.compression_method = MZ_COMPRESS_METHOD_STORE; info.uncompressed_size = static_cast<int64_t>(data.size());
+        require(mz_zip_writer_entry_open(zip.handle, &info) == MZ_OK, std::format("Cannot create embedded entry: {}", name));
+        if (!data.empty()) { require(mz_zip_writer_entry_write(zip.handle, data.data(), static_cast<int32_t>(data.size())) == static_cast<int32_t>(data.size()), std::format("Cannot write embedded entry: {}", name)); }
+        require(mz_zip_writer_entry_close(zip.handle) == MZ_OK, std::format("Cannot finish embedded entry: {}", name));
+    };
     for (const auto& [name, originalName] : pakNames) {
         if (textures.contains(name)) { continue; }
-        auto data = embedded(name);
-        require(zip->addEntry(originalName, *data), std::format("Cannot preserve {}.", name));
+        add(originalName, pakData.at(name));
     }
-    for (const auto& [name, data] : textures) { require(zip->addEntry(assetPath(name), data), std::format("Cannot embed {}.", name)); }
-    require(zip->bake(), "Failed to serialize the output PAK archive.");
-    zip.reset();
+    for (const auto& [name, data] : textures) { add(assetPath(name), data); }
+    require(mz_zip_writer_close(zip.handle) == MZ_OK, "Failed to serialize the output PAK archive.");
     auto packed = readFile(archive.path);
     auto outputBytes = bytes;
     const auto& oldPak = lumps[40];
