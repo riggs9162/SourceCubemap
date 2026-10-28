@@ -2,6 +2,50 @@
 #include <algorithm>
 
 namespace scm {
+namespace {
+float legacyLightEncoding(float value) {
+    value = std::round(std::clamp(value, 0.0f, 4095.0f / 1024.0f) * 1024.0f) / 1024.0f;
+    return std::pow(value, 1.0f / 2.2f) * 0.5f;
+}
+glm::vec3 decodeLightmap(glm::vec3 encoded) {
+    encoded = glm::round(glm::clamp(encoded, glm::vec3(0), glm::vec3(1)) * 255.0f) / 255.0f;
+    for (unsigned channel = 0; channel < 3; ++channel) {
+        auto value = encoded[channel];
+        encoded[channel] = (value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f)) * std::pow(2.0f, 2.2f);
+    }
+    return encoded;
+}
+float largest(glm::vec3 color) { return std::max({color.r, color.g, color.b}); }
+}
+
+std::array<glm::vec3, 4> lightmapRadiance(std::array<glm::vec3, 4> samples, bool bumped, bool hdr) {
+    if (hdr) { return samples; }
+    glm::vec3 target;
+    for (unsigned channel = 0; channel < 3; ++channel) { target[channel] = legacyLightEncoding(samples[0][channel]); }
+    if (bumped) {
+        auto sum = samples[1] + samples[2] + samples[3];
+        for (unsigned channel = 0; channel < 3; ++channel) {
+            float correction = sum[channel] > 0 ? target[channel] * 3.0f / sum[channel] : 0;
+            for (unsigned plane = 1; plane < 4; ++plane) { samples[plane][channel] *= correction; }
+        }
+        std::array<unsigned, 3> order{1, 2, 3};
+        std::sort(order.begin(), order.end(), [&](auto a, auto b) { return largest(samples[a]) > largest(samples[b]); });
+        for (auto plane : order) {
+            float maximum = largest(samples[plane]);
+            if (maximum <= 1) { continue; }
+            auto clipped = samples[plane] / maximum;
+            auto excess = (samples[plane] - clipped) * 0.5f;
+            samples[plane] = clipped;
+            for (unsigned other = 1; other < 4; ++other) { if (other != plane) { samples[other] += excess; } }
+        }
+        for (unsigned plane = 1; plane < 4; ++plane) { samples[plane] = decodeLightmap(samples[plane] / std::max(largest(samples[plane]), 1.0f)); }
+    } else {
+        for (unsigned plane = 1; plane < 4; ++plane) { samples[plane] = decodeLightmap(target); }
+    }
+    samples[0] = decodeLightmap(target);
+    return samples;
+}
+
 std::array<float, 256> initialLightStyles(const Bsp& bsp) {
     std::array<float, 256> result; result.fill(std::numeric_limits<float>::quiet_NaN()); result[0] = 1;
     for (const auto& entity : bsp.entities) {

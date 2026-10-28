@@ -22,16 +22,6 @@ glm::vec3 rgbExp(const Reader& reader, size_t offset) {
     float scale = std::ldexp(1.0f / 255.0f, reader.at<int8_t>(offset + 3));
     return glm::vec3(reader.at<uint8_t>(offset), reader.at<uint8_t>(offset + 1), reader.at<uint8_t>(offset + 2)) * scale;
 }
-glm::vec3 ldrLightmap(glm::vec3 linear) {
-    glm::vec3 result;
-    for (unsigned channel = 0; channel < 3; ++channel) {
-        float value = std::round(std::clamp(linear[channel], 0.0f, 4095.0f / 1024.0f) * 1024.0f) / 1024.0f;
-        float encoded = std::round(std::pow(value, 1.0f / 2.2f) * 127.5f) / 255.0f;
-        float decoded = encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
-        result[channel] = decoded * std::pow(2.0f, 2.2f);
-    }
-    return result;
-}
 glm::mat4 transform(glm::vec3 origin, glm::vec3 angles) {
     auto matrix = glm::translate(glm::mat4(1), origin);
     matrix = glm::rotate(matrix, glm::radians(angles.y), glm::vec3(0, 0, 1));
@@ -230,19 +220,19 @@ public:
         }
         LightPlacement result{pageIds, glm::vec2(pageX + 1, pageY + 1), glm::vec2(width, height)};
         Reader lighting(lightData, "lightmaps");
-        for (unsigned plane = 0; plane < 4; ++plane) {
-            unsigned sourcePlane = bumped ? plane : 0;
-            auto& pixels = scene.images[pageIds[plane]].pixels;
-            for (int y = -1; y <= int(height); ++y) {
-                for (int x = -1; x <= int(width); ++x) {
-                    auto pixel = uint32_t(std::clamp(y, 0, int(height) - 1)) * width + uint32_t(std::clamp(x, 0, int(width) - 1));
-                    glm::vec3 color(0);
+        for (int y = -1; y <= int(height); ++y) {
+            for (int x = -1; x <= int(width); ++x) {
+                auto pixel = uint32_t(std::clamp(y, 0, int(height) - 1)) * width + uint32_t(std::clamp(x, 0, int(width) - 1));
+                std::array<glm::vec3, 4> samples{};
+                for (unsigned plane = 0; plane < 4; ++plane) {
+                    unsigned sourcePlane = bumped ? plane : 0;
                     for (size_t style = 0; style < styleCount; ++style) {
                         auto sample = ((style * (bumped ? 4 : 1) + sourcePlane) * width * height + pixel) * 4;
-                        color += rgbExp(lighting, face.lightOffset + sample) * lightStyles[face.styles[style]];
+                        samples[plane] += rgbExp(lighting, face.lightOffset + sample) * lightStyles[face.styles[style]];
                     }
-                    pixels[(pageY + 1 + y) * 1024 + pageX + 1 + x] = glm::vec4(options.hdr ? color : ldrLightmap(color), 1);
                 }
+                auto radiance = lightmapRadiance(samples, bumped, options.hdr);
+                for (unsigned plane = 0; plane < 4; ++plane) { scene.images[pageIds[plane]].pixels[(pageY + 1 + y) * 1024 + pageX + 1 + x] = glm::vec4(radiance[plane], 1); }
             }
         }
         pageX += width + 2; pageRow = std::max(pageRow, height + 2);

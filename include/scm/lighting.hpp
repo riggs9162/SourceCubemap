@@ -8,6 +8,7 @@ struct VertexLightingMesh {
 };
 std::vector<VertexLightingMesh> readVertexLighting(std::span<const std::byte> bytes, uint32_t checksum);
 std::array<float, 256> initialLightStyles(const Bsp& bsp);
+std::array<glm::vec3, 4> lightmapRadiance(std::array<glm::vec3, 4> samples, bool bumped, bool hdr);
 
 class WorldLighting {
 public:
