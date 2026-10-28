@@ -5,6 +5,25 @@
 namespace scm {
 namespace {
 constexpr uint32_t cacheVersion = 25;
+uint64_t cacheBudget = 2ull << 30;
+constexpr uint64_t cacheReserve = 8ull << 30, maximumSceneCache = 512ull << 20;
+class CacheWriteLock {
+    HANDLE handle = nullptr;
+    bool acquired = false;
+public:
+    explicit CacheWriteLock(const fs::path& root) {
+        auto key = lower(fs::weakly_canonical(fs::absolute(root)).generic_string());
+        auto name = "Local\\SourceCubemapCache_" + digest(std::as_bytes(std::span(key.data(), key.size())));
+        handle = CreateMutexA(nullptr, FALSE, name.c_str());
+        if (!handle) { throw Error("Cannot lock the cache directory."); }
+        auto status = WaitForSingleObject(handle, 5000);
+        acquired = status == WAIT_OBJECT_0 || status == WAIT_ABANDONED;
+        if (!acquired) { CloseHandle(handle); handle = nullptr; throw Error("Cache directory is busy; the optional cache write was skipped."); }
+    }
+    ~CacheWriteLock() { if (acquired) { ReleaseMutex(handle); } if (handle) { CloseHandle(handle); } }
+    CacheWriteLock(const CacheWriteLock&) = delete;
+    CacheWriteLock& operator=(const CacheWriteLock&) = delete;
+};
 class CacheMapping {
     struct Handle {
         HANDLE value = nullptr;
@@ -43,17 +62,37 @@ template<class T> std::vector<T> readArray(Reader& reader, size_t count) {
     std::vector<T> result(count); std::memcpy(result.data(), bytes.data(), bytes.size()); return result;
 }
 }
+void setCacheBudget(uint64_t bytes) { cacheBudget = bytes; }
 std::string sceneCacheKey(const Bsp& bsp, const Assets& assets, const SceneOptions& options) {
     Json key{{"schema", cacheVersion}, {"bsp", digest(bsp.bytes)}, {"mounts", assets.report()["mounts"]}, {"hdr", options.hdr}, {"time", options.time}, {"experimental", options.experimental}, {"default_sky", options.defaultSky}};
     key["planar_water"] = options.planarWater;
     auto text = key.dump(); return digest(std::as_bytes(std::span(text.data(), text.size())));
 }
 void writeCacheFile(const fs::path& file, std::span<const std::byte> bytes) {
-    fs::create_directories(file.parent_path()); TemporaryFile temporary(".cache", file.parent_path());
+    require(cacheBudget > 0 && bytes.size() <= cacheBudget, "Cache entry exceeds the configured disk budget; it was not stored.");
+    auto parent = file.parent_path();
+    fs::path root;
+    if (parent.filename() == "scenes" || parent.filename() == "pipelines") { root = parent.parent_path(); }
+    else if (parent.parent_path().filename() == "captures") { root = parent.parent_path().parent_path(); }
+    else { throw Error("Cache writes require a managed scenes, captures, or pipelines directory."); }
+    CacheWriteLock lock(root);
+    fs::create_directories(parent);
+    uint64_t used = 0;
+    for (fs::recursive_directory_iterator entry(root); entry != fs::recursive_directory_iterator(); ++entry) {
+        if (entry->is_symlink()) { entry.disable_recursion_pending(); continue; }
+        if (entry->is_regular_file()) { used += entry->file_size(); }
+    }
+    auto replaced = fs::exists(file) ? fs::file_size(file) : 0;
+    require(used >= replaced && used - replaced <= cacheBudget - bytes.size(), "Cache disk budget reached; no further cache files were stored. Clear an old cache or raise --cache-limit-mb explicitly.");
+    require(fs::space(root).available >= cacheReserve + bytes.size(), "Cache write skipped to retain at least 8 GiB of free disk space.");
+    TemporaryFile temporary(".cache", parent);
     writeFile(temporary.path, bytes);
     require(MoveFileExW(temporary.path.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING) != 0, "Cannot publish a cache file.");
 }
 void writeSceneCache(const fs::path& file, const Scene& scene, const Assets& assets) {
+    uint64_t estimated = scene.vertices.size() * sizeof(Vertex) + scene.indices.size() * sizeof(uint32_t);
+    for (const auto& image : scene.images) { estimated += image.pixels.size() * sizeof(glm::vec4); }
+    require(estimated <= maximumSceneCache && estimated <= cacheBudget, "Decoded scene exceeds the 512 MiB scene-cache limit; it was not stored.");
     Json metadata{{"schema", cacheVersion}, {"vertex_stride", sizeof(Vertex)}, {"vertices", scene.vertices.size()}, {"indices", scene.indices.size()}, {"hdr", scene.hdr}, {"sky_origin", vector3(scene.skyOrigin)}, {"sky_scale", scene.skyScale}, {"fog_color", vector3(scene.fogColor)}, {"fog_start", scene.fogStart}, {"fog_end", scene.fogEnd}, {"sky_fog_color", vector3(scene.skyFogColor)}, {"sky_fog_start", scene.skyFogStart}, {"sky_fog_end", scene.skyFogEnd}, {"diagnostics", scene.diagnostics}, {"assets", assets.report()}, {"materials", Json::array()}, {"draws", Json::array()}, {"images", Json::array()}, {"probes", Json::array()}};
     for (const auto& material : scene.materials) {
         metadata["materials"].push_back({{"name", material.name}, {"shader", material.definition.shader}, {"parameters", material.definition.parameters}, {"proxies", material.definition.proxies}, {"textures", {material.base, material.second, material.normal, material.detail}}, {"flags", material.flags}, {"tint", vector4(material.tint)}, {"alpha", material.alphaReference}, {"detail", {material.detailScale, material.detailFactor, float(material.detailMode)}}, {"translucent", material.translucent}, {"additive", material.additive}, {"no_cull", material.noCull}, {"no_fog", material.noFog}});

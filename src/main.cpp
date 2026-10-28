@@ -18,6 +18,7 @@ struct Options {
     std::string cancelEvent;
     double captureTime = 0;
     unsigned runs = 3;
+    unsigned cacheLimitMb = 2048;
 };
 void progress(const Options& options, std::string stage, unsigned current = 0, unsigned total = 0) {
     if (options.progressJson) { std::cout << scm::Json{{"event", "progress"}, {"stage", stage}, {"current", current}, {"total", total}}.dump() << '\n' << std::flush; }
@@ -211,6 +212,7 @@ int main(int argc, char** argv) {
         command->add_option("--cancel-event", options.cancelEvent, "Windows event used for cooperative cancellation before publication.");
         command->add_option("--device", options.device, "Case-insensitive Vulkan device name substring.");
         command->add_option("--cache", options.cache, "Persistent scene, pipeline, and capture cache directory.");
+        command->add_option("--cache-limit-mb", options.cacheLimitMb, "Maximum cache size in MiB; writes also retain 8 GiB of free disk space.")->check(CLI::Range(0, 65536));
         command->add_flag("--no-cache", options.noCache, "Disable application cache reads and writes.");
         command->add_flag("--experimental", options.experimental, "Allow documented lighting and painted-sky approximations; output is not fidelity-validated.");
         command->add_option("--previews", options.previews, "Write six PNG previews per probe and lighting variant.");
@@ -222,6 +224,7 @@ int main(int argc, char** argv) {
     benchmark->add_option("--runs", options.runs)->check(CLI::Range(1, 100));
     try {
         app.parse(argc, argv);
+        scm::setCacheBudget(uint64_t(options.cacheLimitMb) << 20);
         if (!options.report.empty()) { scm::require(!aliases(options.report, options.input), "The JSON report must not replace the input BSP."); }
         spdlog::set_level(options.verbose ? spdlog::level::debug : spdlog::level::info);
         scm::Json report;
