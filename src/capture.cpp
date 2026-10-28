@@ -163,6 +163,20 @@ Bytes encodeCube(const Cube& source, bool hdr) {
     for (uint8_t mip = 0; mip < mipCount; ++mip) { for (uint8_t face = 0; face < 7; ++face) { require(!verified.getImageDataRaw(mip, 0, face).empty(), "Encoded VTF has an empty face or mip."); } }
     return result;
 }
+Cube decodeCube(std::span<const std::byte> texture, bool hdr) {
+    validateVtf(texture, "cached cubemap preview");
+    Bytes bytes(texture.begin(), texture.end()); vtfpp::VTF vtf(bytes);
+    require(vtf && vtf.getFaceCount() >= 6 && vtf.getWidth() == vtf.getHeight(), "Cached preview requires a square cubemap.");
+    Cube cube; cube.resolution = vtf.getWidth();
+    for (uint8_t face = 0; face < 6; ++face) {
+        auto data = vtf.getImageDataAs(vtfpp::ImageFormat::RGBA32323232F, 0, 0, face);
+        auto& pixels = cube.faces[face]; pixels.resize(size_t(cube.resolution) * cube.resolution);
+        require(data.size() == pixels.size() * sizeof(glm::vec4), "Cached cubemap face could not be decoded.");
+        std::memcpy(pixels.data(), data.data(), data.size());
+        if (!hdr) { for (auto& pixel : pixels) { for (unsigned channel = 0; channel < 3; ++channel) { float value = pixel[channel]; pixel[channel] = value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f); } } }
+    }
+    return cube;
+}
 void writePreview(const Cube& cube, const fs::path& directory, std::string_view name) {
     fs::create_directories(directory);
     static const std::array<std::string_view, 6> suffix{"px", "nx", "py", "ny", "pz", "nz"};
