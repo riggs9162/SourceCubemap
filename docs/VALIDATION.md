@@ -57,3 +57,19 @@ Warm full-regeneration stage medians: parsing 0.296 s; Vulkan startup 0.195 s; s
 Vulkan startup is approximately 3% of the measured warm build. This does not justify a persistent worker under the plan's 10% threshold. The earlier 0.1.0 record measured 12.76 s warm median while CS2 shared the GPU; that workload differs, so it is not a controlled speedup comparison.
 
 Machine-readable reports, native captures, and the generated local BSP accompany the delivery. No game-derived fixtures or captures are committed to the repository.
+
+## Version 0.3.0 continuation
+
+The native Vulkan pipeline passed 33 local automated tests before storage limits were added. Added coverage includes smoke-volume omission, train path initialization, v10 static-prop bounds, malformed texture transforms, ZIP CRCs and empty entries, repeated namespace-preserving regeneration, cancellation, cached previews, and real GPU water reflection/refraction/fog pixels. A separate focused test then passed cache-budget enforcement, replacement accounting, disabled writes, and preservation without loading games or map assets.
+
+Real builds completed for vault_example (12 HDR probes plus default sky), gm_construct (28 probes in both variants), gm_flatgrass (8 probes in both variants), and d1_trainstation_01 (79 probes plus default sky in both variants). All outputs passed structural and unrelated-data preservation checks. Output-name aliases increase the physical VTF entry count. GMod loaded the generated vault BSP and resolved both original and renamed-map HDR cubemaps at 32 pixels without texture/material errors; both produced actual reflection captures. Smoke particles remain omitted with an explicit experimental warning.
+
+Directional lightmap normalization reduced the near-prop HDR six-face RGB mean absolute errors from 11.79/10.94/10.36/9.39/7.16/16.59 to 4.23/5.69/3.50/3.77/4.88/5.29 on a 0-255 scale in the local matched comparison. Flatgrass full visual parity remains incomplete, particularly cloud projection and prop shading. Construct water and HL2 runtime appearance are not native-certified.
+
+The GUI was exercised through inspection, actual fixture generation, face previews, validation, and refusal to overwrite an existing output. Its final layout was visually inspected.
+
+Version 0.3 measurements before the storage-limit change include a Flatgrass regeneration median of 5.295 seconds and p95 of 8.482 seconds over three runs. A user-started GMod session overlapped these measurements; they are shared-GPU observations, not isolated performance acceptance. Other reports include cold-cache writes and rejected oversized cache loads, so they must not be described as uniformly warm-cache results. Those reports are retained separately. The final storage limits were not re-benchmarked.
+
+At approximately 13:57 local time on 2026-10-28, Windows reported an AHCI controller reset, unexpected removal of disk 1, and an NTFS delayed metadata write failure. S: became unavailable, preventing further HL2 native acceptance. Generation and benchmarking were stopped. Read-only evidence does not establish which workload caused the drive failure. No drive repair, reinitialization, remount, or reboot was attempted in this continuation.
+
+About 42 GiB of generated cache/test output was identified for cleanup after the user requested it. Automatic approval review rejected deletion even after explicit confirmation. A reviewed PowerShell cleanup script was supplied for the user to run; deletion has not been claimed as completed. Source, executable builds, test scripts, and delivered BSPs are excluded.
