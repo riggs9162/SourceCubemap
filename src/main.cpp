@@ -30,6 +30,13 @@ scm::fs::path shaderDirectory() {
 }
 std::set<std::string> namespaces(const scm::Bsp& bsp) {
     std::set<std::string> names;
+    if (auto metadata = bsp.embedded("sourcecubemap/build.json")) {
+        auto record = scm::Json::parse(scm::textOf(*metadata));
+        scm::require(record.value("schema", 0) == 1, "Unsupported embedded SourceCubemap metadata version.");
+        auto name = record.at("map_namespace").get<std::string>();
+        scm::require(!name.empty() && name.find_first_of("/\\:") == std::string::npos && name != "." && name != "..", "Invalid original cubemap namespace in build metadata.");
+        names.insert(scm::lower(name)); return names;
+    }
     for (const auto& [name, original] : bsp.pakNames) {
         if (!name.starts_with("materials/maps/")) { continue; }
         auto end = name.find('/', 15);
@@ -67,6 +74,8 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
     bsp.validateDestination(output, options.overwrite, options.inPlace);
     scm::require(!bsp.probes.empty(), "The map contains no cubemap samples.");
     auto names = namespaces(bsp);
+    auto mapNamespace = *names.begin();
+    names.insert(scm::lower(output.stem().string()));
     scm::Json times{{"parsing", parsing.seconds()}};
     std::vector<bool> variants;
     if ((options.hdr == "auto" || options.hdr == "ldr" || options.hdr == "both") && bsp.lumps[8].length) { variants.push_back(false); }
@@ -85,7 +94,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
     for (bool hdr : variants) {
         spdlog::info("Resolving {} scene and required assets", hdr ? "HDR" : "LDR");
         scm::Stopwatch loading;
-        bool defaultSky = needsDefaultSky(bsp, assets, hdr, *names.begin());
+        bool defaultSky = needsDefaultSky(bsp, assets, hdr, mapNamespace);
         scm::SceneOptions sceneOptions{hdr, options.captureTime, options.cache, !options.noCache, options.experimental, defaultSky};
         sceneOptions.planarWater = options.water == "planar";
         auto scene = scm::loadScene(bsp, assets, sceneOptions);
@@ -130,6 +139,10 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
         scenes.push_back({{"hdr", hdr}, {"geometry", scene.diagnostics}, {"assets", assets.report()}});
     }
     scm::Stopwatch writing;
+    auto textureCount = textures.size();
+    auto metadata = scm::Json{{"schema", 1}, {"map_namespace", mapNamespace}, {"runtime_map_namespace", scm::lower(output.stem().string())}, {"texture_namespaces", names}}.dump(2);
+    auto metadataBytes = std::as_bytes(std::span(metadata.data(), metadata.size()));
+    textures.emplace("sourcecubemap/build.json", scm::Bytes(metadataBytes.begin(), metadataBytes.end()));
     bsp.writeCubemaps(textures, output, options.overwrite, options.inPlace);
     times["bsp_writing_including_transaction_validation"] = writing.seconds();
     scm::Stopwatch validation;
@@ -137,7 +150,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
     times["validation"] = validation.seconds();
     times["scene_and_asset_loading"] = assetsSeconds; times["gpu_preparation"] = prepareSeconds;
     times["rendering"] = renderSeconds; times["encoding"] = encodeSeconds; times["total"] = total.seconds();
-    return {{"output", scm::fs::absolute(output).string()}, {"map_namespace", *names.begin()}, {"probes", bsp.probes.size()}, {"textures_written", textures.size()}, {"timings_seconds", times}, {"renderer", renderer.statistics()}, {"scenes", scenes}, {"quality", options.quality}, {"capture_time", options.captureTime}, {"experimental", options.experimental}, {"rendering_fidelity", options.experimental ? "experimental_approximations" : "supported_subset_not_certified"}, {"structural_validation", "pass"}, {"native_game_acceptance", "not_performed"}, {"reused_captures", reusedCaptures}, {"cache_mode", options.incremental ? "incremental" : "full_regeneration"}};
+    return {{"output", scm::fs::absolute(output).string()}, {"map_namespace", mapNamespace}, {"texture_namespaces", names}, {"probes", bsp.probes.size()}, {"textures_written", textureCount}, {"timings_seconds", times}, {"renderer", renderer.statistics()}, {"scenes", scenes}, {"quality", options.quality}, {"capture_time", options.captureTime}, {"experimental", options.experimental}, {"rendering_fidelity", options.experimental ? "experimental_approximations" : "supported_subset_not_certified"}, {"structural_validation", "pass"}, {"native_game_acceptance", "not_performed"}, {"reused_captures", reusedCaptures}, {"cache_mode", options.incremental ? "incremental" : "full_regeneration"}};
 }
 }
 
