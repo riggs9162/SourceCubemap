@@ -1,6 +1,7 @@
 #include <scm/scene.hpp>
 #include <scm/cache.hpp>
 #include <scm/lighting.hpp>
+#include <scm/entities.hpp>
 #include <vtfpp/VTF.h>
 #include <mdlpp/mdlpp.h>
 #include <glm/gtc/matrix_transform.hpp>
@@ -278,7 +279,7 @@ Scene Builder::build() {
     auto texData = bsp.source->getLumpData<bsppp::BSPLump::TEXDATA>();
     auto brushModels = bsp.source->getLumpData<bsppp::BSPLump::MODELS>();
     require(!brushModels.empty(), "The BSP has no world model.");
-    struct BrushState { glm::mat4 matrix{1}; glm::vec4 color{1}; bool hidden = false; };
+    struct BrushState { glm::mat4 matrix{1}; glm::vec4 color{1}; bool hidden = false; int renderMode = 0; };
     std::vector<BrushState> brushStates(brushModels.size());
     std::vector<uint32_t> faceModels(faces.size(), 0);
     for (size_t m = 1; m < brushModels.size(); ++m) {
@@ -286,13 +287,30 @@ Scene Builder::build() {
         require(found != bsp.entities.end(), "A brush model has no corresponding entity.");
         auto type = std::string((*found)["classname"].getValue());
         auto& state = brushStates[m];
+        state.renderMode = static_cast<int>(parseFloat((*found)["rendermode"].getValue()));
         state.hidden = type.starts_with("trigger_") || type == "func_vehicleclip" || type == "func_clip_vphysics" || type == "func_occluder" || type == "func_areaportal" || type == "func_areaportalwindow" || parseFloat((*found)["StartDisabled"].getValue()) != 0;
-        state.hidden = state.hidden || type == "func_smokevolume";
         bool door = type == "func_door" || type == "func_door_rotating";
-        require(state.hidden || door || type == "func_brush" || type == "func_illusionary" || type == "func_wall" || type == "func_button" || type == "func_reflective_glass" || type == "func_breakable", std::format("Unsupported initial brush-entity behavior: {}", type));
-        require(state.hidden || (parseFloat((*found)["rendermode"].getValue()) == 0 && parseFloat((*found)["renderfx"].getValue()) == 0), "Brush-entity render effects are not implemented.");
+        state.hidden = state.hidden || type == "func_traincontrols" || type == "func_smokevolume" || state.renderMode == 10;
+        if (type == "func_monitor") { unsupported("Live monitor brush surfaces are not rendered."); state.hidden = true; }
+        if (type == "func_lod" && !state.hidden) {
+            require(options.experimental, "Distance-dependent func_lod fading is not implemented. Use --experimental to render these brushes without fading.");
+            scene.diagnostics["warnings"].push_back("func_lod brushes render without distance fading in experimental captures.");
+        }
+        require(state.hidden || door || type == "func_tracktrain" || type == "func_train" || type == "func_physbox" || type == "func_rotating" || type == "func_lod" || type == "func_brush" || type == "func_illusionary" || type == "func_wall" || type == "func_button" || type == "func_reflective_glass" || type == "func_breakable", std::format("Unsupported initial brush-entity behavior: {}", type));
+        if ((type == "func_physbox" || type == "func_rotating") && !state.hidden) {
+            require(options.time == 0 && (*found)["parentname"].getValue().empty(), std::format("'{}' supports only the unparented authored pose at capture time zero.", type));
+        }
+        require(state.hidden || ((state.renderMode == 0 || state.renderMode == 2 || state.renderMode == 4 || state.renderMode == 5) && parseFloat((*found)["renderfx"].getValue()) == 0), std::format("Brush-entity render effects are not implemented: {} '{}' (mode {}, effect {}).", type, (*found)["targetname"].getValue(), (*found)["rendermode"].getValue(), (*found)["renderfx"].getValue()));
         auto origin = parseVector((*found)["origin"].getValue()), angles = parseVector((*found)["angles"].getValue());
+        if (type == "func_tracktrain" && !state.hidden) {
+            auto pose = initialTrackTrainPose(bsp, *found, options.time); origin = pose.origin; angles = pose.angles;
+            scene.diagnostics["tracktrains"].push_back({{"name", std::string((*found)["targetname"].getValue())}, {"origin", {origin.x, origin.y, origin.z}}, {"angles", {angles.x, angles.y, angles.z}}, {"state", "initial_path_pose"}});
+        }
         const auto& model = brushModels[m];
+        if (type == "func_train" && !state.hidden) {
+            auto pose = initialPathTrainPose(bsp, *found, (vec3(model.min) + vec3(model.max)) * 0.5f, options.time); origin = pose.origin; angles = pose.angles;
+            scene.diagnostics["path_trains"].push_back({{"name", std::string((*found)["targetname"].getValue())}, {"origin", {origin.x, origin.y, origin.z}}, {"angles", {angles.x, angles.y, angles.z}}, {"state", "initial_path_pose"}});
+        }
         if (door) {
             float flagsValue = parseFloat((*found)["spawnflags"].getValue()), spawn = parseFloat((*found)["spawnpos"].getValue());
             require(flagsValue >= 0 && flagsValue <= 131071 && std::floor(flagsValue) == flagsValue && (spawn == 0 || spawn == 1), "Invalid initial door state.");
@@ -350,6 +368,7 @@ Scene Builder::build() {
     std::map<std::vector<uint64_t>, uint32_t> visibilityIds;
     std::vector<std::vector<uint64_t>> visibilityMasks;
     std::map<std::tuple<uint32_t, uint32_t, bool, uint32_t>, std::vector<uint32_t>> batches;
+    std::map<std::pair<uint32_t, int>, uint32_t> brushMaterials;
     for (size_t faceIndex = 0; faceIndex < faces.size(); ++faceIndex) {
         const auto& face = faces[faceIndex];
         const auto& brush = brushStates[faceModels[faceIndex]];
@@ -376,6 +395,16 @@ Scene Builder::build() {
         uint32_t nameOffset = offsets.at<uint32_t>(size_t(tex.nameStringTableID) * 4);
         auto name = strings.string(nameOffset, stringsData.size() - nameOffset);
         auto materialIndex = material(name);
+        if (brush.renderMode != 0) {
+            auto key = std::pair(materialIndex, brush.renderMode);
+            if (!brushMaterials.contains(key)) {
+                auto copy = scene.materials[materialIndex]; copy.name += std::format("@render{}", brush.renderMode);
+                if (brush.renderMode == 4) { copy.flags |= AlphaTest; }
+                else { copy.flags |= VertexAlpha; copy.translucent = brush.renderMode == 2; copy.additive = brush.renderMode == 5; }
+                brushMaterials.emplace(key, static_cast<uint32_t>(scene.materials.size())); scene.materials.push_back(std::move(copy));
+            }
+            materialIndex = brushMaterials.at(key);
+        }
         const auto& mat = scene.materials[materialIndex];
         bool bumped = (info.flags & 0x800) != 0;
         require(!(mat.flags & SSBump) || bumped, std::format("SSBump material '{}' has no directional lightmaps.", name));
