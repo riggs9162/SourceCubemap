@@ -108,7 +108,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
             auto name = (skyOnly ? std::string("cubemapdefault") : probe.name()) + (hdr ? ".hdr" : "");
             auto cacheFile = scm::fs::path(options.cache) / "captures" / cacheKey / (name + ".bin");
             scm::Bytes bytes;
-            if (options.incremental && !options.noCache && options.previews.empty() && scm::fs::exists(cacheFile)) {
+            if (options.incremental && !options.noCache && scm::fs::exists(cacheFile)) {
                 try {
                     auto cached = scm::readFile(cacheFile);
                     scm::require(cached.size() >= 16, "Truncated capture cache.");
@@ -120,7 +120,11 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
                     ++reusedCaptures;
                 } catch (const std::exception& error) { spdlog::warn("Ignoring capture cache: {}", error.what()); bytes.clear(); }
             }
-            if (!bytes.empty()) { for (const auto& map : names) { textures.emplace("materials/maps/" + map + "/" + name + ".vtf", bytes); } continue; }
+            if (!bytes.empty()) {
+                for (const auto& map : names) { textures.emplace("materials/maps/" + map + "/" + name + ".vtf", bytes); }
+                if (!options.previews.empty()) { scm::writePreview(scm::decodeCube(bytes, hdr), options.previews, name); }
+                continue;
+            }
             if (!prepared) { scm::Stopwatch preparation; renderer.prepare(scene); prepareSeconds += preparation.seconds(); prepared = true; }
             spdlog::info("Capturing {} {}/{}: {} ({} pixels)", hdr ? "HDR" : "LDR", i + 1, bsp.probes.size() + size_t(defaultSky), name, probe.resolution);
             scm::Stopwatch rendering;
