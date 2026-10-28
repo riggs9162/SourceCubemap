@@ -18,8 +18,17 @@ void checked(VkResult result, std::string_view operation) { require(result == VK
 float linear(float value) { return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f); }
 struct Buffer { VkBuffer buffer{}; VmaAllocation allocation{}; void* mapping{}; VkDeviceSize size{}; };
 struct GpuImage { VkImage image{}; VmaAllocation allocation{}; VkImageView view{}; uint32_t mips = 1; };
-struct Push { glm::mat4 projection; glm::vec4 tint; glm::vec4 controls; glm::uvec4 flags; glm::vec4 fog; };
-static_assert(sizeof(Push) == 128);
+struct Push { glm::mat4 projection; glm::vec4 eye; };
+struct DrawUniform {
+    glm::vec4 tint, controls;
+    glm::uvec4 flags;
+    glm::vec4 fog;
+    glm::vec4 skyTop, skyBottom, skySun, skySunColor, skyDusk, skyControls, stars;
+    glm::vec4 phong, phongFresnel, phongTint;
+    std::array<glm::vec4, 6> ambient;
+    std::array<PropLight, 4> lights;
+};
+static_assert(sizeof(Push) == 80 && sizeof(DrawUniform) == 576 && sizeof(PropLight) == 64);
 }
 
 struct Renderer::Impl {
@@ -46,7 +55,7 @@ struct Renderer::Impl {
     std::map<unsigned, VkPipeline> pipelines;
     std::vector<GpuImage> images;
     std::vector<VkDescriptorSet> descriptors;
-    Buffer vertices, indices, readback;
+    Buffer vertices, indices, readback, uniforms;
     GpuImage color, depth;
     std::array<VkImageView, 6> colorViews{}, depthViews{};
     uint32_t targetSize = 0;
@@ -92,7 +101,7 @@ struct Renderer::Impl {
     void releaseScene() {
         if (descriptorPool) { vkDestroyDescriptorPool(device, descriptorPool, nullptr); descriptorPool = {}; }
         for (auto& image : images) { destroy(image); }
-        images.clear(); descriptors.clear(); destroy(vertices); destroy(indices);
+        images.clear(); descriptors.clear(); destroy(vertices); destroy(indices); destroy(uniforms);
     }
     void releaseTargets() {
         for (auto& view : colorViews) { if (view) { vkDestroyImageView(device, view, nullptr); view = {}; } }
@@ -205,8 +214,9 @@ struct Renderer::Impl {
         VkCommandBufferAllocateInfo commandInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; commandInfo.commandPool = pool; commandInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; commandInfo.commandBufferCount = 1;
         checked(vkAllocateCommandBuffers(device, &commandInfo, &command), "Allocate command buffer");
         VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; checked(vkCreateFence(device, &fenceInfo, nullptr, &fence), "Create fence");
-        std::array<VkDescriptorSetLayoutBinding, 10> bindings{};
-        for (uint32_t i = 0; i < bindings.size(); ++i) { bindings[i] = {i, i < 8 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}; }
+        std::array<VkDescriptorSetLayoutBinding, 11> bindings{};
+        for (uint32_t i = 0; i < 10; ++i) { bindings[i] = {i, i < 8 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}; }
+        bindings[10] = {10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size()); layoutInfo.pBindings = bindings.data();
         checked(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorLayout), "Create descriptor layout");
         VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Push)};
@@ -337,8 +347,11 @@ struct Renderer::Impl {
         } catch (...) { vkDeviceWaitIdle(device); for (auto& buffer : uploads) { destroy(buffer); } throw; }
         uploadTotalSeconds += uploadTimer.seconds();
         uint32_t count = static_cast<uint32_t>(scene.draws.size());
-        std::array<VkDescriptorPoolSize, 2> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, count * 8}, {VK_DESCRIPTOR_TYPE_SAMPLER, count * 2}}};
-        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; poolInfo.maxSets = count; poolInfo.poolSizeCount = 2; poolInfo.pPoolSizes = sizes.data();
+        auto alignment = properties.limits.minUniformBufferOffsetAlignment;
+        auto uniformStride = (sizeof(DrawUniform) + alignment - 1) / alignment * alignment;
+        uniforms = makeBuffer(std::max(VkDeviceSize(1), count * uniformStride), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
+        std::array<VkDescriptorPoolSize, 3> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, count * 8}, {VK_DESCRIPTOR_TYPE_SAMPLER, count * 2}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, count}}};
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; poolInfo.maxSets = count; poolInfo.poolSizeCount = static_cast<uint32_t>(sizes.size()); poolInfo.pPoolSizes = sizes.data();
         checked(vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool), "Create descriptor pool");
         std::vector<VkDescriptorSetLayout> layouts(count, descriptorLayout); descriptors.resize(count);
         VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocation.descriptorPool = descriptorPool; allocation.descriptorSetCount = count; allocation.pSetLayouts = layouts.data();
@@ -346,16 +359,38 @@ struct Renderer::Impl {
         for (uint32_t drawIndex = 0; drawIndex < count; ++drawIndex) {
             const auto& draw = scene.draws[drawIndex]; const auto& material = scene.materials[draw.material];
             std::array<uint32_t, 8> slots{material.base, material.second, material.normal, draw.lightmaps[0], draw.lightmaps[1], draw.lightmaps[2], draw.lightmaps[3], material.detail};
-            std::array<VkDescriptorImageInfo, 10> values{}; std::array<VkWriteDescriptorSet, 10> writes{};
+            std::array<VkDescriptorImageInfo, 10> values{}; std::array<VkWriteDescriptorSet, 11> writes{};
             for (uint32_t i = 0; i < 10; ++i) {
                 if (i < 8) { values[i].imageView = images.at(slots[i]).view; values[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; }
                 else { values[i].sampler = (i == 9 || scene.images[material.base].clamp) ? clampSampler : wrapSampler; }
                 writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[drawIndex], i, 0, 1, i < 8 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER, &values[i], nullptr, nullptr};
             }
-            vkUpdateDescriptorSets(device, 10, writes.data(), 0, nullptr);
+            float fogStart = draw.skyWorld ? scene.skyFogStart : scene.fogStart, fogEnd = draw.skyWorld ? scene.skyFogEnd : scene.fogEnd;
+            auto fogColor = draw.skyWorld ? scene.skyFogColor : scene.fogColor;
+            bool fogEnabled = !draw.skyBox && !material.noFog && fogEnd > fogStart;
+            DrawUniform uniform{};
+            uniform.tint = material.tint;
+            uniform.controls = {material.alphaReference, material.detailFactor, material.detailScale, fogEnd};
+            uniform.flags = {material.flags | (draw.lightmaps[0] ? BumpLight : 0u), draw.lighting, std::bit_cast<uint32_t>(fogStart), fogEnabled ? 1u : 0u};
+            uniform.fog = {linear(fogColor.r), linear(fogColor.g), linear(fogColor.b), 1};
+            const auto& sky = scene.paintedSky;
+            uniform.skyTop = {sky.top, sky.fadeBias}; uniform.skyBottom = {sky.bottom, scene.hdr ? sky.hdrScale : 1.0f};
+            uniform.skySun = {sky.sunDirection, sky.sunSize}; uniform.skySunColor = {sky.sunColor, 0};
+            uniform.skyDusk = {sky.duskColor, sky.duskIntensity}; uniform.skyControls = {sky.duskScale, float(sky.starLayers), 0, 0};
+            uniform.stars = {sky.starScale, sky.starFade, sky.starPosition, 0};
+            const auto& lighting = scene.propLighting.at(draw.lighting);
+            uniform.phong = {material.phongExponent, material.phongBoost, float(lighting.count), lighting.baked && !(material.flags & Phong) ? 1.0f : 0.0f};
+            uniform.phongFresnel = {material.phongFresnel, material.phongExponentFactor}; uniform.phongTint = {material.phongTint, material.blendTintOverBase};
+            for (size_t i = 0; i < lighting.ambient.size(); ++i) { uniform.ambient[i] = {lighting.ambient[i], 0}; }
+            uniform.lights = lighting.lights;
+            std::memcpy(static_cast<std::byte*>(uniforms.mapping) + drawIndex * uniformStride, &uniform, sizeof(uniform));
+            VkDescriptorBufferInfo bufferInfo{uniforms.buffer, drawIndex * uniformStride, sizeof(DrawUniform)};
+            writes[10] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[drawIndex], 10, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &bufferInfo, nullptr};
+            vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
             unsigned key = (material.translucent ? 1u : 0u) | (material.additive ? 2u : 0u) | (material.noCull ? 4u : 0u) | (draw.skyBox ? 8u : 0u);
             pipeline(key);
         }
+        checked(vmaFlushAllocation(allocator, uniforms.allocation, 0, VK_WHOLE_SIZE), "Flush draw uniforms");
     }
     Cube capture(const Scene& scene, const Probe& probe, bool skyOnly) {
         uint32_t factor = options.quality == "high" ? 2 : 1;
@@ -398,10 +433,7 @@ struct Renderer::Impl {
                         unsigned key = (material.translucent ? 1u : 0u) | (material.additive ? 2u : 0u) | (material.noCull ? 4u : 0u) | (draw.skyBox ? 8u : 0u);
                         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline(key));
                         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptors[i], 0, nullptr);
-                        float fogStart = pass == 1 ? scene.skyFogStart : scene.fogStart, fogEnd = pass == 1 ? scene.skyFogEnd : scene.fogEnd;
-                        auto fogColor = pass == 1 ? scene.skyFogColor : scene.fogColor;
-                        bool fogEnabled = pass > 0 && !material.noFog && fogEnd > fogStart;
-                        Push push{viewProjection, material.tint, {material.alphaReference, material.detailFactor, material.detailScale, fogEnd}, {material.flags | (draw.lightmaps[0] ? BumpLight : 0u), uint32_t(material.detailMode), std::bit_cast<uint32_t>(fogStart), fogEnabled ? 1u : 0u}, {linear(fogColor.r), linear(fogColor.g), linear(fogColor.b), 1}};
+                        Push push{viewProjection, {origin, float(pass)}};
                         vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
                         vkCmdDrawIndexed(command, draw.indexCount, 1, draw.firstIndex, 0, 0);
                         ++drawCalls;

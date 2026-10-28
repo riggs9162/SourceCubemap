@@ -1,5 +1,6 @@
 #include <scm/scene.hpp>
 #include <scm/cache.hpp>
+#include <scm/lighting.hpp>
 #include <vtfpp/VTF.h>
 #include <mdlpp/mdlpp.h>
 #include <glm/gtc/matrix_transform.hpp>
@@ -53,6 +54,7 @@ public:
         scene.images.push_back({"white", 1, 1, false, false, {glm::vec4(1)}});
         scene.images.push_back({"flat normal", 1, 1, false, false, {glm::vec4(0.5f, 0.5f, 1, 1)}});
         scene.diagnostics = {{"unsupported", Json::array()}, {"warnings", Json::array()}};
+        lightStyles = initialLightStyles(bsp);
     }
     uint32_t texture(std::string name, bool srgb, std::string_view requester) {
         if (name.empty()) { return 0; }
@@ -89,15 +91,17 @@ public:
         material.name = name;
         auto& definition = material.definition = readMaterial(assets, name, options.hdr);
         auto shader = definition.shader;
-        bool painted = shader == "g_sky" && options.experimental;
+        bool painted = shader == "g_sky";
         require(shader == "lightmappedgeneric" || shader == "unlitgeneric" || shader == "worldvertextransition" || shader == "vertexlitgeneric" || shader == "sky" || painted, std::format("Unsupported shader '{}' in '{}'. No BSP was written.", shader, name));
         require(definition.proxies.empty() || (painted && definition.proxies.size() == 1 && lower(definition.proxies.front()) == "skypaint"), std::format("Material proxies are not implemented for '{}'. No BSP was written.", name));
         if (shader == "unlitgeneric" || shader == "sky" || painted) { material.flags |= Unlit; }
         if (shader == "worldvertextransition") { material.flags |= Blend; }
         if (shader == "vertexlitgeneric") { material.flags |= VertexLit; }
-        for (auto parameter : {"$bumpmap2", "$blendmodulatetexture", "$lightwarptexture", "$selfillummask", "$selfillumfresnel", "$seamless_scale", "$bumptransform", "$basetexturetransform2", "$detailtexturetransform"}) {
+        if (painted) { material.flags |= Painted; }
+        for (auto parameter : {"$bumpmap2", "$blendmodulatetexture", "$lightwarptexture", "$selfillummask", "$selfillumfresnel", "$seamless_scale", "$basetexturetransform2", "$detailtexturetransform"}) {
             require(definition.value(parameter).empty() || definition.value(parameter) == "0", std::format("Material parameter '{}' is not implemented for '{}'.", parameter, name));
         }
+        require(definition.value("$bumptransform").empty() || definition.value("$bumptransform") == definition.value("$basetexturetransform"), std::format("Independent bump texture coordinates are not implemented for '{}'.", name));
         auto environment = definition.value("$envmap");
         require(environment.empty() || lower(environment) == "env_cubemap" || assetPath(environment).starts_with("maps/"), std::format("Static environment textures are not implemented for '{}'. Only probe-driven reflection feedback can be suppressed.", name));
         auto base = definition.value(options.hdr ? "$hdrbasetexture" : "$basetexture");
@@ -120,8 +124,30 @@ public:
         if (definition.flag("$ssbump")) { require(material.flags & NormalMap, "SSBump requires a bump texture."); material.flags |= SSBump; }
         require(definition.value("$selfillumtint").empty() || parseVector(definition.value("$selfillumtint")) == glm::vec3(1), std::format("Self-illumination tint is not implemented for '{}'.", name));
         if (definition.flag("$phong")) {
-            require(options.experimental, std::format("Phong model shading is not implemented for {}. Use --experimental for diffuse-only model rendering.", name));
-            scene.diagnostics["warnings"].push_back(std::format("{}: Phong specular is omitted in experimental rendering.", name));
+            require(shader == "vertexlitgeneric", std::format("Phong is supported only for VertexLitGeneric: {}", name));
+            for (auto key : {"$phongwarptexture", "$rimlight", "$phongexponenttexturemask"}) {
+                require(definition.value(key).empty() || definition.value(key) == "0", std::format("Unsupported Phong control '{}' in '{}'.", key, name));
+            }
+            material.flags |= Phong;
+            if (!definition.flag("$phongdisablehalflambert")) { material.flags |= HalfLambert; }
+            material.phongExponent = parseFloat(definition.value("$phongexponent"), 5);
+            material.phongBoost = parseFloat(definition.value("$phongboost"), 1);
+            material.phongExponentFactor = parseFloat(definition.value("$phongexponentfactor"), 149);
+            material.phongFresnel = parseVector(definition.value("$phongfresnelranges"), {0, 0.5f, 1});
+            material.phongTint = parseVector(definition.value("$phongtint"), glm::vec3(1));
+            require(material.phongExponent > 0 && material.phongBoost >= 0 && material.phongExponentFactor >= 0, std::format("Invalid Phong parameters in '{}'.", name));
+            if (!definition.value("$phongexponenttexture").empty() && definition.value("$phongexponent").empty()) {
+                material.second = texture(definition.value("$phongexponenttexture"), false, name); material.flags |= PhongExponentTexture;
+            }
+            if (definition.flag("$basemapalphaphongmask")) { material.flags |= PhongBaseAlpha; }
+            if (definition.flag("$invertphongmask")) { material.flags |= PhongInvertMask; }
+            if (definition.flag("$phongalbedotint")) { material.flags |= PhongAlbedoTint; }
+        }
+        if (definition.flag("$halflambert")) { material.flags |= HalfLambert; }
+        if (definition.flag("$blendtintbybasealpha")) {
+            material.flags |= BlendTintByAlpha;
+            material.blendTintOverBase = parseFloat(definition.value("$blendtintcoloroverbase"), 0);
+            require(material.blendTintOverBase >= 0 && material.blendTintOverBase <= 1, "Invalid material tint replacement factor.");
         }
         uint32_t index = static_cast<uint32_t>(scene.materials.size());
         scene.materials.push_back(std::move(material)); materialIds.emplace(name, index);
@@ -172,7 +198,11 @@ public:
     struct LightPlacement { std::array<uint32_t, 4> images{}; glm::vec2 offset{}, size{1}; };
     LightPlacement lightmap(const bsppp::BSPFace_v1& face, bool bumped) {
         if (face.lightOffset < 0) { return {}; }
-        require(face.styles[0] == 0 && face.styles[1] == 255, "Only the static base light style is implemented.");
+        size_t styleCount = 0;
+        while (styleCount < 4 && face.styles[styleCount] != 255) {
+            require(std::isfinite(lightStyles[face.styles[styleCount]]), "A face references an unresolved initial light style."); ++styleCount;
+        }
+        require(styleCount > 0, "A lit face has no light styles.");
         uint32_t width = face.lightmapTextureSizeInLuxels[0] + 1, height = face.lightmapTextureSizeInLuxels[1] + 1;
         require(width > 0 && height > 0 && width + 2 <= 1024 && height + 2 <= 1024, "Unsupported lightmap dimensions.");
         if (pageX + width + 2 > 1024) { pageX = 0; pageY += pageRow; pageRow = 0; }
@@ -191,7 +221,11 @@ public:
             for (int y = -1; y <= int(height); ++y) {
                 for (int x = -1; x <= int(width); ++x) {
                     auto pixel = uint32_t(std::clamp(y, 0, int(height) - 1)) * width + uint32_t(std::clamp(x, 0, int(width) - 1));
-                    auto color = rgbExp(lighting, face.lightOffset + (sourcePlane * width * height + pixel) * 4);
+                    glm::vec3 color(0);
+                    for (size_t style = 0; style < styleCount; ++style) {
+                        auto sample = ((style * (bumped ? 4 : 1) + sourcePlane) * width * height + pixel) * 4;
+                        color += rgbExp(lighting, face.lightOffset + sample) * lightStyles[face.styles[style]];
+                    }
                     pixels[(pageY + 1 + y) * 1024 + pageX + 1 + x] = glm::vec4(color, 1);
                 }
             }
@@ -211,6 +245,7 @@ public:
     int skyArea = -1;
     std::map<std::string, uint32_t> textureIds, materialIds;
     std::array<uint32_t, 4> pageIds{};
+    std::array<float, 256> lightStyles{};
     uint32_t pageX = 0, pageY = 0, pageRow = 0;
 };
 
@@ -247,7 +282,9 @@ Scene Builder::build() {
         auto type = std::string((*found)["classname"].getValue());
         auto& state = brushStates[m];
         state.hidden = type.starts_with("trigger_") || type == "func_vehicleclip" || type == "func_clip_vphysics" || parseFloat((*found)["StartDisabled"].getValue()) != 0;
-        require(state.hidden || type == "func_brush" || type == "func_illusionary" || type == "func_wall" || type == "func_button" || type == "func_reflective_glass", std::format("Unsupported initial brush-entity behavior: {}", type));
+        bool door = type == "func_door" || type == "func_door_rotating";
+        require(!door || !(static_cast<int>(parseFloat((*found)["spawnflags"].getValue())) & 1), "Doors that start open require unsupported spawn transforms.");
+        require(state.hidden || door || type == "func_brush" || type == "func_illusionary" || type == "func_wall" || type == "func_button" || type == "func_reflective_glass" || type == "func_breakable", std::format("Unsupported initial brush-entity behavior: {}", type));
         require(state.hidden || (parseFloat((*found)["rendermode"].getValue()) == 0 && parseFloat((*found)["renderfx"].getValue()) == 0), "Brush-entity render effects are not implemented.");
         state.matrix = transform(parseVector((*found)["origin"].getValue()), parseVector((*found)["angles"].getValue()));
         state.color = glm::vec4(parseVector((*found)["rendercolor"].getValue(), glm::vec3(255)) / 255.0f, parseFloat((*found)["renderamt"].getValue(), 255) / 255.0f);
@@ -269,7 +306,7 @@ Scene Builder::build() {
             require(!visData.empty(), "A 3D skybox requires compiled visibility data for scene classification.");
             scene.skyOrigin = parseVector(entity["origin"].getValue());
             scene.skyScale = parseFloat(entity["scale"].getValue(), 16);
-            require(scene.skyScale > 0 && parseVector(entity["angles"].getValue()) == glm::vec3(0), "3D sky cameras require a positive scale and zero rotation.");
+            require(scene.skyScale > 0, "3D sky cameras require a positive scale.");
             skyFaces = visibleFaces(scene.skyOrigin);
             skyArea = Reader(leafData, "sky leaf").at<uint16_t>(size_t(leafAt(scene.skyOrigin)) * 32 + 6) & 511;
             if (parseFloat(entity["fogenable"].getValue()) != 0) {
@@ -442,6 +479,8 @@ void Builder::addProps() {
     size_t stride = version == 4 ? 56 : version == 5 ? 60 : 64;
     require(data.size() - reader.cursor == size_t(count) * stride, "Static-prop byte count does not match its version.");
     auto ambientIndexData = bsp.lump(options.hdr ? 51 : 52), ambientSampleData = bsp.lump(options.hdr ? 55 : 56);
+    WorldLighting worldLighting(bsp, options.hdr);
+    uint32_t bakedProps = 0, ambientProps = 0;
     Reader ambientIndices(ambientIndexData, "leaf ambient indices"), ambientSamples(ambientSampleData, "leaf ambient samples"), leavesReader(leafData, "prop leaves");
     auto ambientAt = [&](glm::vec3 position) {
         std::array<glm::vec3, 6> cube{};
@@ -461,13 +500,18 @@ void Builder::addProps() {
             glm::vec3 sample;
             for (unsigned axis = 0; axis < 3; ++axis) { sample[axis] = glm::mix(minimum[axis], maximum[axis], ambientSamples.at<uint8_t>(offset + 24 + axis) / 255.0f); }
             auto delta = sample - position; float weight = 1.0f / (glm::dot(delta, delta) + 1.0f); total += weight;
-            for (unsigned side = 0; side < 6; ++side) { cube[side] += rgbExp(ambientSamples, offset + side * 4) * weight; }
+            for (unsigned side = 0; side < 6; ++side) { cube[side] += rgbExp(ambientSamples, offset + side * 4) * (255.0f * weight); }
         }
         for (auto& side : cube) { side /= total; }
         return cube;
     };
     for (uint32_t i = 0; i < count; ++i) {
         size_t record = reader.cursor + size_t(i) * stride;
+        uint32_t propFlags = reader.at<uint8_t>(record + 31);
+        if (version >= 6) {
+            auto minimum = reader.at<uint16_t>(record + 60), maximum = reader.at<uint16_t>(record + 62);
+            if ((minimum && minimum > 95) || (maximum && maximum < 95)) { continue; }
+        }
         auto origin = reader.at<glm::vec3>(record), angles = reader.at<glm::vec3>(record + 12);
         auto modelIndex = reader.at<uint16_t>(record + 24);
         require(modelIndex < modelNames.size(), "Static prop references an invalid model.");
@@ -475,25 +519,60 @@ void Builder::addProps() {
         auto stem = name.substr(0, name.size() - 4);
         auto mdl = assets.get(name, "static prop"), vtx = assets.get(stem + ".dx90.vtx", name), vvd = assets.get(stem + ".vvd", name);
         mdlpp::StudioModel model;
-        require(model.open(mdl->bytes, vtx->bytes, vvd->bytes), std::format("Cannot load MDL/VTX/VVD model: {}", name));
         require(Reader(mdl->bytes, name).at<uint32_t>(8) == Reader(vtx->bytes, name).at<uint32_t>(16) && Reader(mdl->bytes, name).at<uint32_t>(8) == Reader(vvd->bytes, name).at<uint32_t>(8), std::format("Model companion checksums differ: {}", name));
+        require(model.open(mdl->bytes, vtx->bytes, vvd->bytes), std::format("Cannot load MDL/VTX/VVD model: {}", name));
         for (const auto& part : model.mdl.bodyParts) { require(part.models.size() <= 1, std::format("Static-prop bodygroups are not supported: {}", name)); }
         auto baked = model.processModelData(0);
         require(baked.vertices.size() <= 65535, std::format("Model exceeds SourcePP's current 16-bit baked index range: {}", name));
         auto matrix = transform(origin, angles);
         auto normalMatrix = glm::mat3(matrix);
-        auto lightingOrigin = (reader.at<uint8_t>(record + 31) & 2) ? reader.at<glm::vec3>(record + 44) : origin;
+        auto lightingOrigin = (propFlags & 2) ? reader.at<glm::vec3>(record + 44) : glm::vec3(matrix * glm::vec4(vec3(model.mdl.illuminationPosition), 1));
         auto ambient = ambientAt(lightingOrigin);
-        require(options.experimental, std::format("{} requires static-prop lighting acceptance. Use --experimental for ambient-cube lighting until VHV/direct-light parity is implemented.", name));
-        scene.diagnostics["warnings"].push_back(std::format("{}: ambient-cube lighting is experimental; direct-light and VHV parity is unverified.", name));
+        auto lighting = worldLighting.sample(lightingOrigin); lighting.ambient = ambient;
+        std::vector<glm::vec3> bakedColors(baked.vertices.size(), glm::vec3(-1));
+        auto lightingAsset = assets.find(std::format("sp_{}{}.vhv", options.hdr ? "hdr_" : "", i));
+        if (lightingAsset && !(propFlags & 64)) {
+            auto meshes = readVertexLighting(lightingAsset->bytes, Reader(mdl->bytes, name).at<uint32_t>(8));
+            size_t meshIndex = 0;
+            for (size_t body = 0; body < model.mdl.bodyParts.size(); ++body) {
+                const auto& part = model.mdl.bodyParts[body];
+                for (size_t m = 0; m < part.models.size(); ++m) {
+                    const auto& mdlModel = part.models[m];
+                    const auto& lods = model.vtx.bodyParts.at(body).models.at(m).modelLODs;
+                    for (size_t lod = 0; lod < lods.size(); ++lod) {
+                        require(lods[lod].meshes.size() == mdlModel.meshes.size(), "VTX and MDL mesh counts differ.");
+                        for (size_t mesh = 0; mesh < mdlModel.meshes.size(); ++mesh) {
+                            for (const auto& group : lods[lod].meshes[mesh].stripGroups) {
+                                require(meshIndex < meshes.size(), "VHV is missing a VTX strip group.");
+                                const auto& colors = meshes[meshIndex++];
+                                require(colors.lod == lod && colors.colors.size() == group.vertices.size(), "VHV LOD or strip-group vertex counts differ from VTX.");
+                                if (lod != 0) { continue; }
+                                for (size_t vertex = 0; vertex < group.vertices.size(); ++vertex) {
+                                    size_t index = size_t(mdlModel.verticesOffset) + mdlModel.meshes[mesh].verticesOffset + group.vertices[vertex].meshVertexID;
+                                    require(index < bakedColors.size(), "VHV vertex mapping exceeds model bounds.");
+                                    require(bakedColors[index].x < 0 || bakedColors[index] == colors.colors[vertex], "VHV contains conflicting colors for a shared model vertex.");
+                                    bakedColors[index] = colors.colors[vertex];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            require(meshIndex == meshes.size(), "VHV contains strip groups absent from the model.");
+            lighting.baked = true; ++bakedProps;
+        } else { require(!(propFlags & 8), "Props that ignore lighting normals require baked VHV colors."); ++ambientProps; }
+        uint32_t lightingIndex = static_cast<uint32_t>(scene.propLighting.size());
+        scene.propLighting.push_back(lighting);
         auto base = static_cast<uint32_t>(scene.vertices.size());
-        for (const auto& source : baked.vertices) {
+        for (size_t sourceIndex = 0; sourceIndex < baked.vertices.size(); ++sourceIndex) {
+            const auto& source = baked.vertices[sourceIndex];
             Vertex vertex;
             vertex.position = glm::vec3(matrix * glm::vec4(vec3(source.position), 1)); vertex.normal = glm::normalize(normalMatrix * vec3(source.normal));
             vertex.tangent = glm::vec4(normalMatrix * glm::vec3(vec4(source.tangent)), source.tangent[3]);
             vertex.uv = {source.uv[0], source.uv[1]};
             glm::vec3 light(0);
             for (unsigned axis = 0; axis < 3; ++axis) { light += ambient[axis * 2 + (vertex.normal[axis] < 0 ? 1 : 0)] * vertex.normal[axis] * vertex.normal[axis]; }
+            if (lighting.baked && bakedColors[sourceIndex].x >= 0) { light = bakedColors[sourceIndex]; }
             vertex.color = glm::vec4(light, 1); scene.vertices.push_back(vertex);
         }
         int skin = reader.at<int32_t>(record + 32);
@@ -509,13 +588,20 @@ void Builder::addProps() {
             require(!resolved.empty(), std::format("Missing model material '{}' requested by '{}'. Check mounted content and model material directories.", materialName, name));
             auto id = material(resolved); scene.materials[id].flags |= VertexLit;
             scene.draws.push_back({static_cast<uint32_t>(scene.indices.size()), static_cast<uint32_t>(mesh.indices.size()), id});
+            scene.draws.back().lighting = lightingIndex;
+            if (skyArea >= 0) { scene.draws.back().skyWorld = (leavesReader.at<uint16_t>(size_t(leafAt(origin)) * 32 + 6) & 511) == skyArea; }
             for (size_t j = 0; j < mesh.indices.size(); j += 3) {
                 require(j + 2 < mesh.indices.size(), "Incomplete model triangle.");
-                for (auto k : {0u, 2u, 1u}) { require(mesh.indices[j + k] < baked.vertices.size(), "Model index exceeds vertex count."); scene.indices.push_back(base + mesh.indices[j + k]); }
+                for (auto k : {0u, 2u, 1u}) {
+                    auto index = mesh.indices[j + k]; require(index < baked.vertices.size(), "Model index exceeds vertex count.");
+                    require(!lighting.baked || bakedColors[index].x >= 0, "VHV is missing a rendered model vertex.");
+                    scene.indices.push_back(base + index);
+                }
             }
         }
     }
     scene.diagnostics["static_props"] = count;
+    scene.diagnostics["prop_lighting"] = {{"vhv", bakedProps}, {"ambient_and_world_lights", ambientProps}};
 }
 
 void Builder::addSky() {
@@ -526,8 +612,34 @@ void Builder::addSky() {
     for (const auto& entity : bsp.entities) { if (entity["classname"].getValue() == "worldspawn") { name = entity["skyname"].getValue(); } }
     require(!name.empty(), "Sky surfaces exist but worldspawn has no skyname.");
     if (name == "painted") {
-        require(options.experimental, "GMod's procedural painted sky is not implemented. Use --experimental to capture the installed fallback sky textures.");
-        scene.diagnostics["warnings"].push_back("The painted sky uses the game's fallback textures; env_skypaint, sun glow, and animated stars are not reproduced.");
+        auto& sky = scene.paintedSky;
+        for (const auto& entity : bsp.entities) {
+            if (entity["classname"].getValue() != "env_skypaint") { continue; }
+            require(!sky.enabled, "Multiple env_skypaint entities require runtime selection.");
+            sky.enabled = true;
+            auto number = [&](const char* key, float fallback) { return parseFloat(entity[key].getValue(), fallback); };
+            auto vector = [&](const char* key, glm::vec3 fallback) { return parseVector(entity[key].getValue(), fallback); };
+            sky.top = vector("topcolor", sky.top); sky.bottom = vector("bottomcolor", sky.bottom);
+            sky.sunDirection = vector("sunnormal", sky.sunDirection); sky.sunColor = vector("suncolor", sky.sunColor); sky.duskColor = vector("duskcolor", sky.duskColor);
+            sky.fadeBias = number("fadebias", sky.fadeBias); sky.hdrScale = number("hdrscale", sky.hdrScale);
+            sky.sunSize = number("sunsize", sky.sunSize); sky.duskScale = number("duskscale", sky.duskScale); sky.duskIntensity = number("duskintensity", sky.duskIntensity);
+            require(sky.fadeBias >= 0 && sky.hdrScale >= 0, "Painted sky has invalid fade or HDR parameters.");
+            require(sky.sunSize == 0 && sky.duskIntensity == 0, "Painted sky sun discs and dusk bands are not implemented yet.");
+            float layers = number("drawstars", 1) != 0 ? number("starlayers", 1) : 0;
+            require(layers == 0 || layers == 1, "Painted skies currently support one star/cloud layer.");
+            sky.starLayers = static_cast<uint32_t>(layers);
+            sky.starScale = number("starscale", sky.starScale); sky.starFade = number("starfade", sky.starFade);
+            sky.starPosition = number("starspeed", 0.01f) * static_cast<float>(options.time);
+            require(sky.starScale > 0 && sky.starFade > 0 && std::isfinite(sky.starPosition), "Painted sky star scale, fade, and time must be finite and valid.");
+            if (sky.starLayers) {
+                auto star = std::string(entity["startexture"].getValue());
+                sky.stars = texture(star.empty() ? "skybox/starfield" : star, false, "env_skypaint");
+                require(options.experimental, "Painted sky clouds require --experimental until native sampling comparison passes.");
+                scene.diagnostics["warnings"].push_back("Painted sky cloud sampling is experimental; full-face native parity is not certified.");
+            }
+        }
+        require(sky.enabled, "The painted sky requires an env_skypaint entity.");
+        scene.diagnostics["painted_sky"] = {{"capture_time", options.time}, {"star_layers", sky.starLayers}, {"hdr_scale", options.hdr ? sky.hdrScale : 1.0f}};
     }
     const std::array<std::string, 6> suffix{"rt", "lf", "bk", "ft", "up", "dn"};
     const std::array<glm::vec3, 6> forward{{{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}};
@@ -536,6 +648,7 @@ void Builder::addSky() {
         auto id = material("skybox/" + name + suffix[face]);
         scene.materials[id].flags |= Unlit | Sky;
         scene.materials[id].noCull = true;
+        if (scene.paintedSky.enabled) { scene.materials[id].second = scene.paintedSky.stars; }
         auto right = glm::cross(up[face], forward[face]);
         uint32_t base = static_cast<uint32_t>(scene.vertices.size());
         for (auto uv : std::array<glm::vec2, 4>{{{0,0},{1,0},{1,1},{0,1}}}) {

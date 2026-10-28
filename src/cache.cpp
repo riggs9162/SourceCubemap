@@ -4,7 +4,7 @@
 
 namespace scm {
 namespace {
-constexpr uint32_t cacheVersion = 10;
+constexpr uint32_t cacheVersion = 13;
 Json vector3(glm::vec3 value) { return {value.x, value.y, value.z}; }
 Json vector4(glm::vec4 value) { return {value.x, value.y, value.z, value.w}; }
 glm::vec3 read3(const Json& value) { return {value.at(0).get<float>(), value.at(1).get<float>(), value.at(2).get<float>()}; }
@@ -31,8 +31,18 @@ void writeSceneCache(const fs::path& file, const Scene& scene, const Assets& ass
     Json metadata{{"schema", cacheVersion}, {"vertex_stride", sizeof(Vertex)}, {"vertices", scene.vertices.size()}, {"indices", scene.indices.size()}, {"hdr", scene.hdr}, {"sky_origin", vector3(scene.skyOrigin)}, {"sky_scale", scene.skyScale}, {"fog_color", vector3(scene.fogColor)}, {"fog_start", scene.fogStart}, {"fog_end", scene.fogEnd}, {"sky_fog_color", vector3(scene.skyFogColor)}, {"sky_fog_start", scene.skyFogStart}, {"sky_fog_end", scene.skyFogEnd}, {"diagnostics", scene.diagnostics}, {"assets", assets.report()}, {"materials", Json::array()}, {"draws", Json::array()}, {"images", Json::array()}, {"probes", Json::array()}};
     for (const auto& material : scene.materials) {
         metadata["materials"].push_back({{"name", material.name}, {"shader", material.definition.shader}, {"parameters", material.definition.parameters}, {"proxies", material.definition.proxies}, {"textures", {material.base, material.second, material.normal, material.detail}}, {"flags", material.flags}, {"tint", vector4(material.tint)}, {"alpha", material.alphaReference}, {"detail", {material.detailScale, material.detailFactor, float(material.detailMode)}}, {"translucent", material.translucent}, {"additive", material.additive}, {"no_cull", material.noCull}, {"no_fog", material.noFog}});
+        metadata["materials"].back()["phong"] = {{"exponent", material.phongExponent}, {"boost", material.phongBoost}, {"exponent_factor", material.phongExponentFactor}, {"fresnel", vector3(material.phongFresnel)}, {"tint", vector3(material.phongTint)}, {"blend_tint", material.blendTintOverBase}};
     }
-    for (const auto& draw : scene.draws) { metadata["draws"].push_back({{"first", draw.firstIndex}, {"count", draw.indexCount}, {"material", draw.material}, {"lightmaps", draw.lightmaps}, {"sky_world", draw.skyWorld}, {"sky_box", draw.skyBox}, {"visibility", draw.visibility}, {"center", vector3(draw.center)}, {"radius", draw.radius}}); }
+    const auto& sky = scene.paintedSky;
+    metadata["painted_sky"] = {{"enabled", sky.enabled}, {"top", vector4({sky.top, sky.fadeBias})}, {"bottom", vector4({sky.bottom, sky.hdrScale})}, {"sun", vector4({sky.sunDirection, sky.sunSize})}, {"sun_color", vector3(sky.sunColor)}, {"dusk", vector4({sky.duskColor, sky.duskIntensity})}, {"dusk_scale", sky.duskScale}, {"stars", sky.stars}, {"star_layers", sky.starLayers}, {"star_parameters", {sky.starScale, sky.starFade, sky.starPosition}}};
+    metadata["prop_lighting"] = Json::array();
+    for (const auto& lighting : scene.propLighting) {
+        Json item{{"count", lighting.count}, {"baked", lighting.baked}, {"ambient", Json::array()}, {"lights", Json::array()}};
+        for (auto color : lighting.ambient) { item["ambient"].push_back(vector3(color)); }
+        for (const auto& light : lighting.lights) { item["lights"].push_back({vector4(light.positionType), vector4(light.color), vector4(light.attenuation), vector4(light.directionCone)}); }
+        metadata["prop_lighting"].push_back(std::move(item));
+    }
+    for (const auto& draw : scene.draws) { metadata["draws"].push_back({{"first", draw.firstIndex}, {"count", draw.indexCount}, {"material", draw.material}, {"lightmaps", draw.lightmaps}, {"sky_world", draw.skyWorld}, {"sky_box", draw.skyBox}, {"visibility", draw.visibility}, {"center", vector3(draw.center)}, {"radius", draw.radius}, {"lighting", draw.lighting}}); }
     for (const auto& image : scene.images) { metadata["images"].push_back({{"name", image.name}, {"width", image.width}, {"height", image.height}, {"srgb", image.srgb}, {"clamp", image.clamp}}); }
     for (const auto& probe : scene.probes) { metadata["probes"].push_back({{"origin", {probe.origin.x, probe.origin.y, probe.origin.z}}, {"resolution", probe.resolution}}); }
     Bytes payload; append(payload, std::span(scene.vertices)); append(payload, std::span(scene.indices));
@@ -73,11 +83,29 @@ std::optional<Scene> readSceneCache(const fs::path& file, Assets& assets) {
             material.base = item.at("textures").at(0); material.second = item.at("textures").at(1); material.normal = item.at("textures").at(2); material.detail = item.at("textures").at(3);
             for (auto image : {material.base, material.second, material.normal, material.detail}) { require(image < scene.images.size(), "Invalid cached material texture."); }
             material.flags = item.at("flags"); material.tint = read4(item.at("tint")); material.alphaReference = item.at("alpha"); material.detailScale = item.at("detail").at(0); material.detailFactor = item.at("detail").at(1); material.detailMode = int(item.at("detail").at(2).get<float>());
+            const auto& phong = item.at("phong");
+            material.phongExponent = phong.at("exponent"); material.phongBoost = phong.at("boost"); material.phongExponentFactor = phong.at("exponent_factor"); material.phongFresnel = read3(phong.at("fresnel")); material.phongTint = read3(phong.at("tint"));
+            material.blendTintOverBase = phong.at("blend_tint");
             material.translucent = item.at("translucent"); material.additive = item.at("additive"); material.noCull = item.at("no_cull"); material.noFog = item.at("no_fog"); scene.materials.push_back(std::move(material));
+        }
+        const auto& skyData = metadata.at("painted_sky"); auto& sky = scene.paintedSky;
+        sky.enabled = skyData.at("enabled"); auto top = read4(skyData.at("top")), bottom = read4(skyData.at("bottom")), sun = read4(skyData.at("sun")), dusk = read4(skyData.at("dusk"));
+        sky.top = top; sky.fadeBias = top.w; sky.bottom = bottom; sky.hdrScale = bottom.w; sky.sunDirection = sun; sky.sunSize = sun.w;
+        sky.sunColor = read3(skyData.at("sun_color")); sky.duskColor = dusk; sky.duskIntensity = dusk.w; sky.duskScale = skyData.at("dusk_scale");
+        sky.stars = skyData.at("stars"); sky.starLayers = skyData.at("star_layers"); auto stars = read3(skyData.at("star_parameters")); sky.starScale = stars.x; sky.starFade = stars.y; sky.starPosition = stars.z;
+        require(sky.stars < scene.images.size(), "Invalid cached painted sky texture.");
+        scene.propLighting.clear();
+        for (const auto& item : metadata.at("prop_lighting")) {
+            PropLighting lighting; lighting.count = item.at("count"); lighting.baked = item.at("baked");
+            require(lighting.count <= lighting.lights.size(), "Invalid cached prop light count.");
+            for (size_t i = 0; i < 6; ++i) { lighting.ambient[i] = read3(item.at("ambient").at(i)); }
+            for (size_t i = 0; i < 4; ++i) { const auto& light = item.at("lights").at(i); lighting.lights[i] = {read4(light.at(0)), read4(light.at(1)), read4(light.at(2)), read4(light.at(3))}; }
+            scene.propLighting.push_back(lighting);
         }
         for (const auto& item : metadata.at("draws")) {
             Draw draw; draw.firstIndex = item.at("first"); draw.indexCount = item.at("count"); draw.material = item.at("material"); draw.lightmaps = item.at("lightmaps").get<std::array<uint32_t, 4>>();
             draw.skyWorld = item.at("sky_world"); draw.skyBox = item.at("sky_box"); draw.visibility = item.at("visibility").get<std::vector<uint64_t>>(); draw.center = read3(item.at("center")); draw.radius = item.at("radius");
+            draw.lighting = item.at("lighting"); require(draw.lighting < scene.propLighting.size(), "Invalid cached prop lighting reference.");
             require(uint64_t(draw.firstIndex) + draw.indexCount <= scene.indices.size() && draw.material < scene.materials.size(), "Invalid cached draw range.");
             for (auto image : draw.lightmaps) { require(image < scene.images.size(), "Invalid cached lightmap."); } scene.draws.push_back(std::move(draw));
         }
