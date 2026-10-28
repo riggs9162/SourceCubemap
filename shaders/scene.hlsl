@@ -6,6 +6,7 @@ struct VertexInput {
     [[vk::location(4)]] float2 lightUV : TEXCOORD1;
     [[vk::location(5)]] float4 color : COLOR0;
     [[vk::location(6)]] float blend : TEXCOORD2;
+    [[vk::location(7)]] float4 secondaryUV : TEXCOORD3;
 };
 struct FragmentInput {
     float4 position : SV_Position;
@@ -17,10 +18,13 @@ struct FragmentInput {
     [[vk::location(5)]] float3 worldPosition : TEXCOORD4;
     [[vk::location(6)]] float3 worldNormal : TEXCOORD5;
     [[vk::location(7)]] float4 worldTangent : TEXCOORD6;
+    [[vk::location(8)]] float4 secondaryUV : TEXCOORD7;
 };
 struct Camera {
     column_major float4x4 projection;
     float4 eye;
+    float4 clipPlane;
+    float4 waterView;
 };
 struct PropLight {
     float4 positionType;
@@ -37,6 +41,8 @@ struct DrawUniform {
     float4 phong, phongFresnel, phongTint;
     float4 ambient[6];
     PropLight lights[4];
+    float4 waterFog, waterControls, waterReflect, waterRefract, waterScroll, waterLayers, waterTime;
+    float4 selfIllumTint;
 };
 [[vk::push_constant]] Camera camera;
 [[vk::binding(10)]] ConstantBuffer<DrawUniform> parameters;
@@ -50,6 +56,10 @@ struct DrawUniform {
 [[vk::binding(7)]] Texture2D<float4> detailTexture;
 [[vk::binding(8)]] SamplerState materialSampler;
 [[vk::binding(9)]] SamplerState lightSampler;
+[[vk::binding(11)]] TextureCube<float4> waterReflection;
+[[vk::binding(12)]] TextureCube<float4> waterRefraction;
+[[vk::binding(13)]] Texture2D<float4> blendMaskTexture;
+[[vk::binding(14)]] Texture2D<float4> selfIllumMaskTexture;
 
 FragmentInput VSMain(VertexInput input) {
     FragmentInput output;
@@ -62,6 +72,7 @@ FragmentInput VSMain(VertexInput input) {
     output.worldPosition = input.position;
     output.worldNormal = input.normal;
     output.worldTangent = input.tangent;
+    output.secondaryUV = input.secondaryUV;
     return output;
 }
 
@@ -108,12 +119,81 @@ float3 LightSample(PropLight light, float3 position, out float3 direction) {
     return light.color.rgb * attenuation;
 }
 
+float3 WaterCoordinate(float3 direction) {
+    float3 a = abs(direction);
+    if (a.x >= a.y && a.x >= a.z) { return float3(float2(direction.x >= 0 ? -direction.z : direction.z, -direction.y) / a.x * 0.5 + 0.5, direction.x >= 0 ? 0 : 1); }
+    if (a.y >= a.z) { return float3(float2(direction.x, direction.y >= 0 ? direction.z : -direction.z) / a.y * 0.5 + 0.5, direction.y >= 0 ? 2 : 3); }
+    return float3(float2(direction.z >= 0 ? direction.x : -direction.x, -direction.y) / a.z * 0.5 + 0.5, direction.z >= 0 ? 4 : 5);
+}
+
+float3 WaterDirection(float3 coordinate) {
+    float2 p = coordinate.xy * 2 - 1;
+    uint face = uint(coordinate.z);
+    if (face == 0) { return float3(1, -p.y, -p.x); }
+    if (face == 1) { return float3(-1, -p.y, p.x); }
+    if (face == 2) { return float3(p.x, 1, p.y); }
+    if (face == 3) { return float3(p.x, -1, -p.y); }
+    if (face == 4) { return float3(p.x, -p.y, 1); }
+    return float3(-p.x, -p.y, -1);
+}
+
+float4 WaterColor(FragmentInput input) {
+    bool above = parameters.waterControls.w != 0;
+    clip(above ? camera.eye.z - camera.waterView.x : camera.waterView.x - camera.eye.z);
+    float2 uv = input.uv * parameters.waterScroll.zw;
+    float4 normal = normalTexture.Sample(materialSampler, uv + parameters.waterScroll.xy);
+    if (any(parameters.waterLayers != 0)) {
+        float4 offsets = parameters.waterLayers * parameters.waterTime.z;
+        float2 rotated = float2(input.uv.x + input.uv.y, input.uv.y - input.uv.x) * 0.1;
+        normal += normalTexture.Sample(materialSampler, rotated + offsets.xy);
+        normal += normalTexture.Sample(materialSampler, input.uv.yx * 0.45 + offsets.zw);
+        normal *= 0.33;
+    }
+    normal.xyz = normal.xyz * 2 - 1;
+    float3 ray = input.worldPosition - camera.eye.xyz;
+    float surfaceDistance = length(ray);
+    float3 view = ray / max(surfaceDistance, 0.0001);
+    float3 coordinates = WaterCoordinate(view);
+    float4 unwarped = waterRefraction.SampleLevel(lightSampler, view, 0);
+    float fogRange = parameters.waterControls.z - parameters.waterFog.w;
+    float fogDepth = above ? saturate((max(unwarped.a - surfaceDistance, 0) - parameters.waterFog.w) / fogRange) : 1;
+    float2 distortion = normal.xy * normal.a * fogDepth;
+    float3 refractCoordinates = coordinates;
+    refractCoordinates.xy += distortion * parameters.waterControls.y;
+    float4 refracted = waterRefraction.SampleLevel(lightSampler, WaterDirection(refractCoordinates), 0);
+    float fog = above ? saturate((max(refracted.a - surfaceDistance, 0) - parameters.waterFog.w) / fogRange - 0.05) : saturate((surfaceDistance - parameters.waterFog.w) / fogRange);
+    float3 refraction = lerp(refracted.rgb * parameters.waterRefract.rgb, parameters.waterFog.rgb, fog);
+    if (parameters.waterRefract.w == 0) { return float4(refraction, 1); }
+    float3 reflectCoordinates = coordinates;
+    reflectCoordinates.xy += distortion * parameters.waterControls.x;
+    float3 reflectRay = WaterDirection(reflectCoordinates); reflectRay.z *= -1;
+    float3 reflection = waterReflection.SampleLevel(lightSampler, reflectRay, 0).rgb * parameters.waterReflect.rgb;
+    float3 tangent = normalize(input.worldTangent.xyz);
+    float3 faceNormal = normalize(input.worldNormal);
+    float3 bitangent = normalize(cross(faceNormal, tangent)) * input.worldTangent.w;
+    float3 eyeTangent = float3(dot(-view, tangent), dot(-view, bitangent), dot(-view, faceNormal));
+    float fresnel = pow(1 - saturate(dot(eyeTangent, normal.xyz)), 5) * saturate((fogDepth - 0.05) * 20);
+    if (parameters.waterReflect.w != 0) { fresnel = 1; }
+    return float4(lerp(refraction, reflection, fresnel), 1);
+}
+
 float4 PSMain(FragmentInput input) : SV_Target0 {
     uint flags = parameters.flags.x;
-    if ((flags & 2048) != 0) { return float4(PaintedSkyColor(input.worldPosition), 1); }
+    clip(dot(float4(input.worldPosition, 1), camera.clipPlane));
+    if ((flags & 2048) != 0) { return float4(PaintedSkyColor(input.worldPosition), camera.waterView.z == 2 ? 1000000 : 1); }
+    if ((flags & 524288) != 0) { return WaterColor(input); }
     float4 base = baseTexture.Sample(materialSampler, input.uv);
+    if ((flags & 4194304) != 0) { base *= secondTexture.Sample(materialSampler, input.secondaryUV.xy); }
     if ((flags & 512) != 0) { base.a *= input.color.a; }
-    if ((flags & 2) != 0) { base = lerp(base, secondTexture.Sample(materialSampler, input.uv), saturate(input.blend)); }
+    if ((flags & 2) != 0) {
+        float blend = saturate(input.blend);
+        if ((flags & 1048576) != 0) {
+            float2 mask = blendMaskTexture.Sample(materialSampler, input.secondaryUV.zw).rg;
+            float low = saturate(mask.y - mask.x), high = saturate(mask.y + mask.x);
+            blend = high > low ? smoothstep(low, high, blend) : step(low, blend);
+        }
+        base = lerp(base, secondTexture.Sample(materialSampler, input.secondaryUV.xy), blend);
+    }
     if ((flags & 4) != 0) { clip(base.a * parameters.tint.a - parameters.controls.x); }
     float3 light = lightTexture.Sample(lightSampler, input.lightUV).rgb;
     if ((flags & 24) == 24) {
@@ -173,7 +253,10 @@ float4 PSMain(FragmentInput input) : SV_Target0 {
     }
     if ((flags & 262144) != 0) { base.rgb = lerp(base.rgb, lerp(base.rgb * parameters.tint.rgb, parameters.tint.rgb, parameters.phongTint.w), base.a); }
     float3 result = base.rgb * light + specular;
-    if ((flags & 32) != 0) { result = lerp(result, base.rgb, base.a); }
+    if ((flags & 32) != 0) {
+        float3 mask = (flags & 2097152) != 0 ? selfIllumMaskTexture.Sample(materialSampler, input.uv).rgb : base.aaa;
+        result = lerp(base.rgb * light, base.rgb * parameters.selfIllumTint.rgb, mask) + specular;
+    }
     if ((flags & 128) == 0) { result *= input.color.rgb; }
     if ((flags & 262144) == 0) { result *= parameters.tint.rgb; }
     if (parameters.flags.w != 0) {
@@ -181,5 +264,12 @@ float4 PSMain(FragmentInput input) : SV_Target0 {
         float factor = saturate((length(input.fogPosition) - fogStart) / (parameters.controls.w - fogStart));
         result = lerp(result, parameters.fog.rgb, factor);
     }
-    return float4(result, base.a * parameters.tint.a);
+    if (camera.waterView.y != 0 && camera.waterView.z == 0 && camera.eye.w == 2) {
+        float distance = length(input.worldPosition - camera.eye.xyz);
+        float factor = saturate((distance - parameters.waterFog.w) / (parameters.waterControls.z - parameters.waterFog.w));
+        result = lerp(result, parameters.waterFog.rgb, factor);
+    }
+    float alpha = base.a * parameters.tint.a;
+    if (camera.waterView.z == 2) { alpha = camera.eye.w == 2 ? length(input.worldPosition - camera.eye.xyz) : 1000000; }
+    return float4(result, alpha);
 }

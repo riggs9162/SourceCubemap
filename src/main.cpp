@@ -61,6 +61,7 @@ bool needsDefaultSky(const scm::Bsp& bsp, scm::Assets& assets, bool hdr, std::st
     return needed;
 }
 scm::Json build(const Options& options, const scm::fs::path& output) {
+    scm::require(std::isfinite(options.captureTime) && options.captureTime >= 0, "Capture time must be a finite nonnegative number.");
     scm::Stopwatch total, parsing;
     scm::Bsp bsp(options.input);
     bsp.validateDestination(output, options.overwrite, options.inPlace);
@@ -86,6 +87,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
         scm::Stopwatch loading;
         bool defaultSky = needsDefaultSky(bsp, assets, hdr, *names.begin());
         scm::SceneOptions sceneOptions{hdr, options.captureTime, options.cache, !options.noCache, options.experimental, defaultSky};
+        sceneOptions.planarWater = options.water == "planar";
         auto scene = scm::loadScene(bsp, assets, sceneOptions);
         assetsSeconds += loading.seconds();
         auto cacheDescription = "renderer-v2:" + scm::sceneCacheKey(bsp, assets, sceneOptions) + assets.report().dump() + options.quality + renderer.statistics().at("device").get<std::string>() + renderer.statistics().at("driver_version").dump() + scm::digest(scm::readFile(shaderDirectory() / "scene.vert.spv")) + scm::digest(scm::readFile(shaderDirectory() / "scene.frag.spv"));
@@ -163,7 +165,7 @@ int main(int argc, char** argv) {
     for (auto* command : {generate, benchmark}) {
         command->add_option("--hdr", options.hdr)->check(CLI::IsMember({"auto", "ldr", "hdr", "both"}));
         command->add_option("--quality", options.quality)->check(CLI::IsMember({"fast", "standard", "high"}));
-        command->add_option("--water", options.water, "Strict mode rejects unsupported water.")->check(CLI::IsMember({"strict"}));
+        command->add_option("--water", options.water, "Planar reflections and depth refraction require --experimental.")->check(CLI::IsMember({"strict", "planar"}));
         command->add_option("--capture-time", options.captureTime)->check(CLI::NonNegativeNumber);
         command->add_option("--device", options.device, "Case-insensitive Vulkan device name substring.");
         command->add_option("--cache", options.cache, "Persistent scene, pipeline, and capture cache directory.");

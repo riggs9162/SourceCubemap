@@ -29,6 +29,51 @@ glm::mat4 transform(glm::vec3 origin, glm::vec3 angles) {
     matrix = glm::rotate(matrix, glm::radians(angles.x), glm::vec3(0, 1, 0));
     return glm::rotate(matrix, glm::radians(angles.z), glm::vec3(1, 0, 0));
 }
+glm::vec2 materialPair(std::string text, glm::vec2 fallback) {
+    if (text.empty()) { return fallback; }
+    for (auto& character : text) { if (character == '[' || character == ']') { character = ' '; } }
+    std::istringstream stream(text); glm::vec2 result; std::string remaining;
+    require(bool(stream >> result.x >> result.y) && !(stream >> remaining) && std::isfinite(result.x) && std::isfinite(result.y), "Invalid two-component material parameter.");
+    return result;
+}
+glm::vec3 materialColor(std::string text, glm::vec3 fallback = glm::vec3(1)) {
+    auto result = parseVector(text, fallback);
+    return text.find('{') != std::string::npos ? result / 255.0f : result;
+}
+WaterMaterial waterDefinition(const MaterialDefinition& definition, double time) {
+    WaterMaterial water;
+    water.above = definition.flag("$abovewater");
+    water.reflection = !definition.value("$reflecttexture").empty();
+    require(definition.value("$refracttexture") == "_rt_WaterRefraction", "Water requires the standard refraction render target.");
+    require(!water.reflection || definition.value("$reflecttexture") == "_rt_WaterReflection", "Water requires the standard reflection render target.");
+    require(!definition.flag("$forcecheap") && !definition.flag("$blurrefract") && definition.value("$basetexture").empty(), "Cheap, blurred, and base-textured water are not implemented.");
+    require(definition.flag("$fogenable"), "Water without depth fog is not supported.");
+    water.fogColor = materialColor(definition.value("$fogcolor"));
+    water.reflectTint = materialColor(definition.value("$reflecttint"));
+    water.refractTint = materialColor(definition.value("$refracttint"));
+    water.fogStart = parseFloat(definition.value("$fogstart")); water.fogEnd = parseFloat(definition.value("$fogend"), 1024);
+    require(water.fogEnd > water.fogStart, "Water fog end must exceed its start.");
+    water.reflectAmount = parseFloat(definition.value("$reflectamount"), 0.8f); water.refractAmount = parseFloat(definition.value("$refractamount"));
+    require(water.reflectAmount >= 0 && water.refractAmount >= 0, "Water distortion cannot be negative.");
+    water.reflectEntities = definition.flag("$reflectentities"); water.noFresnel = definition.flag("$nofresnel");
+    water.scale = materialPair(definition.value("$scale"), glm::vec2(1));
+    water.scroll1 = parseVector(definition.value("$scroll1")); water.scroll2 = parseVector(definition.value("$scroll2"));
+    require(definition.proxies.size() == definition.proxyParameters.size(), "Missing water proxy parameters.");
+    bool scrollFound = false;
+    for (size_t i = 0; i < definition.proxies.size(); ++i) {
+        auto name = lower(definition.proxies[i]);
+        if (name == "waterlod") { continue; }
+        require(name == "texturescroll" && !scrollFound, std::format("Unsupported water proxy '{}'.", name));
+        scrollFound = true;
+        const auto& parameters = definition.proxyParameters[i];
+        auto value = [&](const char* key) { auto found = parameters.find(key); return found == parameters.end() ? std::string{} : found->second; };
+        require(lower(value("texturescrollvar")) == "$bumptransform", "Water TextureScroll must target $bumptransform.");
+        float angle = glm::radians(parseFloat(value("texturescrollangle"))), rate = parseFloat(value("texturescrollrate"));
+        water.scroll = glm::vec2(std::cos(angle), std::sin(angle)) * static_cast<float>(rate * time);
+        require(std::isfinite(water.scroll.x) && std::isfinite(water.scroll.y), "Water capture time exceeds the supported range.");
+    }
+    return water;
+}
 glm::vec2 transformedUV(glm::vec2 uv, std::string_view description) {
     if (description.empty()) { return uv; }
     std::istringstream stream{std::string(description)};
@@ -52,24 +97,26 @@ class Builder {
 public:
     Builder(const Bsp& input, Assets& resolver, const SceneOptions& settings) : bsp(input), assets(resolver), options(settings) {
         scene.hdr = options.hdr;
+        scene.captureTime = options.time;
         scene.probes = bsp.probes;
         scene.images.push_back({"white", 1, 1, false, false, {glm::vec4(1)}});
         scene.images.push_back({"flat normal", 1, 1, false, false, {glm::vec4(0.5f, 0.5f, 1, 1)}});
         scene.diagnostics = {{"unsupported", Json::array()}, {"warnings", Json::array()}};
         lightStyles = initialLightStyles(bsp);
     }
-    uint32_t texture(std::string name, bool srgb, std::string_view requester) {
+    uint32_t texture(std::string name, bool srgb, std::string_view requester, int frame = -1) {
         if (name.empty()) { return 0; }
         name = assetPath(name);
         if (!name.starts_with("materials/")) { name = "materials/" + name; }
         if (!name.ends_with(".vtf")) { name += ".vtf"; }
-        std::string key = name + (srgb ? ":srgb" : ":linear");
+        std::string key = name + (srgb ? ":srgb" : ":linear") + std::format(":{}", frame);
         if (textureIds.contains(key)) { return textureIds.at(key); }
         auto asset = assets.get(name, requester);
         validateVtf(asset->bytes, name);
         vtfpp::VTF vtf(asset->bytes, false, options.hdr);
         require(static_cast<bool>(vtf), std::format("Invalid texture {}.", name));
-        require(vtf.getFrameCount() == 1, std::format("Animated VTF is not supported yet: {}", name));
+        require(vtf.getFrameCount() == 1 || frame >= 0, std::format("Animated VTF is not supported yet: {}", name));
+        require(std::max(frame, 0) < vtf.getFrameCount(), std::format("Texture frame is out of range: {}", name));
         require(vtf.getFaceCount() == 1 && vtf.getDepth() == 1, std::format("Expected a 2D texture: {}", name));
         bool floating = vtf.getFormat() == vtfpp::ImageFormat::RGBA16161616F || vtf.getFormat() == vtfpp::ImageFormat::RGB323232F || vtf.getFormat() == vtfpp::ImageFormat::RGBA32323232F;
         Image image;
@@ -81,7 +128,7 @@ public:
         for (uint32_t mip = 0; mip < image.mipCount; ++mip) {
             size_t count = size_t(std::max(1u, image.width >> mip)) * std::max(1u, image.height >> mip);
             require((image.pixels.size() + count) * sizeof(glm::vec4) <= (1ull << 30), std::format("Decoded texture '{}' exceeds the 1 GiB limit.", name));
-            auto pixels = vtf.getImageDataAs(vtfpp::ImageFormat::RGBA32323232F, static_cast<uint8_t>(mip));
+            auto pixels = vtf.getImageDataAs(vtfpp::ImageFormat::RGBA32323232F, static_cast<uint8_t>(mip), static_cast<uint16_t>(std::max(frame, 0)));
             require(pixels.size() == count * sizeof(glm::vec4), std::format("Failed to decode mip {} of {}.", mip, name));
             auto offset = image.pixels.size(); image.pixels.resize(offset + count);
             std::memcpy(image.pixels.data() + offset, pixels.data(), pixels.size());
@@ -98,14 +145,98 @@ public:
         material.name = name;
         auto& definition = material.definition = readMaterial(assets, name, options.hdr);
         auto shader = definition.shader;
+        if (shader == "sdk_lightmappedgeneric" || shader == "sdk_unlitgeneric" || shader == "sdk_vertexlitgeneric" || shader == "sdk_worldvertextransition") {
+            require(options.experimental, std::format("SDK shader '{}' in '{}' requires --experimental; custom shader extensions are not certified.", shader, name));
+            shader.erase(0, 4);
+            scene.diagnostics["warnings"].push_back(std::format("SDK shader '{}' in '{}' uses the supported '{}' parameters; custom extensions may differ.", definition.shader, name, shader));
+        }
+        if (shader == "lightmappedreflective") {
+            require(options.experimental, std::format("Planar glass reflections are not implemented for '{}'.", name));
+            scene.diagnostics["warnings"].push_back(std::format("Planar reflective glass '{}' is omitted in experimental captures.", name));
+            material.flags = Omitted;
+            uint32_t index = static_cast<uint32_t>(scene.materials.size()); scene.materials.push_back(std::move(material)); materialIds.emplace(name, index); return index;
+        }
+        if (shader == "water") {
+            require(options.planarWater && options.experimental, std::format("Water '{}' requires --water planar --experimental. Native water parity is not certified.", name));
+            material.water = waterDefinition(definition, options.time);
+            float frame = parseFloat(definition.value("$bumpframe"));
+            require(frame >= 0 && frame <= 65535 && std::floor(frame) == frame, "Invalid water normal frame.");
+            material.normal = texture(definition.value("$normalmap", "dev/water_normal"), false, name, static_cast<int>(frame));
+            material.flags = Water | Unlit | NormalMap;
+            material.noCull = true;
+            uint32_t index = static_cast<uint32_t>(scene.materials.size());
+            scene.materials.push_back(std::move(material)); materialIds.emplace(name, index);
+            return index;
+        }
         bool painted = shader == "g_sky";
-        require(shader == "lightmappedgeneric" || shader == "unlitgeneric" || shader == "worldvertextransition" || shader == "vertexlitgeneric" || shader == "sky" || painted, std::format("Unsupported shader '{}' in '{}'. No BSP was written.", shader, name));
-        require(definition.proxies.empty() || (painted && definition.proxies.size() == 1 && lower(definition.proxies.front()) == "skypaint"), std::format("Material proxies are not implemented for '{}'. No BSP was written.", name));
-        if (shader == "unlitgeneric" || shader == "sky" || painted) { material.flags |= Unlit; }
+        require(shader == "lightmappedgeneric" || shader == "unlitgeneric" || shader == "unlittwotexture" || shader == "worldvertextransition" || shader == "vertexlitgeneric" || shader == "sky" || painted, std::format("Unsupported shader '{}' in '{}'. No BSP was written.", shader, name));
+        int baseFrame = -1;
+        if (!definition.value("$frame").empty()) {
+            auto frame = parseFloat(definition.value("$frame"));
+            require(frame >= 0 && frame <= 65535 && std::floor(frame) == frame, "Invalid authored texture frame."); baseFrame = static_cast<int>(frame);
+        }
+        for (size_t i = 0; i < definition.proxies.size(); ++i) {
+            auto proxy = lower(definition.proxies[i]);
+            if (painted && proxy == "skypaint") { continue; }
+            if (proxy == "texturescroll") {
+                const auto& parameters = definition.proxyParameters.at(i);
+                require(parameters.contains("texturescrollvar"), "TextureScroll proxy has no target variable.");
+                auto target = lower(parameters.at("texturescrollvar"));
+                require(target == "$basetexturetransform" || target == "$texture2transform", std::format("Unsupported TextureScroll target '{}' in '{}'.", target, name));
+                auto scalar = [&](const std::string& key, float fallback) {
+                    auto found = parameters.find(key);
+                    if (found == parameters.end()) { return fallback; }
+                    auto value = found->second;
+                    if (value.starts_with('$')) { value = definition.value(lower(value)); require(!value.empty(), "TextureScroll references an undefined parameter."); }
+                    return parseFloat(value);
+                };
+                auto scale = scalar("texturescale", 1), angle = glm::radians(scalar("texturescrollangle", 0));
+                double distance = options.time * scalar("texturescrollrate", 1), x = distance * std::cos(angle), y = distance * std::sin(angle);
+                definition.parameters[target] = std::format("center 0 0 scale {} {} translate {} {}", scale, scale, x - std::floor(x), y - std::floor(y));
+                continue;
+            }
+            if (proxy == "sine") {
+                const auto& parameters = definition.proxyParameters.at(i);
+                auto scalar = [&](const std::string& key, float fallback) {
+                    auto found = parameters.find(key);
+                    if (found == parameters.end()) { return fallback; }
+                    auto value = found->second;
+                    if (value.starts_with('$')) { value = definition.value(lower(value)); require(!value.empty(), "Sine proxy references an undefined material parameter."); }
+                    return parseFloat(value);
+                };
+                auto result = parameters.find("resultvar"); require(result != parameters.end(), "Sine proxy has no result variable.");
+                auto target = lower(result->second);
+                int component = -1;
+                for (int channel = 0; channel < 3; ++channel) {
+                    if (target.ends_with(std::format("[{}]", channel))) { component = channel; target.resize(target.size() - 3); break; }
+                }
+                require(target == "$selfillumtint" || target == "$color" || target == "$color2" || target == "$alpha" || target == "$envmaptint", std::format("Unsupported Sine result '{}' in '{}'.", target, name));
+                auto period = scalar("sineperiod", 1); if (period == 0) { period = 1; }
+                auto minimum = scalar("sinemin", 0), maximum = scalar("sinemax", 1);
+                double phase = (options.time - scalar("timeoffset", 0)) / period;
+                double value = minimum + (maximum - minimum) * (0.5 + 0.5 * std::sin(phase * 6.283185307179586));
+                require(target != "$alpha" || component == -1, "Scalar alpha cannot have a vector component.");
+                auto vector = component == -1 ? glm::vec3(static_cast<float>(value)) : parseVector(definition.value(target), glm::vec3(1));
+                if (component != -1) { vector[component] = static_cast<float>(value); }
+                definition.parameters[target] = target == "$alpha" ? std::format("{}", value) : std::format("[{} {} {}]", vector.x, vector.y, vector.z);
+                continue;
+            }
+            if (proxy == "toggletexture") {
+                require(options.experimental && options.time == 0, std::format("Entity texture toggles in '{}' require --experimental at capture time zero; entity inputs are not simulated.", name));
+                const auto& parameters = definition.proxyParameters.at(i);
+                require(parameters.contains("toggletexturevar") && lower(parameters.at("toggletexturevar")) == "$basetexture" && parameters.contains("toggletextureframenumvar") && lower(parameters.at("toggletextureframenumvar")) == "$frame", "Only base-texture frame toggles are implemented.");
+                baseFrame = std::max(baseFrame, 0);
+                scene.diagnostics["warnings"].push_back(std::format("ToggleTexture in '{}' uses authored frame {}; runtime entity inputs are not simulated.", name, baseFrame));
+                continue;
+            }
+            throw Error(std::format("Material proxy '{}' is not implemented for '{}'. No BSP was written.", definition.proxies[i], name));
+        }
+        if (shader == "unlitgeneric" || shader == "unlittwotexture" || shader == "sky" || painted) { material.flags |= Unlit; }
+        if (shader == "unlittwotexture") { material.flags |= TwoTexture; require(!definition.flag("$cloakpassenabled"), "UnlitTwoTexture cloak passes are not implemented."); }
         if (shader == "worldvertextransition") { material.flags |= Blend; }
         if (shader == "vertexlitgeneric") { material.flags |= VertexLit; }
         if (painted) { material.flags |= Painted; }
-        for (auto parameter : {"$bumpmap2", "$blendmodulatetexture", "$lightwarptexture", "$selfillummask", "$selfillumfresnel", "$seamless_scale", "$basetexturetransform2", "$detailtexturetransform"}) {
+        for (auto parameter : {"$bumpmap2", "$lightwarptexture", "$selfillumfresnel", "$selfillum_envmapmask_alpha", "$seamless_scale", "$detailtexturetransform"}) {
             require(definition.value(parameter).empty() || definition.value(parameter) == "0", std::format("Material parameter '{}' is not implemented for '{}'.", parameter, name));
         }
         require(definition.value("$bumptransform").empty() || definition.value("$bumptransform") == definition.value("$basetexturetransform"), std::format("Independent bump texture coordinates are not implemented for '{}'.", name));
@@ -113,8 +244,12 @@ public:
         require(environment.empty() || lower(environment) == "env_cubemap" || assetPath(environment).starts_with("maps/"), std::format("Static environment textures are not implemented for '{}'. Only probe-driven reflection feedback can be suppressed.", name));
         auto base = definition.value(options.hdr ? "$hdrbasetexture" : "$basetexture");
         if (base.empty()) { base = definition.value("$basetexture"); }
-        material.base = texture(base, true, name);
-        material.second = texture(definition.value("$basetexture2"), true, name);
+        material.base = texture(base, true, name, baseFrame);
+        material.second = texture(definition.value(shader == "unlittwotexture" ? "$texture2" : "$basetexture2"), true, name);
+        if (!definition.value("$blendmodulatetexture").empty()) {
+            require(shader == "worldvertextransition" && !definition.flag("$maskedblending"), "Blend modulation currently requires ordinary WorldVertexTransition blending.");
+            material.blendMask = texture(definition.value("$blendmodulatetexture"), false, name); material.flags |= BlendModulation;
+        }
         if (!definition.value("$bumpmap").empty()) { material.normal = texture(definition.value("$bumpmap"), false, name); material.flags |= NormalMap; }
         if (!definition.value("$detail").empty()) { material.detail = texture(definition.value("$detail"), false, name); material.flags |= Detail; }
         if (definition.flag("$alphatest")) { material.flags |= AlphaTest; }
@@ -129,7 +264,12 @@ public:
         require(!(material.flags & Detail) || material.detailMode == 0, std::format("Detail blend mode {} is not implemented for {}.", material.detailMode, name));
         material.tint = glm::vec4(parseVector(definition.value("$color", definition.value("$color2")), glm::vec3(1)), parseFloat(definition.value("$alpha"), 1));
         if (definition.flag("$ssbump")) { require(material.flags & NormalMap, "SSBump requires a bump texture."); material.flags |= SSBump; }
-        require(definition.value("$selfillumtint").empty() || parseVector(definition.value("$selfillumtint")) == glm::vec3(1), std::format("Self-illumination tint is not implemented for '{}'.", name));
+        material.selfIllumTint = parseVector(definition.value("$selfillumtint"), glm::vec3(1));
+        require(glm::all(glm::greaterThanEqual(material.selfIllumTint, glm::vec3(0))), "Self-illumination tint cannot be negative.");
+        if (definition.flag("$selfillum") && !definition.value("$selfillummask").empty()) {
+            require(shader == "vertexlitgeneric" && !(material.flags & NormalMap), std::format("Separate self-illumination masks currently require an unbumped VertexLitGeneric material: {}", name));
+            material.selfIllumMask = texture(definition.value("$selfillummask"), false, name); material.flags |= SelfIllumMask;
+        }
         if (definition.flag("$phong")) {
             require(shader == "vertexlitgeneric", std::format("Phong is supported only for VertexLitGeneric: {}", name));
             for (auto key : {"$phongwarptexture", "$rimlight", "$phongexponenttexturemask"}) {
@@ -334,6 +474,17 @@ Scene Builder::build() {
         for (int i = 0; i < model.numFaces; ++i) { faceModels[model.firstFace + i] = static_cast<uint32_t>(m); }
     }
     nodesData = bsp.lump(5); planeData = bsp.lump(1); leafData = bsp.lump(10); leafFaceData = bsp.lump(16); visData = bsp.lump(4);
+    if (options.planarWater && bsp.lumps[36].length) {
+        auto waterData = bsp.lump(36); Reader water(waterData, "water volumes");
+        require(bsp.lumps[36].version == 0 && waterData.size() % 12 == 0, "Unsupported water volume layout.");
+        scene.hasWater = true; scene.waterHeight = water.at<float>(0);
+        require(std::isfinite(scene.waterHeight), "Invalid water surface height.");
+        for (size_t i = 0; i < waterData.size(); i += 12) { require(water.at<float>(i) == scene.waterHeight, "Multiple water surface heights are not implemented."); }
+        for (const auto& probe : bsp.probes) { scene.submergedProbes.push_back((Reader(leafData).at<uint32_t>(size_t(leafAt(glm::vec3(probe.origin))) * 32) & 32) != 0); }
+        scene.diagnostics["warnings"].push_back("Planar water uses one reflection level and depth refraction; distortion and fog are experimental.");
+        scene.diagnostics["warnings"].push_back("Water secondary views omit translucent and additive surfaces. Underwater fog uses the above-water material settings.");
+        scene.diagnostics["water"] = {{"mode", "planar"}, {"surface_height", scene.waterHeight}, {"reflection_levels", 1}};
+    }
     lightData = bsp.lump(options.hdr ? 53 : 8);
     require(!lightData.empty(), "Requested compiled lighting is missing.");
     auto stringsData = bsp.lump(43), stringOffsets = bsp.lump(44), displacements = bsp.lump(26), dispVertices = bsp.lump(33);
@@ -387,7 +538,7 @@ Scene Builder::build() {
         std::vector<uint64_t> visible((bsp.probes.size() + 63) / 64);
         bool anyVisible = false;
         for (size_t p = 0; p < probeFaces.size(); ++p) {
-            if (faceModels[faceIndex] != 0 || inSkyWorld || !referencedFaces.contains(static_cast<uint32_t>(faceIndex)) || probeFaces[p].contains(static_cast<uint32_t>(faceIndex))) { visible[p / 64] |= uint64_t(1) << (p % 64); anyVisible = true; }
+            if (scene.hasWater || faceModels[faceIndex] != 0 || inSkyWorld || !referencedFaces.contains(static_cast<uint32_t>(faceIndex)) || probeFaces[p].contains(static_cast<uint32_t>(faceIndex))) { visible[p / 64] |= uint64_t(1) << (p % 64); anyVisible = true; }
         }
         if (!anyVisible) { continue; }
         auto [foundVisibility, insertedVisibility] = visibilityIds.emplace(visible, static_cast<uint32_t>(visibilityMasks.size()));
@@ -407,6 +558,7 @@ Scene Builder::build() {
             materialIndex = brushMaterials.at(key);
         }
         const auto& mat = scene.materials[materialIndex];
+        if (mat.flags & Omitted) { continue; }
         bool bumped = (info.flags & 0x800) != 0;
         require(!(mat.flags & SSBump) || bumped, std::format("SSBump material '{}' has no directional lightmaps.", name));
         auto placement = lightmap(face, bumped);
@@ -418,6 +570,12 @@ Scene Builder::build() {
         }
         require(polygon.size() >= 3, "Face has fewer than three vertices.");
         auto normal = planes.at<glm::vec3>(size_t(face.planeNum) * 20) * (face.side ? -1.0f : 1.0f);
+        if (mat.flags & Water) {
+            require(scene.hasWater, "Water faces have no compiled water volume.");
+            if (std::abs(normal.z) < 0.999f) { continue; }
+            require(faceModels[faceIndex] == 0 && !inSkyWorld && std::abs(polygon.front().z - scene.waterHeight) < 0.1f, "Moving, sloped, and skybox water are not implemented.");
+            if (mat.water.above) { scene.waterMaterial = materialIndex; }
+        }
         auto makeVertex = [&](glm::vec3 position, glm::vec3 uvPosition, float alpha) {
             Vertex vertex;
             vertex.position = glm::vec3(brush.matrix * glm::vec4(position, 1)); vertex.normal = glm::mat3(brush.matrix) * normal;
@@ -425,6 +583,7 @@ Scene Builder::build() {
             vertex.tangent = glm::vec4(glm::mat3(brush.matrix) * tangent, glm::dot(glm::cross(normal, tangent), glm::vec3(vec4(info.textureVector2))) < 0 ? -1 : 1);
             glm::vec4 homogeneous(uvPosition, 1);
             vertex.uv = {glm::dot(homogeneous, vec4(info.textureVector1)) / tex.width, glm::dot(homogeneous, vec4(info.textureVector2)) / tex.height};
+            vertex.secondaryUV = glm::vec4(transformedUV(vertex.uv, mat.definition.value((mat.flags & TwoTexture) ? "$texture2transform" : "$basetexturetransform2")), transformedUV(vertex.uv, mat.definition.value("$blendmasktransform")));
             vertex.uv = transformedUV(vertex.uv, mat.definition.value("$basetexturetransform"));
             auto luxel = glm::vec2(glm::dot(homogeneous, vec4(info.lightmapVector1)), glm::dot(homogeneous, vec4(info.lightmapVector2)));
             vertex.lightUV = (luxel - glm::vec2(face.lightmapTextureMinsInLuxels[0], face.lightmapTextureMinsInLuxels[1]) + placement.offset + 0.5f) / 1024.0f;
@@ -496,6 +655,7 @@ Scene Builder::build() {
         scene.indices.insert(scene.indices.end(), indices.begin(), indices.end());
     }
     addProps();
+    require(!scene.hasWater || (scene.waterMaterial < scene.materials.size() && (scene.materials[scene.waterMaterial].flags & Water)), "Water volumes require a supported above-water surface material.");
     addSky();
     for (auto& draw : scene.draws) {
         glm::vec3 minimum(std::numeric_limits<float>::max()), maximum(std::numeric_limits<float>::lowest());
@@ -505,6 +665,7 @@ Scene Builder::build() {
     scene.diagnostics["vertices"] = scene.vertices.size();
     scene.diagnostics["triangles"] = scene.indices.size() / 3;
     scene.diagnostics["draws"] = scene.draws.size();
+    scene.diagnostics["water_draws"] = std::count_if(scene.draws.begin(), scene.draws.end(), [&](const auto& draw) { return (scene.materials[draw.material].flags & Water) != 0; });
     scene.diagnostics["sky_world_faces"] = skyFaces.size();
     glm::vec3 skyMinimum(std::numeric_limits<float>::max()), skyMaximum(std::numeric_limits<float>::lowest());
     size_t skyTriangles = 0;
@@ -618,7 +779,8 @@ void Builder::addProps() {
         } else { require(!(propFlags & 8), "Props that ignore lighting normals require baked VHV colors."); ++ambientProps; }
         uint32_t lightingIndex = static_cast<uint32_t>(scene.propLighting.size());
         scene.propLighting.push_back(lighting);
-        auto base = static_cast<uint32_t>(scene.vertices.size());
+        std::vector<Vertex> propVertices;
+        propVertices.reserve(baked.vertices.size());
         for (size_t sourceIndex = 0; sourceIndex < baked.vertices.size(); ++sourceIndex) {
             const auto& source = baked.vertices[sourceIndex];
             Vertex vertex;
@@ -628,7 +790,7 @@ void Builder::addProps() {
             glm::vec3 light(0);
             for (unsigned axis = 0; axis < 3; ++axis) { light += ambient[axis * 2 + (vertex.normal[axis] < 0 ? 1 : 0)] * vertex.normal[axis] * vertex.normal[axis]; }
             if (lighting.baked && bakedColors[sourceIndex].x >= 0) { light = bakedColors[sourceIndex]; }
-            vertex.color = glm::vec4(light, 1); scene.vertices.push_back(vertex);
+            vertex.color = glm::vec4(light, 1); propVertices.push_back(vertex);
         }
         int skin = reader.at<int32_t>(record + 32);
         require(skin >= 0 && !model.mdl.skins.empty(), std::format("Static prop {} '{}' has invalid skin metadata.", i, name));
@@ -646,6 +808,8 @@ void Builder::addProps() {
             }
             require(!resolved.empty(), std::format("Missing model material '{}' requested by '{}'. Check mounted content and model material directories.", materialName, name));
             auto id = material(resolved); scene.materials[id].flags |= VertexLit;
+            const auto& definition = scene.materials[id].definition;
+            std::vector<uint32_t> remap(propVertices.size(), UINT32_MAX);
             scene.draws.push_back({static_cast<uint32_t>(scene.indices.size()), static_cast<uint32_t>(mesh.indices.size()), id});
             scene.draws.back().lighting = lightingIndex;
             if (skyArea >= 0) { scene.draws.back().skyWorld = (leavesReader.at<uint16_t>(size_t(leafAt(origin)) * 32 + 6) & 511) == skyArea; }
@@ -654,7 +818,13 @@ void Builder::addProps() {
                 for (auto k : {0u, 2u, 1u}) {
                     auto index = mesh.indices[j + k]; require(index < baked.vertices.size(), "Model index exceeds vertex count.");
                     require(!lighting.baked || bakedColors[index].x >= 0, "VHV is missing a rendered model vertex.");
-                    scene.indices.push_back(base + index);
+                    if (remap[index] == UINT32_MAX) {
+                        auto vertex = propVertices[index];
+                        vertex.secondaryUV = glm::vec4(transformedUV(vertex.uv, definition.value((scene.materials[id].flags & TwoTexture) ? "$texture2transform" : "$basetexturetransform2")), transformedUV(vertex.uv, definition.value("$blendmasktransform")));
+                        vertex.uv = transformedUV(vertex.uv, definition.value("$basetexturetransform"));
+                        remap[index] = static_cast<uint32_t>(scene.vertices.size()); scene.vertices.push_back(vertex);
+                    }
+                    scene.indices.push_back(remap[index]);
                 }
             }
         }

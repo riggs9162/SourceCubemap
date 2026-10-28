@@ -18,12 +18,13 @@ struct Vertex {
     glm::vec2 lightUV{};
     glm::vec4 color{1};
     float blend = 0;
+    glm::vec4 secondaryUV{};
 };
 enum MaterialFlags : uint32_t {
     Unlit = 1, Blend = 2, AlphaTest = 4, NormalMap = 8, BumpLight = 16,
     SelfIllum = 32, Detail = 64, VertexLit = 128, Sky = 256, VertexAlpha = 512, SSBump = 1024,
     Painted = 2048, Phong = 4096, HalfLambert = 8192, PhongBaseAlpha = 16384,
-    PhongInvertMask = 32768, PhongAlbedoTint = 65536, PhongExponentTexture = 131072, BlendTintByAlpha = 262144
+    PhongInvertMask = 32768, PhongAlbedoTint = 65536, PhongExponentTexture = 131072, BlendTintByAlpha = 262144, Water = 524288, BlendModulation = 1048576, SelfIllumMask = 2097152, TwoTexture = 4194304, Omitted = 0x80000000u
 };
 struct PaintedSky {
     bool enabled = false;
@@ -45,10 +46,19 @@ struct PropLighting {
     uint32_t count = 0;
     bool baked = false;
 };
+struct WaterMaterial {
+    glm::vec3 fogColor{}, reflectTint{1}, refractTint{1}, scroll1{}, scroll2{};
+    glm::vec2 scroll{}, scale{1};
+    float fogStart = 0, fogEnd = 1024, reflectAmount = 0.8f, refractAmount = 0;
+    bool above = true, reflection = true, reflectEntities = false, noFresnel = false;
+};
 struct Material {
     std::string name;
     MaterialDefinition definition;
     uint32_t base = 0, second = 0, normal = 1, detail = 0;
+    uint32_t blendMask = 0;
+    uint32_t selfIllumMask = 0;
+    glm::vec3 selfIllumTint{1};
     uint32_t flags = 0;
     glm::vec4 tint{1};
     float alphaReference = 0.5f, detailScale = 4, detailFactor = 1;
@@ -57,6 +67,7 @@ struct Material {
     float blendTintOverBase = 0;
     glm::vec3 phongFresnel{0, 0.5f, 1}, phongTint{1};
     bool translucent = false, additive = false, noCull = false, noFog = false;
+    WaterMaterial water;
 };
 struct Draw {
     uint32_t firstIndex = 0, indexCount = 0, material = 0;
@@ -83,8 +94,13 @@ struct Scene {
     glm::vec3 skyFogColor{};
     float skyFogStart = 0, skyFogEnd = 0;
     bool hdr = false;
+    bool hasWater = false;
+    float waterHeight = 0;
+    uint32_t waterMaterial = 0;
+    std::vector<uint8_t> submergedProbes;
+    double captureTime = 0;
     Json diagnostics;
 };
-struct SceneOptions { bool hdr = false; double time = 0; fs::path cache; bool useCache = true; bool experimental = false; bool defaultSky = false; };
+struct SceneOptions { bool hdr = false; double time = 0; fs::path cache; bool useCache = true; bool experimental = false; bool defaultSky = false; bool planarWater = false; };
 Scene loadScene(const Bsp& bsp, Assets& assets, const SceneOptions& options);
 }

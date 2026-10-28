@@ -4,7 +4,7 @@
 
 namespace scm {
 namespace {
-constexpr uint32_t cacheVersion = 18;
+constexpr uint32_t cacheVersion = 25;
 Json vector3(glm::vec3 value) { return {value.x, value.y, value.z}; }
 Json vector4(glm::vec4 value) { return {value.x, value.y, value.z, value.w}; }
 glm::vec3 read3(const Json& value) { return {value.at(0).get<float>(), value.at(1).get<float>(), value.at(2).get<float>()}; }
@@ -20,6 +20,7 @@ template<class T> std::vector<T> readArray(Reader& reader, size_t count) {
 }
 std::string sceneCacheKey(const Bsp& bsp, const Assets& assets, const SceneOptions& options) {
     Json key{{"schema", cacheVersion}, {"bsp", digest(bsp.bytes)}, {"mounts", assets.report()["mounts"]}, {"hdr", options.hdr}, {"time", options.time}, {"experimental", options.experimental}, {"default_sky", options.defaultSky}};
+    key["planar_water"] = options.planarWater;
     auto text = key.dump(); return digest(std::as_bytes(std::span(text.data(), text.size())));
 }
 void writeCacheFile(const fs::path& file, std::span<const std::byte> bytes) {
@@ -32,7 +33,13 @@ void writeSceneCache(const fs::path& file, const Scene& scene, const Assets& ass
     for (const auto& material : scene.materials) {
         metadata["materials"].push_back({{"name", material.name}, {"shader", material.definition.shader}, {"parameters", material.definition.parameters}, {"proxies", material.definition.proxies}, {"textures", {material.base, material.second, material.normal, material.detail}}, {"flags", material.flags}, {"tint", vector4(material.tint)}, {"alpha", material.alphaReference}, {"detail", {material.detailScale, material.detailFactor, float(material.detailMode)}}, {"translucent", material.translucent}, {"additive", material.additive}, {"no_cull", material.noCull}, {"no_fog", material.noFog}});
         metadata["materials"].back()["phong"] = {{"exponent", material.phongExponent}, {"boost", material.phongBoost}, {"exponent_factor", material.phongExponentFactor}, {"fresnel", vector3(material.phongFresnel)}, {"tint", vector3(material.phongTint)}, {"blend_tint", material.blendTintOverBase}};
+        metadata["materials"].back()["proxy_parameters"] = material.definition.proxyParameters;
+        metadata["materials"].back()["blend_mask"] = material.blendMask;
+        metadata["materials"].back()["emission"] = {{"mask", material.selfIllumMask}, {"tint", vector3(material.selfIllumTint)}};
+        const auto& water = material.water;
+        metadata["materials"].back()["water"] = {{"fog_color", vector3(water.fogColor)}, {"reflect_tint", vector3(water.reflectTint)}, {"refract_tint", vector3(water.refractTint)}, {"scroll1", vector3(water.scroll1)}, {"scroll2", vector3(water.scroll2)}, {"scroll_scale", {water.scroll.x, water.scroll.y, water.scale.x, water.scale.y}}, {"fog_start", water.fogStart}, {"fog_end", water.fogEnd}, {"reflect_amount", water.reflectAmount}, {"refract_amount", water.refractAmount}, {"above", water.above}, {"reflection", water.reflection}, {"entities", water.reflectEntities}, {"no_fresnel", water.noFresnel}};
     }
+    metadata["water_scene"] = {{"enabled", scene.hasWater}, {"height", scene.waterHeight}, {"material", scene.waterMaterial}, {"submerged", scene.submergedProbes}, {"time", scene.captureTime}};
     const auto& sky = scene.paintedSky;
     metadata["painted_sky"] = {{"enabled", sky.enabled}, {"top", vector4({sky.top, sky.fadeBias})}, {"bottom", vector4({sky.bottom, sky.hdrScale})}, {"sun", vector4({sky.sunDirection, sky.sunSize})}, {"sun_color", vector3(sky.sunColor)}, {"dusk", vector4({sky.duskColor, sky.duskIntensity})}, {"dusk_scale", sky.duskScale}, {"stars", sky.stars}, {"star_layers", sky.starLayers}, {"star_parameters", {sky.starScale, sky.starFade, sky.starPosition}}};
     metadata["prop_lighting"] = Json::array();
@@ -84,6 +91,15 @@ std::optional<Scene> readSceneCache(const fs::path& file, Assets& assets) {
         for (const auto& item : metadata.at("materials")) {
             Material material; material.name = item.at("name"); material.definition.shader = item.at("shader");
             material.definition.parameters = item.at("parameters").get<std::map<std::string, std::string>>(); material.definition.proxies = item.at("proxies").get<std::vector<std::string>>();
+            material.definition.proxyParameters = item.at("proxy_parameters").get<std::vector<std::map<std::string, std::string>>>();
+            material.blendMask = item.at("blend_mask"); require(material.blendMask < scene.images.size(), "Invalid cached blend mask.");
+            material.selfIllumMask = item.at("emission").at("mask"); material.selfIllumTint = read3(item.at("emission").at("tint"));
+            require(material.selfIllumMask < scene.images.size(), "Invalid cached self-illumination mask.");
+            auto& water = material.water; const auto& source = item.at("water");
+            water.fogColor = read3(source.at("fog_color")); water.reflectTint = read3(source.at("reflect_tint")); water.refractTint = read3(source.at("refract_tint"));
+            water.scroll1 = read3(source.at("scroll1")); water.scroll2 = read3(source.at("scroll2")); auto scroll = read4(source.at("scroll_scale")); water.scroll = {scroll.x, scroll.y}; water.scale = {scroll.z, scroll.w};
+            water.fogStart = source.at("fog_start"); water.fogEnd = source.at("fog_end"); water.reflectAmount = source.at("reflect_amount"); water.refractAmount = source.at("refract_amount");
+            water.above = source.at("above"); water.reflection = source.at("reflection"); water.reflectEntities = source.at("entities"); water.noFresnel = source.at("no_fresnel");
             material.base = item.at("textures").at(0); material.second = item.at("textures").at(1); material.normal = item.at("textures").at(2); material.detail = item.at("textures").at(3);
             for (auto image : {material.base, material.second, material.normal, material.detail}) { require(image < scene.images.size(), "Invalid cached material texture."); }
             material.flags = item.at("flags"); material.tint = read4(item.at("tint")); material.alphaReference = item.at("alpha"); material.detailScale = item.at("detail").at(0); material.detailFactor = item.at("detail").at(1); material.detailMode = int(item.at("detail").at(2).get<float>());
@@ -92,6 +108,9 @@ std::optional<Scene> readSceneCache(const fs::path& file, Assets& assets) {
             material.blendTintOverBase = phong.at("blend_tint");
             material.translucent = item.at("translucent"); material.additive = item.at("additive"); material.noCull = item.at("no_cull"); material.noFog = item.at("no_fog"); scene.materials.push_back(std::move(material));
         }
+        const auto& waterScene = metadata.at("water_scene");
+        scene.hasWater = waterScene.at("enabled"); scene.waterHeight = waterScene.at("height"); scene.waterMaterial = waterScene.at("material"); scene.captureTime = waterScene.at("time"); scene.submergedProbes = waterScene.at("submerged").get<std::vector<uint8_t>>();
+        require(!scene.hasWater || (scene.waterMaterial < scene.materials.size() && (scene.materials[scene.waterMaterial].flags & Water)), "Invalid cached water material.");
         const auto& skyData = metadata.at("painted_sky"); auto& sky = scene.paintedSky;
         sky.enabled = skyData.at("enabled"); auto top = read4(skyData.at("top")), bottom = read4(skyData.at("bottom")), sun = read4(skyData.at("sun")), dusk = read4(skyData.at("dusk"));
         sky.top = top; sky.fadeBias = top.w; sky.bottom = bottom; sky.hdrScale = bottom.w; sky.sunDirection = sun; sky.sunSize = sun.w;
@@ -114,6 +133,7 @@ std::optional<Scene> readSceneCache(const fs::path& file, Assets& assets) {
             for (auto image : draw.lightmaps) { require(image < scene.images.size(), "Invalid cached lightmap."); } scene.draws.push_back(std::move(draw));
         }
         for (const auto& item : metadata.at("probes")) { scene.probes.push_back({{item.at("origin").at(0).get<int>(), item.at("origin").at(1).get<int>(), item.at("origin").at(2).get<int>()}, item.at("resolution")}); }
+        require(!scene.hasWater || (scene.submergedProbes.size() == scene.probes.size() && std::ranges::all_of(scene.submergedProbes, [](uint8_t value) { return value <= 1; })), "Invalid cached underwater probe classification.");
         for (auto index : scene.indices) { require(index < scene.vertices.size(), "Invalid cached geometry index."); }
         scene.hdr = metadata.at("hdr"); scene.skyOrigin = read3(metadata.at("sky_origin")); scene.skyScale = metadata.at("sky_scale");
         scene.fogColor = read3(metadata.at("fog_color")); scene.fogStart = metadata.at("fog_start"); scene.fogEnd = metadata.at("fog_end");

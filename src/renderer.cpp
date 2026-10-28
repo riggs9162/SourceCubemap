@@ -18,7 +18,7 @@ void checked(VkResult result, std::string_view operation) { require(result == VK
 float linear(float value) { return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f); }
 struct Buffer { VkBuffer buffer{}; VmaAllocation allocation{}; void* mapping{}; VkDeviceSize size{}; };
 struct GpuImage { VkImage image{}; VmaAllocation allocation{}; VkImageView view{}; uint32_t mips = 1; };
-struct Push { glm::mat4 projection; glm::vec4 eye; };
+struct Push { glm::mat4 projection; glm::vec4 eye, clipPlane, waterView; };
 struct DrawUniform {
     glm::vec4 tint, controls;
     glm::uvec4 flags;
@@ -27,8 +27,10 @@ struct DrawUniform {
     glm::vec4 phong, phongFresnel, phongTint;
     std::array<glm::vec4, 6> ambient;
     std::array<PropLight, 4> lights;
+    glm::vec4 waterFog, waterControls, waterReflect, waterRefract, waterScroll, waterLayers, waterTime;
+    glm::vec4 selfIllumTint;
 };
-static_assert(sizeof(Push) == 80 && sizeof(DrawUniform) == 576 && sizeof(PropLight) == 64);
+static_assert(sizeof(Push) == 112 && sizeof(DrawUniform) == 704 && sizeof(PropLight) == 64);
 }
 
 struct Renderer::Impl {
@@ -56,12 +58,14 @@ struct Renderer::Impl {
     std::vector<GpuImage> images;
     std::vector<VkDescriptorSet> descriptors;
     Buffer vertices, indices, readback, uniforms;
-    GpuImage color, depth;
+    GpuImage color, depth, waterReflection, waterRefraction;
     std::array<VkImageView, 6> colorViews{}, depthViews{};
     uint32_t targetSize = 0;
+    bool targetWater = false;
     double gpuSeconds = 0;
     uint64_t captureCount = 0;
     uint64_t drawCalls = 0, culledDraws = 0;
+    uint64_t waterViews = 0;
     uint64_t textureUploadBytes = 0, uploadSubmissions = 0;
     double uploadWaitSeconds = 0, uploadTotalSeconds = 0, pipelineSeconds = 0;
 
@@ -106,7 +110,7 @@ struct Renderer::Impl {
     void releaseTargets() {
         for (auto& view : colorViews) { if (view) { vkDestroyImageView(device, view, nullptr); view = {}; } }
         for (auto& view : depthViews) { if (view) { vkDestroyImageView(device, view, nullptr); view = {}; } }
-        destroy(color); destroy(depth); destroy(readback); targetSize = 0;
+        destroy(color); destroy(depth); destroy(waterReflection); destroy(waterRefraction); destroy(readback); targetSize = 0;
     }
     Buffer makeBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host) {
         Buffer buffer; buffer.size = size;
@@ -118,21 +122,22 @@ struct Renderer::Impl {
         buffer.mapping = result.pMappedData;
         return buffer;
     }
-    VkImageView makeView(VkImage image, VkFormat format, VkImageAspectFlags aspect, uint32_t firstLayer, uint32_t layers, uint32_t mips) {
+    VkImageView makeView(VkImage image, VkFormat format, VkImageAspectFlags aspect, uint32_t firstLayer, uint32_t layers, uint32_t mips, bool cube = false) {
         VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        info.image = image; info.viewType = layers == 1 ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_2D_ARRAY; info.format = format;
+        info.image = image; info.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : layers == 1 ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_2D_ARRAY; info.format = format;
         info.subresourceRange = {aspect, 0, mips, firstLayer, layers};
         VkImageView view{}; checked(vkCreateImageView(device, &info, nullptr, &view), "Create image view"); return view;
     }
-    GpuImage makeImage(uint32_t width, uint32_t height, uint32_t layers, uint32_t mips, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect) {
+    GpuImage makeImage(uint32_t width, uint32_t height, uint32_t layers, uint32_t mips, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, bool cube = false) {
         require(width > 0 && height > 0 && width <= properties.limits.maxImageDimension2D && height <= properties.limits.maxImageDimension2D && layers <= properties.limits.maxImageArrayLayers, "Image dimensions exceed the GPU limits.");
         GpuImage result; result.mips = mips;
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        info.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
         info.imageType = VK_IMAGE_TYPE_2D; info.format = format; info.extent = {width, height, 1};
         info.mipLevels = mips; info.arrayLayers = layers; info.samples = VK_SAMPLE_COUNT_1_BIT; info.tiling = VK_IMAGE_TILING_OPTIMAL; info.usage = usage;
         VmaAllocationCreateInfo allocation{}; allocation.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
         checked(vmaCreateImage(allocator, &info, &allocation, &result.image, &result.allocation, nullptr), "Create image");
-        try { result.view = makeView(result.image, format, aspect, 0, layers, mips); }
+        try { result.view = makeView(result.image, format, aspect, 0, layers, mips, cube); }
         catch (...) { destroy(result); throw; }
         return result;
     }
@@ -214,9 +219,13 @@ struct Renderer::Impl {
         VkCommandBufferAllocateInfo commandInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; commandInfo.commandPool = pool; commandInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; commandInfo.commandBufferCount = 1;
         checked(vkAllocateCommandBuffers(device, &commandInfo, &command), "Allocate command buffer");
         VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; checked(vkCreateFence(device, &fenceInfo, nullptr, &fence), "Create fence");
-        std::array<VkDescriptorSetLayoutBinding, 11> bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 15> bindings{};
         for (uint32_t i = 0; i < 10; ++i) { bindings[i] = {i, i < 8 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}; }
         bindings[10] = {10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        bindings[11] = {11, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        bindings[12] = {12, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        bindings[13] = {13, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        bindings[14] = {14, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size()); layoutInfo.pBindings = bindings.data();
         checked(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorLayout), "Create descriptor layout");
         VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Push)};
@@ -255,10 +264,10 @@ struct Renderer::Impl {
         stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertexShader, "VSMain", nullptr};
         stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragmentShader, "PSMain", nullptr};
         VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
-        std::array<VkVertexInputAttributeDescription, 7> attributes{{
+        std::array<VkVertexInputAttributeDescription, 8> attributes{{
             {0,0,VK_FORMAT_R32G32B32_SFLOAT,offsetof(Vertex,position)}, {1,0,VK_FORMAT_R32G32B32_SFLOAT,offsetof(Vertex,normal)},
             {2,0,VK_FORMAT_R32G32B32A32_SFLOAT,offsetof(Vertex,tangent)}, {3,0,VK_FORMAT_R32G32_SFLOAT,offsetof(Vertex,uv)},
-            {4,0,VK_FORMAT_R32G32_SFLOAT,offsetof(Vertex,lightUV)}, {5,0,VK_FORMAT_R32G32B32A32_SFLOAT,offsetof(Vertex,color)}, {6,0,VK_FORMAT_R32_SFLOAT,offsetof(Vertex,blend)}}};
+            {4,0,VK_FORMAT_R32G32_SFLOAT,offsetof(Vertex,lightUV)}, {5,0,VK_FORMAT_R32G32B32A32_SFLOAT,offsetof(Vertex,color)}, {6,0,VK_FORMAT_R32_SFLOAT,offsetof(Vertex,blend)}, {7,0,VK_FORMAT_R32G32B32A32_SFLOAT,offsetof(Vertex,secondaryUV)}}};
         VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO}; vertex.vertexBindingDescriptionCount = 1; vertex.pVertexBindingDescriptions = &binding; vertex.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributes.size()); vertex.pVertexAttributeDescriptions = attributes.data();
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO}; assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO}; viewport.viewportCount = viewport.scissorCount = 1;
@@ -277,11 +286,12 @@ struct Renderer::Impl {
         Stopwatch compiling;
         VkPipeline value{}; checked(vkCreateGraphicsPipelines(device, pipelineCache, 1, &info, nullptr, &value), "Create graphics pipeline"); pipelineSeconds += compiling.seconds(); pipelines.emplace(key, value); return value;
     }
-    void targets(uint32_t size) {
-        if (targetSize == size) { return; }
+    void targets(uint32_t size, bool water) {
+        if (targetSize == size && targetWater == water) { return; }
         releaseTargets();
         require(size <= properties.limits.maxImageDimension2D, "Capture resolution exceeds the GPU limit.");
         targetSize = size;
+        targetWater = water;
         color = makeImage(size, size, 6, 1, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
         depth = makeImage(size, size, 6, 1, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
         for (uint32_t i = 0; i < 6; ++i) {
@@ -289,6 +299,17 @@ struct Renderer::Impl {
             depthViews[i] = makeView(depth.image, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT, i, 1, 1);
         }
         readback = makeBuffer(VkDeviceSize(size) * size * 6 * sizeof(glm::vec4), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        uint32_t waterSize = water ? size : 1;
+        waterReflection = makeImage(waterSize, waterSize, 6, 1, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, true);
+        waterRefraction = makeImage(waterSize, waterSize, 6, 1, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, true);
+        begin();
+        for (auto* image : {&waterReflection, &waterRefraction}) {
+            barrier(image->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 6);
+            VkClearColorValue clear{{0,0,0,1000000}}; VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,6};
+            vkCmdClearColorImage(command, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+            barrier(image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 6);
+        }
+        submit();
     }
     void prepare(const Scene& scene) {
         checked(vkDeviceWaitIdle(device), "Wait before replacing scene"); releaseScene();
@@ -352,7 +373,7 @@ struct Renderer::Impl {
         auto alignment = properties.limits.minUniformBufferOffsetAlignment;
         auto uniformStride = (sizeof(DrawUniform) + alignment - 1) / alignment * alignment;
         uniforms = makeBuffer(std::max(VkDeviceSize(1), count * uniformStride), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
-        std::array<VkDescriptorPoolSize, 3> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, count * 8}, {VK_DESCRIPTOR_TYPE_SAMPLER, count * 2}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, count}}};
+        std::array<VkDescriptorPoolSize, 3> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, count * 12}, {VK_DESCRIPTOR_TYPE_SAMPLER, count * 2}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, count}}};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; poolInfo.maxSets = count; poolInfo.poolSizeCount = static_cast<uint32_t>(sizes.size()); poolInfo.pPoolSizes = sizes.data();
         checked(vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool), "Create descriptor pool");
         std::vector<VkDescriptorSetLayout> layouts(count, descriptorLayout); descriptors.resize(count);
@@ -372,6 +393,7 @@ struct Renderer::Impl {
             bool fogEnabled = !draw.skyBox && !material.noFog && fogEnd > fogStart;
             DrawUniform uniform{};
             uniform.tint = material.tint;
+            uniform.selfIllumTint = {material.selfIllumTint, 0};
             uniform.controls = {material.alphaReference, material.detailFactor, material.detailScale, fogEnd};
             uniform.flags = {material.flags | (draw.lightmaps[0] ? BumpLight : 0u), draw.lighting, std::bit_cast<uint32_t>(fogStart), fogEnabled ? 1u : 0u};
             uniform.fog = {linear(fogColor.r), linear(fogColor.g), linear(fogColor.b), 1};
@@ -385,29 +407,38 @@ struct Renderer::Impl {
             uniform.phongFresnel = {material.phongFresnel, material.phongExponentFactor}; uniform.phongTint = {material.phongTint, material.blendTintOverBase};
             for (size_t i = 0; i < lighting.ambient.size(); ++i) { uniform.ambient[i] = {lighting.ambient[i], 0}; }
             uniform.lights = lighting.lights;
+            const auto& water = scene.hasWater && !(material.flags & Water) ? scene.materials.at(scene.waterMaterial).water : material.water;
+            uniform.waterFog = {glm::pow(glm::max(water.fogColor, glm::vec3(0)), glm::vec3(2.2f)), water.fogStart};
+            uniform.waterControls = {water.reflectAmount, water.refractAmount, water.fogEnd, water.above ? 1.0f : 0.0f};
+            uniform.waterReflect = {water.reflectTint, water.noFresnel ? 1.0f : 0.0f};
+            uniform.waterRefract = {water.refractTint, water.reflection ? 1.0f : 0.0f};
+            uniform.waterScroll = {water.scroll.x, water.scroll.y, water.scale.x, water.scale.y};
+            uniform.waterLayers = {water.scroll1.x, water.scroll1.y, water.scroll2.x, water.scroll2.y};
+            uniform.waterTime = {water.scroll1.z, water.scroll2.z, static_cast<float>(scene.captureTime), 0};
             std::memcpy(static_cast<std::byte*>(uniforms.mapping) + drawIndex * uniformStride, &uniform, sizeof(uniform));
             VkDescriptorBufferInfo bufferInfo{uniforms.buffer, drawIndex * uniformStride, sizeof(DrawUniform)};
             writes[10] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[drawIndex], 10, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &bufferInfo, nullptr};
             vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            VkDescriptorImageInfo blendImage{VK_NULL_HANDLE, images.at(material.blendMask).view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet blendWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,descriptors[drawIndex],13,0,1,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,&blendImage,nullptr,nullptr};
+            vkUpdateDescriptorSets(device, 1, &blendWrite, 0, nullptr);
+            VkDescriptorImageInfo emissionImage{VK_NULL_HANDLE, images.at(material.selfIllumMask).view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet emissionWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,descriptors[drawIndex],14,0,1,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,&emissionImage,nullptr,nullptr};
+            vkUpdateDescriptorSets(device, 1, &emissionWrite, 0, nullptr);
             unsigned key = (material.translucent ? 1u : 0u) | (material.additive ? 2u : 0u) | (material.noCull ? 4u : 0u) | (draw.skyBox ? 8u : 0u);
             pipeline(key);
         }
         checked(vmaFlushAllocation(allocator, uniforms.allocation, 0, VK_WHOLE_SIZE), "Flush draw uniforms");
     }
-    Cube capture(const Scene& scene, const Probe& probe, bool skyOnly) {
-        uint32_t factor = options.quality == "high" ? 2 : 1;
-        uint32_t size = probe.resolution * factor; targets(size);
-        begin();
-        if (queries) { vkCmdResetQueryPool(command, queries, 0, 2); vkCmdWriteTimestamp2(command, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, queries, 0); }
+    void renderViews(const Scene& scene, glm::vec3 cameraOrigin, size_t probeIndex, bool skyOnly, unsigned mode, bool submerged, glm::vec4 clipPlane) {
+        uint32_t size = targetSize;
         barrier(color.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 6);
         barrier(depth.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT, 1, 6);
         const std::array<glm::vec3, 6> forward{{{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}};
         const std::array<glm::vec3, 6> up{{{0,1,0},{0,1,0},{0,0,-1},{0,0,1},{0,1,0},{0,1,0}}};
         auto projection = glm::perspectiveLH_ZO(glm::radians(90.f), 1.f, 1.f, 1000000.f); projection[1][1] *= -1;
-        auto probeFound = std::find_if(scene.probes.begin(), scene.probes.end(), [&](const auto& value) { return value.origin == probe.origin; });
-        size_t probeIndex = static_cast<size_t>(probeFound - scene.probes.begin());
         for (uint32_t face = 0; face < 6; ++face) {
-            VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; colorAttachment.imageView = colorViews[face]; colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE; colorAttachment.clearValue.color = {{0,0,0,1}};
+            VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; colorAttachment.imageView = colorViews[face]; colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE; colorAttachment.clearValue.color = {{0,0,0,1000000}};
             VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; depthAttachment.imageView = depthViews[face]; depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; depthAttachment.clearValue.depthStencil.depth = 1;
             VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO}; rendering.renderArea.extent = {size,size}; rendering.layerCount = 1; rendering.colorAttachmentCount = 1; rendering.pColorAttachments = &colorAttachment; rendering.pDepthAttachment = &depthAttachment;
             vkCmdBeginRendering(command, &rendering);
@@ -420,22 +451,24 @@ struct Renderer::Impl {
                     VkClearAttachment clear{}; clear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT; clear.clearValue.depthStencil.depth = 1;
                     VkClearRect rectangle{{{0,0},{size,size}},0,1}; vkCmdClearAttachments(command, 1, &clear, 1, &rectangle);
                 }
-                glm::vec3 origin = pass == 0 ? glm::vec3(0) : pass == 1 && scene.skyScale > 0 ? glm::vec3(probe.origin) / scene.skyScale + scene.skyOrigin : glm::vec3(probe.origin);
+                glm::vec3 origin = pass == 0 ? glm::vec3(0) : pass == 1 && scene.skyScale > 0 ? cameraOrigin / scene.skyScale + scene.skyOrigin : cameraOrigin;
                 auto viewProjection = projection * glm::lookAtLH(origin, origin + forward[face], up[face]);
                 std::vector<uint32_t> order(scene.draws.size()); std::iota(order.begin(), order.end(), 0u);
                 std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { auto da = scene.draws[a].center - origin, db = scene.draws[b].center - origin; return glm::dot(da, da) > glm::dot(db, db); });
                 for (unsigned transparent = 0; transparent < 2; ++transparent) {
                     for (uint32_t i : order) {
                         const auto& draw = scene.draws[i]; const auto& material = scene.materials[draw.material];
+                        if (mode && ((material.flags & Water) || material.translucent || material.additive)) { continue; }
+                        if (mode == 1 && draw.lighting && !scene.materials.at(scene.waterMaterial).water.reflectEntities) { continue; }
                         if ((draw.skyBox ? 0u : draw.skyWorld ? 1u : 2u) != pass || bool(transparent) != (material.translucent || material.additive)) { continue; }
-                        if (!draw.visibility.empty() && probeIndex < scene.probes.size() && !(draw.visibility.at(probeIndex / 64) & (uint64_t(1) << (probeIndex % 64)))) { ++culledDraws; continue; }
+                        if (!mode && !draw.visibility.empty() && probeIndex < scene.probes.size() && !(draw.visibility.at(probeIndex / 64) & (uint64_t(1) << (probeIndex % 64)))) { ++culledDraws; continue; }
                         auto relative = draw.center - origin;
                         float z = glm::dot(relative, forward[face]), x = glm::dot(relative, glm::cross(up[face], forward[face])), y = glm::dot(relative, up[face]);
                         if (!draw.skyBox && (z + draw.radius < 1 || std::abs(x) - z > draw.radius * 1.414214f || std::abs(y) - z > draw.radius * 1.414214f)) { ++culledDraws; continue; }
                         unsigned key = (material.translucent ? 1u : 0u) | (material.additive ? 2u : 0u) | (material.noCull ? 4u : 0u) | (draw.skyBox ? 8u : 0u);
                         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline(key));
                         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptors[i], 0, nullptr);
-                        Push push{viewProjection, {origin, float(pass)}};
+                        Push push{viewProjection, {origin, float(pass)}, pass == 2 ? clipPlane : glm::vec4(0), {scene.waterHeight, submerged ? 1.0f : 0.0f, float(mode), 0}};
                         vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
                         vkCmdDrawIndexed(command, draw.indexCount, 1, draw.firstIndex, 0, 0);
                         ++drawCalls;
@@ -444,6 +477,38 @@ struct Renderer::Impl {
             }
             vkCmdEndRendering(command);
         }
+    }
+    void copyWater(GpuImage& destination) {
+        barrier(color.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 6);
+        barrier(destination.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 6);
+        VkImageCopy copy{}; copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,6}; copy.extent = {targetSize,targetSize,1};
+        vkCmdCopyImage(command, color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        barrier(destination.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 6);
+    }
+    Cube capture(const Scene& scene, const Probe& probe, bool skyOnly) {
+        uint32_t factor = options.quality == "high" ? 2 : 1;
+        uint32_t size = probe.resolution * factor; targets(size, scene.hasWater);
+        for (auto descriptor : descriptors) {
+            std::array<VkDescriptorImageInfo, 2> images{{{VK_NULL_HANDLE,waterReflection.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},{VK_NULL_HANDLE,waterRefraction.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}}};
+            std::array<VkWriteDescriptorSet, 2> writes{};
+            for (uint32_t i = 0; i < 2; ++i) { writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,descriptor,11+i,0,1,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,&images[i],nullptr,nullptr}; }
+            vkUpdateDescriptorSets(device, 2, writes.data(), 0, nullptr);
+        }
+        auto found = std::find_if(scene.probes.begin(), scene.probes.end(), [&](const auto& value) { return value.origin == probe.origin; });
+        size_t probeIndex = static_cast<size_t>(found - scene.probes.begin());
+        bool submerged = scene.hasWater && probeIndex < scene.submergedProbes.size() && scene.submergedProbes[probeIndex];
+        begin();
+        if (queries) { vkCmdResetQueryPool(command, queries, 0, 2); vkCmdWriteTimestamp2(command, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, queries, 0); }
+        if (scene.hasWater && !skyOnly) {
+            float side = submerged ? -1.0f : 1.0f;
+            auto reflected = glm::vec3(probe.origin); reflected.z = 2 * scene.waterHeight - reflected.z;
+            renderViews(scene, reflected, probeIndex, false, 1, false, {0,0,side,-scene.waterHeight*side});
+            copyWater(waterReflection);
+            renderViews(scene, glm::vec3(probe.origin), probeIndex, false, 2, false, {0,0,-side,scene.waterHeight*side});
+            copyWater(waterRefraction);
+            waterViews += 12;
+        }
+        renderViews(scene, glm::vec3(probe.origin), probeIndex, skyOnly, 0, submerged, glm::vec4(0));
         barrier(color.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 6);
         VkBufferImageCopy copy{}; copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,6}; copy.imageExtent = {size,size,1};
         vkCmdCopyImageToBuffer(command, color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &copy);
@@ -471,5 +536,7 @@ Renderer::Renderer(const RenderOptions& options) : impl(std::make_unique<Impl>(o
 Renderer::~Renderer() = default;
 void Renderer::prepare(const Scene& scene) { impl->prepare(scene); }
 Cube Renderer::capture(const Scene& scene, const Probe& probe, bool skyOnly) { return impl->capture(scene, probe, skyOnly); }
-Json Renderer::statistics() const { return {{"device", impl->properties.deviceName}, {"driver_version", impl->properties.driverVersion}, {"gpu_seconds", impl->gpuSeconds}, {"captures", impl->captureCount}, {"draw_calls", impl->drawCalls}, {"culled_draws", impl->culledDraws}, {"texture_upload_bytes", impl->textureUploadBytes}, {"upload_submissions", impl->uploadSubmissions}, {"upload_total_seconds", impl->uploadTotalSeconds}, {"upload_wait_seconds", impl->uploadWaitSeconds}, {"pipeline_seconds", impl->pipelineSeconds}, {"swapchain", false}}; }
+Json Renderer::statistics() const {
+    return {{"device", impl->properties.deviceName}, {"driver_version", impl->properties.driverVersion}, {"gpu_seconds", impl->gpuSeconds}, {"captures", impl->captureCount}, {"draw_calls", impl->drawCalls}, {"culled_draws", impl->culledDraws}, {"water_secondary_views", impl->waterViews}, {"water_reflection_levels", impl->waterViews ? 1 : 0}, {"texture_upload_bytes", impl->textureUploadBytes}, {"upload_submissions", impl->uploadSubmissions}, {"upload_total_seconds", impl->uploadTotalSeconds}, {"upload_wait_seconds", impl->uploadWaitSeconds}, {"pipeline_seconds", impl->pipelineSeconds}, {"swapchain", false}};
+}
 }
