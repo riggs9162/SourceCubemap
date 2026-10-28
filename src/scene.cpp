@@ -526,8 +526,8 @@ void Builder::addProps() {
     auto count = reader.take<uint32_t>();
     if (!count) { return; }
     auto version = game->version;
-    require(version >= 4 && version <= 6, std::format("Unsupported static-prop layout v{}.", version));
-    size_t stride = version == 4 ? 56 : version == 5 ? 60 : 64;
+    require((version >= 4 && version <= 6) || version == 10, std::format("Unsupported static-prop layout v{}.", version));
+    size_t stride = version == 4 ? 56 : version == 5 ? 60 : version == 6 ? 64 : 72;
     require(data.size() - reader.cursor == size_t(count) * stride, "Static-prop byte count does not match its version.");
     auto ambientIndexData = bsp.lump(options.hdr ? 51 : 52), ambientSampleData = bsp.lump(options.hdr ? 55 : 56);
     WorldLighting worldLighting(bsp, options.hdr);
@@ -558,7 +558,10 @@ void Builder::addProps() {
     };
     for (uint32_t i = 0; i < count; ++i) {
         size_t record = reader.cursor + size_t(i) * stride;
-        uint32_t propFlags = reader.at<uint8_t>(record + 31);
+        uint32_t propFlags = version == 10 ? reader.at<uint32_t>(record + 64) : reader.at<uint8_t>(record + 31);
+        require((propFlags & ~0x1ffu) == 0, "Unknown static-prop flags.");
+        if (version == 10) { require(reader.at<uint32_t>(record + 68) == 0, "Per-texel static-prop lightmaps are not implemented."); }
+        if (propFlags & 4) { continue; }
         if (version >= 6) {
             auto minimum = reader.at<uint16_t>(record + 60), maximum = reader.at<uint16_t>(record + 62);
             if ((minimum && minimum > 95) || (maximum && maximum < 95)) { continue; }
@@ -627,7 +630,11 @@ void Builder::addProps() {
             vertex.color = glm::vec4(light, 1); scene.vertices.push_back(vertex);
         }
         int skin = reader.at<int32_t>(record + 32);
-        require(skin >= 0 && size_t(skin) < model.mdl.skins.size(), "Static prop has an invalid model skin.");
+        require(skin >= 0 && !model.mdl.skins.empty(), std::format("Static prop {} '{}' has invalid skin metadata.", i, name));
+        if (size_t(skin) >= model.mdl.skins.size()) {
+            require(options.experimental, std::format("Static prop {} '{}' requests skin {} but the model has {} skin families. Use --experimental to select skin zero.", i, name, skin, model.mdl.skins.size()));
+            scene.diagnostics["warnings"].push_back(std::format("Static prop {} '{}' requests missing skin {}; experimental rendering uses skin zero.", i, name, skin)); skin = 0;
+        }
         for (const auto& mesh : baked.meshes) {
             auto slot = model.mdl.skins.at(skin).at(mesh.materialIndex);
             const auto& materialName = model.mdl.materials.at(slot).name;
