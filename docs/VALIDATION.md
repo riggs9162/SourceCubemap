@@ -32,7 +32,7 @@ All 364 LDR/HDR VHV files from Construct's 182 static props pass header, model-c
 
 The generated Flatgrass copy loaded in separate GMod sessions with `mat_hdr_level=0` and `mat_hdr_level=2`. Native materials selected `maps/gm_flatgrass/c0_96_-12032` and `maps/gm_flatgrass/c0_96_-12032.hdr` respectively, both 256 by 256 with no material/texture error. Both produced visible environment reflections on a sphere. LDR/HDR acceptance records and screenshots accompany the local delivery. The generator itself never starts those sessions. Native texture loading, reflection use, and structural preservation are separate from image parity.
 
-The original installed maps are not replaced. Owned temporary maps, graph files, materials, capture folders, and Lua harnesses are removed after copying evidence. Only the owned acceptance processes are stopped.
+The original installed maps are not replaced. Owned acceptance processes were stopped. Temporary map copies and the Lua startup harness were removed after matching their hashes to saved copies. Automatic approval review rejected both bulk cleanup and the narrower verified-file cleanup without a specific reason. Temporary materials, native capture folders, and four generated graph files remain under their unique `scm_*20261028` / `sourcecubemap_*20261028` names. Their locations are recorded in the delivery cleanup report. They are not used by normal maps.
 
 ## Current Construct and HL2 boundaries
 
