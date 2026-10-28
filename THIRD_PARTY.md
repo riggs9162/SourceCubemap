@@ -11,6 +11,7 @@ The build downloads Microsoft's DirectX Shader Compiler v1.9.2609 with a verifie
 Technical references:
 
 - [Valve Source SDK 2013](https://github.com/ValveSoftware/source-sdk-2013): BSP definitions, public VTF interface, cubemap naming and defaults, view rendering, lightmap conventions, and Source shader behavior. Its SDK license does not license this application's code. No Valve implementation is copied into the project.
+- [Facepunch Garry's Mod Lua](https://github.com/Facepunch/garrysmod): public `env_skypaint` inputs and SkyPaint proxy bindings. Painted-sky projection and transfer behavior are characterized with native captures; no proprietary shader binaries are copied or decompiled.
 - [SourcePP](https://github.com/craftablescience/sourcepp): reused parsers and texture/archive serializers under MIT.
 - [Lumper](https://github.com/momentum-mod/lumper): BSP offset and compressed-lump handling reference under MIT.
 - [bsp-to-glb](https://github.com/Hona/bsp-to-glb): compiled geometry and displacement reconstruction reference under MIT.

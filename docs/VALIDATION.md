@@ -1,36 +1,59 @@
 # Local acceptance record
 
-Recorded on 2026-10-28 using the installed Windows x64 GMod and HL2 assets. These observations describe this machine and these inputs, not universal Source compatibility.
+Recorded on 2026-10-28 for SourceCubemap 0.2.0 using installed Windows x64 GMod and HL2 assets. The tested executable was built from `96946ae`. These results describe this machine and these inputs, not universal Source compatibility.
 
 ## Structural and rendering checks
 
-The standalone executable built successfully with MSVC, CMake, Ninja, pinned vcpkg packages, pinned SourcePP, and pinned DXC. Its static executable imports Windows system libraries; Vulkan is loaded from the graphics driver. Generation does not launch a game or load engine binaries.
+The native C++23 executable builds with MSVC, CMake, Ninja, pinned vcpkg packages, pinned SourcePP, and pinned DXC. Vulkan is loaded from the graphics driver. Generation does not launch a game, load engine binaries, or decompile a BSP.
 
-Eighteen local automated cases passed. They cover malformed BSP/game-lump bounds, compressed geometry, signed/default-size probes, declared and explicit mount precedence, VMT patches and DX9 blocks, missing dependencies, input hardlinks, JSON report aliases, in-place backups, interior PAK preservation, unrelated asset/lump bytes, VTF truncation, capture orientation, default sky references, sky classification without visibility, HDR radiance of 4.0, HDR edge/corner agreement, fallback spheremap content, and dependency/corruption cache invalidation. Tests and compiled fixtures remain locally ignored; the accompanying test log records the results.
+Twenty-four local automated cases pass. Coverage includes malformed BSP/game-lump bounds, compressed geometry, signed/default-size probes, declared and explicit mount precedence, VMT patches, DX9/HDR fallback blocks, malformed numeric parameters, missing dependencies, input hardlinks, JSON report aliases, in-place backups, interior PAK preservation, unrelated asset/lump bytes, VTF truncation, capture orientation, default sky references, sky classification without visibility, HDR radiance of 4.0, HDR edge/corner agreement, fallback spheremap content, dependency/corruption cache invalidation, authored material mip chains and their cache roundtrip, initial light styles, VHV/Phong output, and initial sliding/rotating door poses. Tests and fixtures remain locally ignored.
 
-Original `gm_flatgrass`, `gm_construct`, and `d1_trainstation_01` passed the production structural validator. A successful validation does not prove complete reconstruction or image parity.
+The production structural validator accepts the original Flatgrass, Construct, and HL2 train-station maps. Final Flatgrass output contains eight 256-pixel probes in LDR and HDR, with 16 replacement VTF files. The transactional writer verifies unrelated lump bytes/offsets and embedded assets, then reopens and validates the published BSP. A structural pass does not establish complete reconstruction or visual parity.
 
-An asymmetric compiled room rendered six expected colors and a deliberately offset marker. Its generated VTF was loaded by GMod and used on a reflective sphere. A copied experimental Flatgrass output also loaded successfully. Final separate GMod sessions confirmed:
+## Native sky and prop comparisons
 
-- LDR: `mat_hdr_level=0`, generated `maps/gm_flatgrass/c0_96_-12032`, width/height 256, no material or texture error, visible reflected geometry.
-- HDR: `mat_hdr_level=2`, automatic selection of generated `maps/gm_flatgrass/c0_96_-12032.hdr`, width/height 256, no material or texture error, visible reflected geometry.
+Separate GMod sessions capture the procedural painted sky at fixed time zero, with tone mapping scale one and post-processing disabled for the capture view. Native RenderView images are aligned to the D3D/VTF cubemap basis before comparison. The measurements below cover the upward 256-pixel view, using displayed RGB8 values; they are not full-map or linear-HDR error measurements.
 
-Those sessions used copied maps and a temporary acceptance harness. The owned GMod processes were stopped and temporary maps, graph files, materials, captures, and harness were removed after copying evidence. Original map files were not replaced. Native loading and reflection use passed; visual parity did not. The painted sky and static-prop lighting remain experimental. Native Construct/HL2 rendering acceptance has not been completed.
+| Sky case | LDR mean absolute error / 255 | HDR mean absolute error / 255 |
+| --- | ---: | ---: |
+| Authored Flatgrass composite | 0.44 | 0.66 |
+| Isolated gradient | 0.32 | 0.26 |
+| Isolated cloud layer | 4.16 | 4.16 |
 
-## Performance measurements
+The composite's 95th-percentile channel errors are 2 in LDR and 3 in HDR, with maximum 13. The cloud-only case has 95th-percentile error 17 and maximum 48. These differences keep cloud sampling experimental. Native tests show that the sky HDR multiplier scales the gradient but leaves cloud radiance unchanged. Sun discs, dusk bands, and multiple cloud/star layers remain unsupported.
 
-Hardware: AMD Ryzen 9 7900, 12 cores/24 threads; NVIDIA GeForce RTX 3050, 8 GB; NVIDIA driver 616.56. Standard quality, eight native 256-pixel probes, both LDR/HDR, 16 generated VTF textures per complete run. The GPU was shared with the user's running CS2 session. Cold-run samples reported 99% GPU utilization before generation and approximately 6.5 GiB already allocated. The benchmark source revision is `e69c342`. Subsequent changes add validation, report-path protection, VMT fallback parsing, negative-dependency cache checks, and packaging; the capture renderer and Flatgrass shading remain unchanged. The cache schema upgrade requires a fresh first build.
+A neutral compiled room exposed missing LDR lightmap transfer behavior. Applying legacy gamma/overbright encoding and sRGB decoding reduced five unobstructed face comparisons from approximately 4.4 to 0.4 RGB8 levels of mean error. The sixth native face contains an unrelated player-weapon light and is not used as a diffuse-light acceptance metric.
+
+A compiled static-prop fixture separately exercises VHV-only and Phong materials. VHV shadow placement and the lit/dark regions agree with native captures. Edge filtering and lighting differences remain; this is not a broad prop-fidelity certification. Flatgrass's own doll has no embedded VHV and uses the ambient/world-light path. Close room views still show material/luminance differences and some prop differences. Full native Flatgrass parity remains open.
+
+All 364 LDR/HDR VHV files from Construct's 182 static props pass header, model-checksum, LOD, vertex-count, and VTX strip-group checks. The decoder rejects 3,276 corrupted variants. The VHV fixture additionally passes 18 corrupt-input cases. This establishes parsing/mapping coverage, not Construct rendering acceptance.
+
+## Native generated-texture acceptance
+
+The generated Flatgrass copy loaded in separate GMod sessions with `mat_hdr_level=0` and `mat_hdr_level=2`. Native materials selected `maps/gm_flatgrass/c0_96_-12032` and `maps/gm_flatgrass/c0_96_-12032.hdr` respectively, both 256 by 256 with no material/texture error. Both produced visible environment reflections on a sphere. LDR/HDR acceptance records and screenshots accompany the local delivery. The generator itself never starts those sessions. Native texture loading, reflection use, and structural preservation are separate from image parity.
+
+The original installed maps are not replaced. Owned temporary maps, graph files, materials, capture folders, and Lua harnesses are removed after copying evidence. Only the owned acceptance processes are stopped.
+
+## Current Construct and HL2 boundaries
+
+Construct reaches `gm_construct/water_13_beneath` and fails explicitly because the Water shader is not implemented. Initial constant light styles and its supported VHV layouts are now handled. No incomplete Construct BSP is published.
+
+HL2 `d1_trainstation_01` progresses through initial open-door reconstruction and fails at `func_tracktrain`, whose startup path positioning is not implemented. Runtime models, scripted behavior, and other unsupported features are not certified by these checks. No incomplete HL2 BSP is published.
+
+## Measured performance
+
+Hardware: AMD Ryzen 9 7900, 12 cores/24 threads; NVIDIA GeForce RTX 3050, 8 GB; NVIDIA driver 616.56. Standard quality, eight native 256-pixel probes, both LDR/HDR, capture time zero. No GMod, HL2, or CS2 process ran during these measurements. GPU utilization/memory samples before each run are retained in the JSON report.
 
 | Mode | Runs | Median build time | p95 build time | Capture work |
 | --- | ---: | ---: | ---: | --- |
-| Empty application cache | 3 | 19.72 s | 21.23 s | All 16 captures rendered |
-| Warm full regeneration | 3 | 12.76 s | 13.78 s | All 16 captures rendered |
-| Incremental unchanged content | 3 | 4.06 s | 4.75 s | 16 cached captures reused; zero rendered |
+| Empty application cache | 3 | 9.57 s | 10.41 s | All 16 captures rendered |
+| Warm full regeneration | 5 | 6.50 s | 6.54 s | All 16 captures rendered |
+| Incremental unchanged content | 3 | 3.37 s | 3.52 s | 16 cached captures reused; zero rendered |
 
-The below-ten-second warm full regeneration target was not achieved in these runs. Incremental reuse must not be presented as generation speed. Three observations provide only a small sample; the reported nearest-rank p95 is the maximum observed run. Cold means a new application-cache directory, not cleared OS filesystem caches or a cleared driver shader cache. External cold process wall times were 19.85, 16.39, and 21.37 seconds, including CLI/report overhead.
+The warm full-regeneration target is met for this map and machine. This is a small sample, not a guarantee for other maps. Nearest-rank p95 is the largest observed run at these sample counts. Empty application cache does not clear Windows filesystem caches or driver caches. The timing excludes process/report overhead; external process wall times are recorded separately.
 
-Warm full-regeneration stage medians were approximately 2.11 seconds for scene/asset loading, 4.27 for GPU preparation, 2.91 for rendering/readback, 1.57 for encoding, 0.92 for transactional writing, and 0.39 for final validation. Stage medians are independently calculated and do not sum exactly to total median time. Pipeline creation was below one millisecond with the warm cache. GPU preparation used two upload submissions and 260,046,880 total texture bytes across both lighting variants.
+Warm full-regeneration stage medians: parsing 0.296 s; Vulkan startup 0.195 s; scene/asset loading 1.792 s; GPU preparation 1.404 s; rendering/readback 0.119 s; encoding 1.402 s; transactional writing 0.767 s; final validation 0.445 s. Independently calculated stage medians do not sum exactly to the total median. Texture upload totals 339,039,584 bytes across both variants in four submissions. Authored mip levels are uploaded directly.
 
-Vulkan startup occupied approximately 1.1-2.4% of warm build time. That does not justify adding a persistent worker under the plan's 10% criterion. Upload batching and half-float texture storage reduced transfer work. Measurements also exposed and removed per-texel error-message formatting overhead. The changing external GPU load prevents attributing a precise end-to-end speedup to an isolated change.
+Vulkan startup is approximately 3% of the measured warm build. This does not justify a persistent worker under the plan's 10% threshold. The earlier 0.1.0 record measured 12.76 s warm median while CS2 shared the GPU; that workload differs, so it is not a controlled speedup comparison.
 
-Full machine-readable build/benchmark reports and native reflection images are supplied as local delivery artifacts. They are not committed with game-derived fixtures. Further acceptance requires idle-GPU repetitions, matched native image comparisons, water/prop fidelity, and target-game coverage.
+Machine-readable reports, native captures, and the generated local BSP accompany the delivery. No game-derived fixtures or captures are committed to the repository.
