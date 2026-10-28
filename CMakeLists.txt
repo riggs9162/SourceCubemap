@@ -39,7 +39,7 @@ target_link_libraries(scm_core PUBLIC sourcepp::bsppp sourcepp::vpkpp sourcepp::
 target_link_libraries(scm_core PRIVATE MINIZIP::minizip)
 add_executable(sourcecubemap src/main.cpp)
 target_compile_definitions(sourcecubemap PRIVATE SCM_VERSION="${PROJECT_VERSION}")
-add_library(scm_scene src/scene.cpp src/cache.cpp src/lighting.cpp)
+add_library(scm_scene src/scene.cpp src/cache.cpp src/lighting.cpp src/entities.cpp)
 target_link_libraries(scm_scene PUBLIC scm_core)
 add_library(scm_capture src/capture.cpp)
 target_link_libraries(scm_capture PUBLIC scm_core)
