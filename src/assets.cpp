@@ -158,8 +158,9 @@ MaterialDefinition readMaterial(Assets& assets, std::string name, bool hdr, unsi
         auto key = lower(std::string(entry.getKey()));
         if (key == "proxies") { for (const auto& proxy : entry) { result.proxies.emplace_back(proxy.getKey()); } }
         else if (entry.getChildCount() == 0) { result.parameters[key] = std::string(entry.getValue()); }
-        else if (key.ends_with("_dx6") || key.ends_with("_dx7") || key.ends_with("_dx8") || key == "<dx90") { continue; }
-        else if (key == ">=dx90" || key == ">=dx90_20b" || key == ">=dx95" || key == result.shader + "_dx9" || key == result.shader + "_dx90" || key == result.shader + "_dx95") {
+        else if (key == result.shader + "_hdr_dx9" && !hdr) { continue; }
+        else if (key.ends_with("_dx6") || key.ends_with("_dx7") || key.ends_with("_dx8") || key == "<dx80" || key == "<dx81" || key == "<dx90" || key == "<dx95") { continue; }
+        else if (key == ">=dx90" || key == ">=dx90_20b" || key == ">=dx95" || key == result.shader + "_dx9" || key == result.shader + "_dx90" || key == result.shader + "_dx95" || (hdr && key == result.shader + "_hdr_dx9")) {
             for (const auto& child : entry) {
                 auto childKey = lower(std::string(child.getKey()));
                 if (childKey == "proxies") { for (const auto& proxy : child) { result.proxies.emplace_back(proxy.getKey()); } }
