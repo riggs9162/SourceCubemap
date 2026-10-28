@@ -142,7 +142,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
 int main(int argc, char** argv) {
     auto logger = spdlog::stderr_color_mt("sourcecubemap"); spdlog::set_default_logger(logger); spdlog::set_pattern("%v");
     CLI::App app{"Standalone Source Engine cubemap generator", "sourcecubemap"};
-    app.set_version_flag("--version", "SourceCubemap 0.1.0");
+    app.set_version_flag("--version", "SourceCubemap " SCM_VERSION);
     app.require_subcommand(1);
     Options options;
     wchar_t* local = nullptr; size_t length = 0; _wdupenv_s(&local, &length, L"LOCALAPPDATA");

@@ -54,6 +54,8 @@ $taskHashes = [ordered]@{}
 foreach ($taskFile in $taskFiles) { $taskHashes[$taskFile] = (Get-FileHash -LiteralPath (Join-Path $taskOutput $taskFile) -Algorithm SHA256).Hash.ToLowerInvariant() }
 $taskCommit = & git -C $taskRoot rev-parse HEAD
 $taskDirty = @(& git -C $taskRoot status --porcelain).Count -gt 0
-[ordered]@{ version = '0.1.0'; status = 'experimental'; source_commit = $taskCommit; source_dirty = $taskDirty; packaged_utc = [DateTime]::UtcNow.ToString('o'); sha256 = $taskHashes } |
+$taskVersion = (& (Join-Path $taskBuild 'sourcecubemap.exe') --version) -replace '^SourceCubemap ', ''
+if ($LASTEXITCODE -ne 0 -or $taskVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'Cannot determine the packaged executable version.' }
+[ordered]@{ version = $taskVersion; status = 'experimental'; source_commit = $taskCommit; source_dirty = $taskDirty; packaged_utc = [DateTime]::UtcNow.ToString('o'); sha256 = $taskHashes } |
     ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $taskOutput 'manifest.json') -Encoding utf8
 Write-Output $taskOutput
