@@ -24,6 +24,7 @@ struct MaterialDefinition {
     std::string shader;
     std::map<std::string, std::string> parameters;
     std::vector<std::string> proxies;
+    std::vector<std::map<std::string, std::string>> proxyParameters;
     std::string value(std::string_view key, std::string fallback = {}) const;
     bool flag(std::string_view key) const;
 };

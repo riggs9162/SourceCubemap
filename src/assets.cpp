@@ -134,6 +134,15 @@ MaterialDefinition readMaterial(Assets& assets, std::string name, bool hdr, unsi
     const auto& root = document[0];
     MaterialDefinition result;
     result.shader = lower(std::string(root.getKey()));
+    auto addProxy = [&](const auto& proxy) {
+        result.proxies.emplace_back(proxy.getKey());
+        std::map<std::string, std::string> parameters;
+        for (const auto& entry : proxy) {
+            require(entry.getChildCount() == 0, std::format("Unsupported nested proxy parameter in {}.", name));
+            parameters[lower(std::string(entry.getKey()))] = std::string(entry.getValue());
+        }
+        result.proxyParameters.push_back(std::move(parameters));
+    };
     if (result.shader == "patch") {
         auto include = root["include"].getValue();
         require(!include.empty(), std::format("Patch has no include: {}", name));
@@ -156,14 +165,14 @@ MaterialDefinition readMaterial(Assets& assets, std::string name, bool hdr, unsi
             if ((conditional == "$hdr" && !hdr) || ((conditional == "!$hdr" || conditional == "$ldr") && hdr)) { continue; }
         }
         auto key = lower(std::string(entry.getKey()));
-        if (key == "proxies") { for (const auto& proxy : entry) { result.proxies.emplace_back(proxy.getKey()); } }
+        if (key == "proxies") { for (const auto& proxy : entry) { addProxy(proxy); } }
         else if (entry.getChildCount() == 0) { result.parameters[key] = std::string(entry.getValue()); }
         else if (key == result.shader + "_hdr_dx9" && !hdr) { continue; }
         else if (key.ends_with("_dx6") || key.ends_with("_dx7") || key.ends_with("_dx8") || key == "<dx80" || key == "<dx81" || key == "<dx90" || key == "<dx95") { continue; }
         else if (key == ">=dx90" || key == ">=dx90_20b" || key == ">=dx95" || key == result.shader + "_dx9" || key == result.shader + "_dx90" || key == result.shader + "_dx95" || (hdr && key == result.shader + "_hdr_dx9")) {
             for (const auto& child : entry) {
                 auto childKey = lower(std::string(child.getKey()));
-                if (childKey == "proxies") { for (const auto& proxy : child) { result.proxies.emplace_back(proxy.getKey()); } }
+                if (childKey == "proxies") { for (const auto& proxy : child) { addProxy(proxy); } }
                 else { require(child.getChildCount() == 0, std::format("Unsupported nested material block '{}' in {}.", childKey, name)); result.parameters[childKey] = std::string(child.getValue()); }
             }
         }
