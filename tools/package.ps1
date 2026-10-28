@@ -7,7 +7,7 @@ $taskRoot = Split-Path $PSScriptRoot -Parent
 $taskBuild = if ([IO.Path]::IsPathRooted($BuildDirectory)) { [IO.Path]::GetFullPath($BuildDirectory) } else { [IO.Path]::GetFullPath((Join-Path $taskRoot $BuildDirectory)) }
 $taskOutput = [IO.Path]::GetFullPath($Destination)
 if (Test-Path -LiteralPath $taskOutput) { throw 'The package destination must be a new directory.' }
-$taskFiles = @('sourcecubemap.exe', 'shaders/scene.vert.spv', 'shaders/scene.frag.spv')
+$taskFiles = @('sourcecubemap.exe', 'sourcecubemap-gui.exe', 'shaders/scene.vert.spv', 'shaders/scene.frag.spv')
 foreach ($taskFile in $taskFiles) {
     if (!(Test-Path -LiteralPath (Join-Path $taskBuild $taskFile))) { throw "Build output is missing: $taskFile" }
 }

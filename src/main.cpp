@@ -14,8 +14,23 @@ struct Options {
     std::string input, game, output, report, asset, cache, profile = "gmod", hdr = "auto", quality = "standard", device, previews, water = "strict";
     std::vector<std::string> mounts;
     bool overwrite = false, inPlace = false, verbose = false, experimental = false, noCache = false, incremental = false;
+    bool progressJson = false;
+    std::string cancelEvent;
     double captureTime = 0;
     unsigned runs = 3;
+};
+void progress(const Options& options, std::string stage, unsigned current = 0, unsigned total = 0) {
+    if (options.progressJson) { std::cout << scm::Json{{"event", "progress"}, {"stage", stage}, {"current", current}, {"total", total}}.dump() << '\n' << std::flush; }
+}
+class Cancellation {
+public:
+    explicit Cancellation(const std::string& name) {
+        if (!name.empty()) { event = OpenEventA(SYNCHRONIZE, FALSE, name.c_str()); scm::require(event != nullptr, "The requested cancellation event is unavailable."); }
+    }
+    ~Cancellation() { if (event) { CloseHandle(event); } }
+    void check() const { scm::require(!event || WaitForSingleObject(event, 0) != WAIT_OBJECT_0, "Cancelled by user. No BSP was written."); }
+private:
+    HANDLE event = nullptr;
 };
 bool aliases(const scm::fs::path& first, const scm::fs::path& second) {
     if (scm::fs::exists(first) && scm::fs::exists(second)) { return scm::fs::equivalent(first, second); }
@@ -69,6 +84,7 @@ bool needsDefaultSky(const scm::Bsp& bsp, scm::Assets& assets, bool hdr, std::st
 }
 scm::Json build(const Options& options, const scm::fs::path& output) {
     scm::require(std::isfinite(options.captureTime) && options.captureTime >= 0, "Capture time must be a finite nonnegative number.");
+    Cancellation cancellation(options.cancelEvent); cancellation.check(); progress(options, "parsing");
     scm::Stopwatch total, parsing;
     scm::Bsp bsp(options.input);
     bsp.validateDestination(output, options.overwrite, options.inPlace);
@@ -82,6 +98,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
     if ((options.hdr == "auto" || options.hdr == "hdr" || options.hdr == "both") && bsp.lumps[53].length) { variants.push_back(true); }
     scm::require(!variants.empty() && (options.hdr != "both" || variants.size() == 2), "The requested lighting variant is absent from the BSP.");
     scm::Stopwatch startup;
+    cancellation.check(); progress(options, "starting_renderer");
     scm::Renderer renderer({options.device, options.quality, shaderDirectory(), options.noCache ? scm::fs::path{} : scm::fs::path(options.cache)});
     times["startup"] = startup.seconds();
     std::map<std::string, scm::Bytes> textures;
@@ -92,17 +109,21 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
     scm::Assets assets(bsp, options.game, options.mounts, options.profile);
     assetsSeconds += mounting.seconds();
     for (bool hdr : variants) {
+        cancellation.check(); progress(options, hdr ? "loading_hdr_assets" : "loading_ldr_assets");
         spdlog::info("Resolving {} scene and required assets", hdr ? "HDR" : "LDR");
         scm::Stopwatch loading;
         bool defaultSky = needsDefaultSky(bsp, assets, hdr, mapNamespace);
         scm::SceneOptions sceneOptions{hdr, options.captureTime, options.cache, !options.noCache, options.experimental, defaultSky};
         sceneOptions.planarWater = options.water == "planar";
         auto scene = scm::loadScene(bsp, assets, sceneOptions);
+        cancellation.check();
         assetsSeconds += loading.seconds();
         auto cacheDescription = "renderer-v2:" + scm::sceneCacheKey(bsp, assets, sceneOptions) + assets.report().dump() + options.quality + renderer.statistics().at("device").get<std::string>() + renderer.statistics().at("driver_version").dump() + scm::digest(scm::readFile(shaderDirectory() / "scene.vert.spv")) + scm::digest(scm::readFile(shaderDirectory() / "scene.frag.spv"));
         auto cacheKey = scm::digest(std::as_bytes(std::span(cacheDescription.data(), cacheDescription.size())));
         bool prepared = false;
         for (size_t i = 0; i < bsp.probes.size() + size_t(defaultSky); ++i) {
+            cancellation.check();
+            progress(options, hdr ? "capturing_hdr" : "capturing_ldr", static_cast<unsigned>(i), static_cast<unsigned>(bsp.probes.size() + size_t(defaultSky)));
             bool skyOnly = i == bsp.probes.size();
             scm::Probe probe = skyOnly ? scm::Probe{glm::ivec3(0), 32} : bsp.probes[i];
             auto name = (skyOnly ? std::string("cubemapdefault") : probe.name()) + (hdr ? ".hdr" : "");
@@ -125,7 +146,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
                 if (!options.previews.empty()) { scm::writePreview(scm::decodeCube(bytes, hdr), options.previews, name); }
                 continue;
             }
-            if (!prepared) { scm::Stopwatch preparation; renderer.prepare(scene); prepareSeconds += preparation.seconds(); prepared = true; }
+            if (!prepared) { progress(options, "preparing_gpu"); scm::Stopwatch preparation; renderer.prepare(scene); prepareSeconds += preparation.seconds(); prepared = true; cancellation.check(); }
             spdlog::info("Capturing {} {}/{}: {} ({} pixels)", hdr ? "HDR" : "LDR", i + 1, bsp.probes.size() + size_t(defaultSky), name, probe.resolution);
             scm::Stopwatch rendering;
             auto cube = renderer.capture(scene, probe, skyOnly);
@@ -143,6 +164,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
         scenes.push_back({{"hdr", hdr}, {"geometry", scene.diagnostics}, {"assets", assets.report()}});
     }
     scm::Stopwatch writing;
+    cancellation.check(); progress(options, "writing_bsp");
     auto textureCount = textures.size();
     auto metadata = scm::Json{{"schema", 1}, {"map_namespace", mapNamespace}, {"runtime_map_namespace", scm::lower(output.stem().string())}, {"texture_namespaces", names}}.dump(2);
     auto metadataBytes = std::as_bytes(std::span(metadata.data(), metadata.size()));
@@ -150,6 +172,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
     bsp.writeCubemaps(textures, output, options.overwrite, options.inPlace);
     times["bsp_writing_including_transaction_validation"] = writing.seconds();
     scm::Stopwatch validation;
+    progress(options, "validating_output");
     scm::Bsp reopened(output); reopened.validateTextures(); reopened.verifyPreserved(bsp, textures);
     times["validation"] = validation.seconds();
     times["scene_and_asset_loading"] = assetsSeconds; times["gpu_preparation"] = prepareSeconds;
@@ -173,6 +196,7 @@ int main(int argc, char** argv) {
         command->add_option("--mount", options.mounts, "Additional content directories or archives, in priority order.");
         command->add_option("--json", options.report, "Save the complete machine-readable report.");
         command->add_flag("--verbose", options.verbose);
+        command->add_flag("--progress-json", options.progressJson, "Emit newline-delimited progress events.");
     };
     auto inspect = app.add_subcommand("inspect", "Inspect BSP structure and cubemap samples."); common(inspect, false);
     inspect->add_option("--asset", options.asset, "Inspect a resolved text resource and its provenance.");
@@ -184,6 +208,7 @@ int main(int argc, char** argv) {
         command->add_option("--quality", options.quality)->check(CLI::IsMember({"fast", "standard", "high"}));
         command->add_option("--water", options.water, "Planar reflections and depth refraction require --experimental.")->check(CLI::IsMember({"strict", "planar"}));
         command->add_option("--capture-time", options.captureTime)->check(CLI::NonNegativeNumber);
+        command->add_option("--cancel-event", options.cancelEvent, "Windows event used for cooperative cancellation before publication.");
         command->add_option("--device", options.device, "Case-insensitive Vulkan device name substring.");
         command->add_option("--cache", options.cache, "Persistent scene, pipeline, and capture cache directory.");
         command->add_flag("--no-cache", options.noCache, "Disable application cache reads and writes.");
@@ -232,7 +257,8 @@ int main(int argc, char** argv) {
             report["validation"] = *validate ? "structural_pass" : "not_requested";
         }
         if (!options.report.empty()) { auto text = report.dump(2); scm::writeFile(options.report, std::as_bytes(std::span(text.data(), text.size()))); }
-        std::cout << report.dump(2) << '\n';
+        if (options.progressJson) { std::cout << scm::Json{{"event", "complete"}, {"report", options.report}}.dump() << '\n'; }
+        else { std::cout << report.dump(2) << '\n'; }
         return 0;
     } catch (const CLI::ParseError& error) { return app.exit(error); }
     catch (const std::exception& error) { spdlog::error("Error: {}", error.what()); return 1; }

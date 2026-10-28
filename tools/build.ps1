@@ -1,4 +1,4 @@
-param([ValidateSet('release', 'debug')][string]$Preset = 'release', [switch]$ConfigureOnly, [switch]$Fresh, [switch]$SkipConfigure)
+param([ValidateSet('release', 'debug')][string]$Preset = 'release', [switch]$ConfigureOnly, [switch]$Fresh, [switch]$SkipConfigure, [string[]]$Target)
 $ErrorActionPreference = 'Stop'
 $taskVswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 $taskVs = & $taskVswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -21,7 +21,9 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed ($LASTEXITCODE)." }
     }
     if (!$ConfigureOnly) {
-        & $taskCmake --build --preset $Preset
+        $taskBuildArguments = @('--build', '--preset', $Preset)
+        if ($Target) { $taskBuildArguments += @('--target') + $Target }
+        & $taskCmake @taskBuildArguments
         if ($LASTEXITCODE -ne 0) { throw "Compilation failed ($LASTEXITCODE)." }
     }
 } finally { Pop-Location }
