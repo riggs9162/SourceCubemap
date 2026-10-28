@@ -19,7 +19,16 @@ float largest(glm::vec3 color) { return std::max({color.r, color.g, color.b}); }
 }
 
 std::array<glm::vec3, 4> lightmapRadiance(std::array<glm::vec3, 4> samples, bool bumped, bool hdr) {
-    if (hdr) { return samples; }
+    if (hdr) {
+        if (bumped) {
+            auto sum = samples[1] + samples[2] + samples[3];
+            for (unsigned channel = 0; channel < 3; ++channel) {
+                float correction = sum[channel] > 0 ? samples[0][channel] * 3.0f / sum[channel] : 0;
+                for (unsigned plane = 1; plane < 4; ++plane) { samples[plane][channel] *= correction; }
+            }
+        }
+        return samples;
+    }
     glm::vec3 target;
     for (unsigned channel = 0; channel < 3; ++channel) { target[channel] = legacyLightEncoding(samples[0][channel]); }
     if (bumped) {
