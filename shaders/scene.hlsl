@@ -69,13 +69,13 @@ float3 PaintedSkyColor(float3 direction) {
     direction = normalize(direction);
     float elevation = saturate(direction.z);
     float blend = pow(elevation, max(parameters.skyTop.w, 0.0001));
-    float3 color = lerp(parameters.skyBottom.rgb, parameters.skyTop.rgb, blend);
+    float3 color = lerp(parameters.skyBottom.rgb, parameters.skyTop.rgb, blend) * parameters.skyBottom.w;
     if (parameters.skyControls.y > 0 && elevation > 0) {
         float2 uv = direction.xy / (max(direction.z, 0.001) * max(parameters.stars.x, 0.0001)) + parameters.stars.z;
         float4 cloud = secondTexture.Sample(materialSampler, uv);
         color += cloud.rgb * pow(elevation, rcp(max(parameters.stars.y, 0.0001)));
     }
-    return color * parameters.skyBottom.w;
+    return color;
 }
 
 float3 AmbientLighting(float3 normal) {
