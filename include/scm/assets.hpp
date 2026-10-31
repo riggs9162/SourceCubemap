@@ -22,7 +22,8 @@ public:
     Json report() const;
     void mount(const fs::path& path, bool required = true, bool scanArchives = true);
 private:
-    struct Mount { fs::path path; std::unique_ptr<vpkpp::PackFile> archive; };
+    class DirectoryIndex;
+    struct Mount { fs::path path; std::unique_ptr<vpkpp::PackFile> archive; std::shared_ptr<DirectoryIndex> files; };
     friend const MaterialDefinition& readMaterial(Assets& assets, std::string name, bool hdr, unsigned depth);
     const Bsp& bsp;
     std::vector<Mount> sources;

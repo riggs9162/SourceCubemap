@@ -2,8 +2,67 @@
 #include <vpkpp/format/GMA.h>
 #include <vpkpp/format/VPK.h>
 #include <spdlog/spdlog.h>
+#include <unordered_set>
 
 namespace scm {
+namespace {
+bool indexable(std::string_view name) {
+    size_t segment = 0;
+    for (size_t i = 0; i <= name.size(); ++i) {
+        if (i == name.size() || name[i] == '/') {
+            if (i == segment || name[i - 1] == '.' || name[i - 1] == ' ') { return false; }
+            segment = i + 1;
+        } else if (static_cast<unsigned char>(name[i]) >= 128) { return false; }
+    }
+    return true;
+}
+}
+
+/// Answers lookups inside a mounted directory from cached folder listings, so repeated misses cost no disk access.
+class Assets::DirectoryIndex {
+public:
+    explicit DirectoryIndex(fs::path root) { tree.path = std::move(root); }
+    bool contains(std::string_view name);
+private:
+    struct Folder {
+        fs::path path;
+        bool listed = false;
+        std::unordered_set<std::string> files;
+        std::unordered_map<std::string, std::unique_ptr<Folder>> folders;
+    };
+    static void list(Folder& folder);
+    Folder tree;
+};
+
+bool Assets::DirectoryIndex::contains(std::string_view name) {
+    if (!indexable(name)) { return fs::is_regular_file(tree.path / name); }
+    auto* folder = &tree;
+    for (size_t begin = 0;;) {
+        if (!folder->listed) { list(*folder); }
+        auto end = name.find('/', begin);
+        if (end == std::string_view::npos) { return folder->files.contains(std::string(name.substr(begin))); }
+        auto child = folder->folders.find(std::string(name.substr(begin, end - begin)));
+        if (child == folder->folders.end()) { return false; }
+        folder = child->second.get(); begin = end + 1;
+    }
+}
+void Assets::DirectoryIndex::list(Folder& folder) {
+    folder.listed = true;
+    std::error_code error;
+    for (fs::directory_iterator entry(folder.path, fs::directory_options::skip_permission_denied, error), end; !error && entry != end; entry.increment(error)) {
+        auto wide = entry->path().filename().wstring();
+        if (std::any_of(wide.begin(), wide.end(), [](wchar_t value) { return value >= 128; })) { continue; }
+        std::string name(wide.size(), '\0');
+        std::transform(wide.begin(), wide.end(), name.begin(), [](wchar_t value) { return static_cast<char>(value); });
+        name = lower(std::move(name));
+        std::error_code status;
+        if (entry->is_directory(status)) {
+            auto child = std::make_unique<Folder>(); child->path = entry->path();
+            folder.folders.emplace(std::move(name), std::move(child));
+        } else if (entry->is_regular_file(status)) { folder.files.insert(std::move(name)); }
+    }
+}
+
 void Assets::mount(const fs::path& input, bool required, bool scanArchives) {
     auto path = fs::absolute(input).lexically_normal();
     if (!fs::exists(path)) {
@@ -13,7 +72,7 @@ void Assets::mount(const fs::path& input, bool required, bool scanArchives) {
     }
     if (!mounted.insert(lower(path.string())).second) { return; }
     if (fs::is_directory(path)) {
-        sources.push_back({path, {}});
+        sources.push_back({path, {}, std::make_shared<DirectoryIndex>(path)});
         if (!scanArchives) { return; }
         std::vector<fs::path> archives;
         for (const auto& entry : fs::directory_iterator(path)) {
@@ -29,7 +88,7 @@ void Assets::mount(const fs::path& input, bool required, bool scanArchives) {
     else if (extension == ".gma") { archive = vpkpp::GMA::open(path.string()); }
     else { throw Error(std::format("Unsupported archive mount: {}", path.string())); }
     require(archive != nullptr, "Cannot open archive: {}", path.string());
-    sources.push_back({path, std::move(archive)});
+    sources.push_back({path, std::move(archive), {}});
 }
 Assets::Assets(const Bsp& map, const fs::path& game, const std::vector<std::string>& mounts, std::string profile) : bsp(map) {
     require(fs::is_regular_file(game / "gameinfo.txt"), "--game must identify a directory containing gameinfo.txt.");
@@ -91,7 +150,7 @@ std::shared_ptr<const Asset> Assets::find(std::string name) {
     for (const auto& source : sources) {
         std::optional<Bytes> bytes;
         if (source.archive) { bytes = source.archive->readEntry(name); }
-        else if (fs::is_regular_file(source.path / name)) { bytes = readFile(source.path / name); }
+        else if (source.files->contains(name)) { bytes = readFile(source.path / name); }
         if (!bytes) { continue; }
         auto asset = std::make_shared<Asset>(Asset{std::move(*bytes), source.path.string() + "::" + name});
         cache.emplace(name, asset);
