@@ -830,11 +830,12 @@ Scene Builder::build() {
     require(!scene.hasWater || (scene.waterMaterial < scene.materials.size() && (scene.materials[scene.waterMaterial].flags & Water)), "Water volumes require a supported above-water surface material.");
     addSky();
     finishImages();
-    for (auto& draw : scene.draws) {
+    parallelFor(scene.draws.size(), [&](size_t index) {
+        auto& draw = scene.draws[index];
         glm::vec3 minimum(std::numeric_limits<float>::max()), maximum(std::numeric_limits<float>::lowest());
         for (uint32_t i = 0; i < draw.indexCount; ++i) { auto position = scene.vertices.at(scene.indices.at(draw.firstIndex + i)).position; minimum = glm::min(minimum, position); maximum = glm::max(maximum, position); }
         draw.center = (minimum + maximum) * 0.5f; draw.radius = glm::length(maximum - minimum) * 0.5f;
-    }
+    });
     scene.diagnostics["vertices"] = scene.vertices.size();
     scene.diagnostics["triangles"] = scene.indices.size() / 3;
     scene.diagnostics["draws"] = scene.draws.size();
