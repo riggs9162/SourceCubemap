@@ -55,6 +55,10 @@ sourcecubemap validate map_built.bsp
 
 运行 `sourcecubemap build --help` 查看完整列表。`sourcecubemap inspect map.bsp` 可以查看地图的内容，不会构建任何东西。
 
+## 配合 CompilePal++ 使用
+
+[CompilePal++](https://github.com/riggs9162/CompilePal) 029.4 之后的版本可以把 SourceCubemap 作为编译阶段运行，编译时无需打开游戏。其[指南](https://github.com/riggs9162/CompilePal/blob/toolspp/standalone-support/docs/sourcecubemap.md)介绍了设置方法。
+
 ## 构建中断时
 
 默认情况下，如果地图用到了 SourceCubemap 无法还原的内容，它会停下来并告诉你具体是什么。加上 `--experimental` 就会改用最接近的替代效果继续运行。 Windows 程序默认就会这样做，可以在 `Options...` 里关闭。

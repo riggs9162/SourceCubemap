@@ -55,6 +55,10 @@ sourcecubemap validate map_built.bsp
 
 Führe `sourcecubemap build --help` aus, um die vollständige Liste zu sehen. `sourcecubemap inspect map.bsp` zeigt, was eine Map enthält, ohne etwas zu bauen.
 
+## Mit CompilePal++ verwenden
+
+Versionen von [CompilePal++](https://github.com/riggs9162/CompilePal) nach 029.4 können SourceCubemap als Kompilierschritt ausführen, sodass das Spiel beim Kompilieren nie starten muss. Die [Anleitung](https://github.com/riggs9162/CompilePal/blob/toolspp/standalone-support/docs/sourcecubemap.md) erklärt die Einrichtung.
+
 ## Wenn ein Build abbricht
 
 Standardmäßig bricht SourceCubemap ab, wenn eine Map etwas verwendet, das es nicht nachbilden kann, und sagt dir, was es war. Mit `--experimental` macht es stattdessen mit der nächstbesten Entsprechung weiter. Das Windows-Programm macht das standardmäßig, und unter `Options...` lässt es sich abschalten.
