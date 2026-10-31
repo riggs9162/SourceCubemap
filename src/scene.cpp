@@ -124,24 +124,36 @@ WaterMaterial waterDefinition(const MaterialDefinition& definition, double time)
     }
     return water;
 }
-glm::vec2 transformedUV(glm::vec2 uv, std::string_view description) {
-    if (description.empty()) { return uv; }
-    std::istringstream stream{std::string(description)};
-    std::string key;
-    glm::vec2 center(0.5f), scale(1), translation(0);
-    float angle = 0;
-    while (stream >> key) {
-        if (key == "center") { stream >> center.x >> center.y; }
-        else if (key == "scale") { stream >> scale.x >> scale.y; }
-        else if (key == "rotate") { stream >> angle; }
-        else if (key == "translate") { stream >> translation.x >> translation.y; }
-        else { throw Error(std::format("Unsupported texture transform: {}", description)); }
-        require(!stream.fail() && std::isfinite(center.x) && std::isfinite(center.y) && std::isfinite(scale.x) && std::isfinite(scale.y) && std::isfinite(angle) && std::isfinite(translation.x) && std::isfinite(translation.y), "Invalid texture transform: {}", description);
+/// A material texture transform parsed once so applying it to each vertex costs only arithmetic.
+class UvTransform {
+public:
+    explicit UvTransform(std::string_view description = {}) {
+        if (description.empty()) { return; }
+        std::istringstream stream{std::string(description)};
+        std::string key;
+        float angle = 0;
+        while (stream >> key) {
+            if (key == "center") { stream >> center.x >> center.y; }
+            else if (key == "scale") { stream >> scale.x >> scale.y; }
+            else if (key == "rotate") { stream >> angle; }
+            else if (key == "translate") { stream >> translation.x >> translation.y; }
+            else { throw Error(std::format("Unsupported texture transform: {}", description)); }
+            require(!stream.fail() && std::isfinite(center.x) && std::isfinite(center.y) && std::isfinite(scale.x) && std::isfinite(scale.y) && std::isfinite(angle) && std::isfinite(translation.x) && std::isfinite(translation.y), "Invalid texture transform: {}", description);
+        }
+        float radians = glm::radians(angle);
+        cosine = std::cos(radians); sine = std::sin(radians); identity = false;
     }
-    uv = (uv - center) * scale;
-    float radians = glm::radians(angle);
-    return glm::vec2(std::cos(radians) * uv.x - std::sin(radians) * uv.y, std::sin(radians) * uv.x + std::cos(radians) * uv.y) + center + translation;
-}
+    glm::vec2 operator()(glm::vec2 uv) const {
+        if (identity) { return uv; }
+        uv = (uv - center) * scale;
+        return glm::vec2(cosine * uv.x - sine * uv.y, sine * uv.x + cosine * uv.y) + center + translation;
+    }
+private:
+    bool identity = true;
+    glm::vec2 center{0.5f}, scale{1}, translation{0};
+    float cosine = 1, sine = 0;
+};
+struct MaterialUv { UvTransform secondary, blend, base; };
 
 /// A texture whose asset is resolved and whose VTF decoding waits for the parallel pass at the end of the build.
 struct PendingTexture { uint32_t index; std::shared_ptr<const Asset> asset; bool srgb; int frame; };
@@ -478,7 +490,18 @@ public:
     const Bsp& bsp;
     Assets& assets;
     SceneOptions options;
+    const MaterialUv& materialUv(uint32_t index) {
+        if (uvTransforms.size() <= index) { uvTransforms.resize(scene.materials.size()); }
+        auto& transforms = uvTransforms[index];
+        if (!transforms) {
+            const auto& material = scene.materials[index];
+            const auto& definition = material.definition;
+            transforms = std::make_unique<MaterialUv>(MaterialUv{UvTransform(definition.value((material.flags & TwoTexture) ? "$texture2transform" : "$basetexturetransform2")), UvTransform(definition.value("$blendmasktransform")), UvTransform(definition.value("$basetexturetransform"))});
+        }
+        return *transforms;
+    }
     std::span<const std::byte> nodesData, planeData, leafData, leafFaceData, visData, lightData;
+    std::vector<std::unique_ptr<MaterialUv>> uvTransforms;
     std::set<uint32_t> skyFaces;
     int skyArea = -1;
     std::map<std::string, uint32_t> textureIds, materialIds;
@@ -672,6 +695,7 @@ Scene Builder::build() {
             require(faceModels[faceIndex] == 0 && !inSkyWorld && std::abs(polygon.front().z - scene.waterHeight) < 0.1f, "Moving, sloped, and skybox water are not implemented.");
             if (mat.water.above) { scene.waterMaterial = materialIndex; }
         }
+        const auto& uvTransform = materialUv(materialIndex);
         auto makeVertex = [&](glm::vec3 position, glm::vec3 uvPosition, float alpha) {
             Vertex vertex;
             vertex.position = glm::vec3(brush.matrix * glm::vec4(position, 1)); vertex.normal = glm::mat3(brush.matrix) * normal;
@@ -679,8 +703,8 @@ Scene Builder::build() {
             vertex.tangent = glm::vec4(glm::mat3(brush.matrix) * tangent, glm::dot(glm::cross(normal, tangent), glm::vec3(vec4(info.textureVector2))) < 0 ? -1 : 1);
             glm::vec4 homogeneous(uvPosition, 1);
             vertex.uv = {glm::dot(homogeneous, vec4(info.textureVector1)) / tex.width, glm::dot(homogeneous, vec4(info.textureVector2)) / tex.height};
-            vertex.secondaryUV = glm::vec4(transformedUV(vertex.uv, mat.definition.value((mat.flags & TwoTexture) ? "$texture2transform" : "$basetexturetransform2")), transformedUV(vertex.uv, mat.definition.value("$blendmasktransform")));
-            vertex.uv = transformedUV(vertex.uv, mat.definition.value("$basetexturetransform"));
+            vertex.secondaryUV = glm::vec4(uvTransform.secondary(vertex.uv), uvTransform.blend(vertex.uv));
+            vertex.uv = uvTransform.base(vertex.uv);
             auto luxel = glm::vec2(glm::dot(homogeneous, vec4(info.lightmapVector1)), glm::dot(homogeneous, vec4(info.lightmapVector2)));
             vertex.lightUV = (luxel - glm::vec2(face.lightmapTextureMinsInLuxels[0], face.lightmapTextureMinsInLuxels[1]) + placement.offset + 0.5f) / 1024.0f;
             vertex.blend = alpha;
@@ -912,13 +936,14 @@ void Builder::addProps() {
             if (skyArea >= 0) { scene.draws.back().skyWorld = (leavesReader.at<uint16_t>(size_t(leafAt(origin)) * 32 + 6) & 511) == skyArea; }
             for (size_t j = 0; j < mesh.indices.size(); j += 3) {
                 require(j + 2 < mesh.indices.size(), "Incomplete model triangle.");
+                const auto& uvTransform = materialUv(id);
                 for (auto k : {0u, 2u, 1u}) {
                     auto index = mesh.indices[j + k]; require(index < baked.vertices.size(), "Model index exceeds vertex count.");
                     require(!lighting.baked || bakedColors[index].x >= 0, "VHV is missing a rendered model vertex.");
                     if (remap[index] == UINT32_MAX) {
                         auto vertex = propVertices[index];
-                        vertex.secondaryUV = glm::vec4(transformedUV(vertex.uv, definition.value((scene.materials[id].flags & TwoTexture) ? "$texture2transform" : "$basetexturetransform2")), transformedUV(vertex.uv, definition.value("$blendmasktransform")));
-                        vertex.uv = transformedUV(vertex.uv, definition.value("$basetexturetransform"));
+                        vertex.secondaryUV = glm::vec4(uvTransform.secondary(vertex.uv), uvTransform.blend(vertex.uv));
+                        vertex.uv = uvTransform.base(vertex.uv);
                         remap[index] = static_cast<uint32_t>(scene.vertices.size()); scene.vertices.push_back(vertex);
                     }
                     scene.indices.push_back(remap[index]);
