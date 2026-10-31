@@ -74,7 +74,7 @@ struct Renderer::Impl {
     VkSampler wrapSampler{}, clampSampler{};
     VkQueryPool queries{};
     bool anisotropy = false;
-    std::array<VkPipeline, 16> pipelines{};
+    std::array<VkPipeline, 32> pipelines{};
     std::vector<GpuImage> images;
     std::unordered_map<std::string, GpuImage> imageCache;
     std::vector<VkDescriptorSet> descriptors;
@@ -298,7 +298,7 @@ struct Renderer::Impl {
         spdlog::info("Rendering on {}", properties.deviceName);
     }
     VkPipeline pipeline(unsigned key) {
-        if (pipelines[key]) { return pipelines[key]; }
+        if (pipelines.at(key)) { return pipelines[key]; }
         std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
         stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertexShader, "VSMain", nullptr};
         stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragmentShader, "PSMain", nullptr};
