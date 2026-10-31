@@ -16,6 +16,40 @@ bool indexable(std::string_view name) {
     }
     return true;
 }
+/// Evaluates a VMT key condition as the desktop engine does: unknown platform symbols are false, and || and && combine terms.
+bool conditionHolds(std::string_view condition, bool hdr) {
+    auto term = [&](std::string_view text) {
+        bool negated = text.starts_with('!');
+        if (negated) { text.remove_prefix(1); }
+        if (text.starts_with('$')) { text.remove_prefix(1); }
+        bool value = text == "win32" || text == "windows" || (text == "hdr" && hdr) || (text == "ldr" && !hdr);
+        return value != negated;
+    };
+    auto all = [&](std::string_view text) {
+        for (size_t end = text.find("&&"); ; end = text.find("&&")) {
+            if (!term(text.substr(0, end))) { return false; }
+            if (end == std::string_view::npos) { return true; }
+            text.remove_prefix(end + 2);
+        }
+    };
+    for (size_t end = condition.find("||"); ; end = condition.find("||")) {
+        if (all(condition.substr(0, end))) { return true; }
+        if (end == std::string_view::npos) { return false; }
+        condition.remove_prefix(end + 2);
+    }
+}
+/// Reports whether a DirectX-level fallback block such as >=dx90_20b applies at the desktop level this tool targets.
+bool levelHolds(std::string_view key) {
+    size_t digits = key.find("dx");
+    if (digits == std::string_view::npos) { return false; }
+    auto comparison = key.substr(0, digits);
+    auto name = key.substr(digits + 2);
+    if (comparison != ">=" && comparison != "<" && comparison != "<=" && comparison != ">") { return false; }
+    int level = name == "90_20b" ? 92 : name == "90" ? 90 : name == "95" ? 95 : name == "80" ? 80 : name == "81" ? 81 : name == "60" ? 60 : name == "70" ? 70 : -1;
+    if (level < 0) { return false; }
+    constexpr int current = 95;
+    return comparison == ">=" ? current >= level : comparison == ">" ? current > level : comparison == "<=" ? current <= level : current < level;
+}
 }
 
 /// Answers lookups inside a mounted directory from cached folder listings, so repeated misses cost no disk access.
@@ -212,8 +246,7 @@ MaterialDefinition parseMaterial(Assets& assets, const std::string& name, bool h
         result.proxies.emplace_back(proxy.getKey());
         std::map<std::string, std::string> parameters;
         for (const auto& entry : proxy) {
-            require(entry.getChildCount() == 0, "Unsupported nested proxy parameter in {}.", name);
-            parameters[lower(std::string(entry.getKey()))] = std::string(entry.getValue());
+            if (entry.getChildCount() == 0) { parameters[lower(std::string(entry.getKey()))] = std::string(entry.getValue()); }
         }
         result.proxyParameters.push_back(std::move(parameters));
     };
@@ -234,23 +267,17 @@ MaterialDefinition parseMaterial(Assets& assets, const std::string& name, bool h
     }
     for (const auto& entry : root) {
         auto conditional = lower(std::string(entry.getConditional()));
-        if (!conditional.empty()) {
-            require(conditional == "$win32" || conditional == "$hdr" || conditional == "!$hdr" || conditional == "$ldr", "Unsupported VMT conditional '{}' in {}.", conditional, name);
-            if ((conditional == "$hdr" && !hdr) || ((conditional == "!$hdr" || conditional == "$ldr") && hdr)) { continue; }
-        }
+        if (!conditional.empty() && !conditionHolds(conditional, hdr)) { continue; }
         auto key = lower(std::string(entry.getKey()));
         if (key == "proxies") { for (const auto& proxy : entry) { addProxy(proxy); } }
         else if (entry.getChildCount() == 0) { result.parameters[key] = std::string(entry.getValue()); }
-        else if (key == result.shader + "_hdr_dx9" && !hdr) { continue; }
-        else if (key.ends_with("_dx6") || key.ends_with("_dx7") || key.ends_with("_dx8") || key == "<dx80" || key == "<dx81" || key == "<dx90" || key == "<dx95") { continue; }
-        else if (key == ">=dx90" || key == ">=dx90_20b" || key == ">=dx95" || key == result.shader + "_dx9" || key == result.shader + "_dx90" || key == result.shader + "_dx95" || (hdr && key == result.shader + "_hdr_dx9")) {
+        else if (levelHolds(key) || key == result.shader + "_dx9" || key == result.shader + "_dx90" || key == result.shader + "_dx95" || (hdr && key == result.shader + "_hdr_dx9")) {
             for (const auto& child : entry) {
                 auto childKey = lower(std::string(child.getKey()));
                 if (childKey == "proxies") { for (const auto& proxy : child) { addProxy(proxy); } }
-                else { require(child.getChildCount() == 0, "Unsupported nested material block '{}' in {}.", childKey, name); result.parameters[childKey] = std::string(child.getValue()); }
+                else if (child.getChildCount() == 0) { result.parameters[childKey] = std::string(child.getValue()); }
             }
         }
-        else { throw Error(std::format("Unsupported material fallback block '{}' in {}.", key, name)); }
     }
     return result;
 }
