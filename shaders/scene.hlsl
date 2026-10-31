@@ -73,6 +73,20 @@ FragmentInput VSMain(VertexInput input) {
     output.worldNormal = input.normal;
     output.worldTangent = input.tangent;
     output.secondaryUV = input.secondaryUV;
+    if (input.tangent.w == 2) {
+        float3 toEye = camera.eye.xyz - input.position;
+        float distance = max(length(toEye), 1);
+        float scale = 1;
+        if (input.tangent.z == 2) {
+            scale = distance / 200;
+            output.color.rgb *= clamp(19000 / (distance * distance), 0.05, 1);
+        }
+        if (input.tangent.z != 0) {
+            float4 forward = mul(camera.projection, float4(input.position + toEye / distance * min(length(input.tangent.xy) * scale, distance * 0.5), 1));
+            output.position.z = forward.z / forward.w * output.position.w;
+        }
+        output.position.xy += input.tangent.xy * scale * float2(1, -1);
+    }
     return output;
 }
 

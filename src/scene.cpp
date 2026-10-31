@@ -20,6 +20,9 @@ template<class T> std::vector<T> records(std::span<const std::byte> bytes, std::
     std::memcpy(result.data(), bytes.data(), bytes.size());
     return result;
 }
+/// Marks a vertex that the vertex shader expands into a camera-facing sprite corner; tangent.xy holds the corner offset.
+constexpr float spriteVertex = 2;
+bool spriteEntity(std::string_view type) { return type == "env_sprite" || type == "env_sprite_oriented" || type == "env_glow" || type == "env_sprite_clientside"; }
 template<class V> glm::vec3 vec3(const V& value) { return {value[0], value[1], value[2]}; }
 template<class V> glm::vec4 vec4(const V& value) { return {value[0], value[1], value[2], value[3]}; }
 float linearColor(float value) { return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f); }
@@ -201,6 +204,13 @@ public:
         pendingTextures.push_back({index, std::move(asset), srgb, frame});
         textureIds.emplace(key, index);
         return index;
+    }
+    /// Returns a texture's dimensions from its VTF header, which is available before the parallel decode runs.
+    glm::vec2 textureSize(uint32_t index) const {
+        for (const auto& pending : pendingTextures) {
+            if (pending.index == index) { Reader header(pending.asset->bytes, "texture header"); return {header.at<uint16_t>(16), header.at<uint16_t>(18)}; }
+        }
+        return {scene.images[index].width, scene.images[index].height};
     }
     void decodeTexture(PendingTexture& pending) {
         auto& image = scene.images[pending.index];
@@ -586,6 +596,7 @@ public:
     Scene build();
     void addProps();
     void addSky();
+    void addSprites();
     Scene scene;
     const Bsp& bsp;
     Assets& assets;
@@ -624,8 +635,8 @@ Scene Builder::build() {
     if (bsp.lumps[45].length) { unsupported("Compiled overlays are not rendered."); }
     for (const auto& entity : bsp.entities) {
         auto type = std::string(entity["classname"].getValue()), model = std::string(entity["model"].getValue());
-        bool runtimeModel = !model.empty() && model.front() != '*' && type != "worldspawn";
-        bool runtimeEffect = type == "move_rope" || type == "keyframe_rope" || type == "env_sprite" || type == "env_beam" || type == "env_smokestack" || type == "env_fire" || type == "info_particle_system" || type == "func_smokevolume";
+        bool runtimeModel = !model.empty() && model.front() != '*' && type != "worldspawn" && !spriteEntity(type);
+        bool runtimeEffect = type == "move_rope" || type == "keyframe_rope" || type == "env_beam" || type == "env_smokestack" || type == "env_fire" || type == "info_particle_system" || type == "func_smokevolume";
         if (runtimeModel || runtimeEffect) { unsupported(std::format("Runtime-dependent entity '{}' ({}) is not rendered.", type, model.empty() ? std::string(entity["origin"].getValue()) : model)); }
     }
     std::vector<int> sceneLumps{1, 2, 3, 4, 5, 6, 10, 12, 13, 14, 16, 17, 18, 19, 26, 33, 36, 37, 38, 39, 43, 44};
@@ -917,13 +928,14 @@ Scene Builder::build() {
         if (found == scene.materials.end()) { scene.hasWater = false; scene.waterMaterial = 0; scene.submergedProbes.clear(); }
     }
     addSky();
-    finishImages();
     parallelFor(scene.draws.size(), [&](size_t index) {
         auto& draw = scene.draws[index];
         glm::vec3 minimum(std::numeric_limits<float>::max()), maximum(std::numeric_limits<float>::lowest());
         for (uint32_t i = 0; i < draw.indexCount; ++i) { auto position = scene.vertices.at(scene.indices.at(draw.firstIndex + i)).position; minimum = glm::min(minimum, position); maximum = glm::max(maximum, position); }
         draw.center = (minimum + maximum) * 0.5f; draw.radius = glm::length(maximum - minimum) * 0.5f;
     });
+    addSprites();
+    finishImages();
     scene.diagnostics["vertices"] = scene.vertices.size();
     scene.diagnostics["triangles"] = scene.indices.size() / 3;
     scene.diagnostics["draws"] = scene.draws.size();
@@ -1241,6 +1253,65 @@ void Builder::addSky() {
         scene.draws.push_back({static_cast<uint32_t>(scene.indices.size()), 6, id, {}, false, true});
         for (auto index : {0u,1u,2u,0u,2u,3u}) { scene.indices.push_back(base + index); }
     }
+}
+
+void Builder::addSprites() {
+    uint32_t sprites = 0;
+    std::map<std::pair<uint32_t, int>, uint32_t> spriteMaterials;
+    for (const auto& entity : bsp.entities) {
+        auto type = std::string(entity["classname"].getValue());
+        if (!spriteEntity(type)) { continue; }
+        int mode = static_cast<int>(parseFloat(entity["rendermode"].getValue()));
+        auto spawnFlags = static_cast<uint32_t>(parseFloat(entity["spawnflags"].getValue()));
+        if (mode == 10 || parseFloat(entity["renderamt"].getValue(), 255) <= 0 || (!entity["targetname"].getValue().empty() && !(spawnFlags & 1))) { continue; }
+        auto path = std::string(entity["model"].getValue());
+        if (path.empty()) { warn(std::format("{} at {} has no sprite model and is omitted.", type, entity["origin"].getValue())); continue; }
+        path = assetPath(std::move(path));
+        if (path.ends_with(".spr") || path.ends_with(".vmt")) { path.resize(path.size() - 4); }
+        if (path.starts_with("materials/")) { path.erase(0, 10); }
+        uint32_t id = 0;
+        try {
+            if (!assets.find("materials/" + path + ".vmt")) { warn(std::format("Sprite material '{}' is missing, so {} at {} is omitted.", path, type, entity["origin"].getValue())); continue; }
+            id = material(path);
+        } catch (const Error& error) { warn(std::format("Sprite '{}' is omitted: {}", path, error.what())); continue; }
+        if (scene.materials[id].flags & Omitted) { continue; }
+        auto [found, inserted] = spriteMaterials.try_emplace({id, mode}, 0u);
+        if (inserted) {
+            auto copy = scene.materials[id];
+            copy.name += std::format("@sprite{}", mode);
+            copy.flags = (copy.flags & ~(AlphaTest | Detail | NormalMap | Phong | Modulate | Modulate2x | VertexLit | Blend)) | Unlit | VertexAlpha;
+            copy.additive = copy.additive || mode == 3 || mode == 5 || mode == 7 || mode == 8 || mode == 9;
+            copy.translucent = !copy.additive; copy.noCull = true; copy.noFog = true;
+            found->second = static_cast<uint32_t>(scene.materials.size());
+            scene.materials.push_back(std::move(copy));
+        }
+        auto spriteOrigin = materialPair(scene.materials[found->second].definition.value("$spriteorigin"), glm::vec2(0.5f));
+        float scale = parseFloat(entity["scale"].getValue(), 1); if (scale <= 0) { scale = 1; }
+        glm::vec2 size = textureSize(scene.materials[found->second].base) * scale;
+        auto color = glm::pow(parseVector(entity["rendercolor"].getValue(), glm::vec3(255)) / 255.0f, glm::vec3(2.2f));
+        if (options.hdr) { color *= parseFloat(entity["HDRColorScale"].getValue(), 1); }
+        auto origin = parseVector(entity["origin"].getValue());
+        float alpha = parseFloat(entity["renderamt"].getValue(), 255) / 255.0f, glow = mode == 3 ? 2.0f : mode == 9 ? 1.0f : 0.0f;
+        bool oriented = type == "env_sprite_oriented";
+        auto axes = transform(glm::vec3(0), parseVector(entity["angles"].getValue()));
+        auto right = glm::vec3(axes * glm::vec4(0, -1, 0, 0)), up = glm::vec3(axes * glm::vec4(0, 0, 1, 0));
+        uint32_t base = static_cast<uint32_t>(scene.vertices.size()), first = static_cast<uint32_t>(scene.indices.size());
+        for (auto uv : std::array<glm::vec2, 4>{{{0,0},{1,0},{1,1},{0,1}}}) {
+            glm::vec2 corner((uv.x - spriteOrigin.x) * size.x, (spriteOrigin.y - uv.y) * size.y);
+            Vertex vertex;
+            vertex.position = oriented ? origin + right * corner.x + up * corner.y : origin;
+            vertex.uv = uv; vertex.color = {color, alpha};
+            if (!oriented) { vertex.tangent = {corner, glow, spriteVertex}; }
+            scene.vertices.push_back(vertex);
+        }
+        for (auto index : {0u,1u,2u,0u,2u,3u}) { scene.indices.push_back(base + index); }
+        Draw draw{first, 6, found->second};
+        draw.center = origin; draw.radius = mode == 3 ? 1000000.0f : glm::length(size);
+        if (skyArea >= 0) { draw.skyWorld = (Reader(leafData, "sprite leaf").at<uint16_t>(size_t(leafAt(origin)) * 32 + 6) & 511) == skyArea; }
+        scene.draws.push_back(std::move(draw));
+        ++sprites;
+    }
+    if (sprites) { scene.diagnostics["sprites"] = sprites; }
 }
 }
 size_t pixelBytes(PixelFormat format, uint32_t width, uint32_t height) {
