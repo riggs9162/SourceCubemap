@@ -1,12 +1,18 @@
 #include <scm/cache.hpp>
 #include <Windows.h>
 #include <spdlog/spdlog.h>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 namespace scm {
 namespace {
 constexpr uint32_t cacheVersion = 26;
 uint64_t cacheBudget = 2ull << 30;
-constexpr uint64_t cacheReserve = 8ull << 30, maximumSceneCache = 512ull << 20;
+constexpr uint64_t cacheReserve = 8ull << 30, maximumSceneCache = 512ull << 20, maximumQueuedBytes = 512ull << 20;
+std::mutex cacheUsageGuard;
+std::map<fs::path, uint64_t> cacheUsage;
 class CacheWriteLock {
     HANDLE handle = nullptr;
     bool acquired = false;
@@ -49,6 +55,47 @@ public:
     CacheMapping(const CacheMapping&) = delete;
     CacheMapping& operator=(const CacheMapping&) = delete;
 };
+/// Writes cache files in submission order on one background thread so generation never waits for the disk.
+class CacheQueue {
+    std::mutex guard;
+    std::condition_variable changed;
+    std::deque<std::pair<fs::path, Bytes>> pending;
+    uint64_t pendingBytes = 0;
+    bool writing = false, stopping = false;
+    std::thread worker;
+    void run() {
+        std::unique_lock lock(guard);
+        while (true) {
+            changed.wait(lock, [&] { return stopping || !pending.empty(); });
+            if (pending.empty()) { return; }
+            auto [file, bytes] = std::move(pending.front()); pending.pop_front();
+            writing = true; lock.unlock();
+            try { writeCacheFile(file, bytes); }
+            catch (const std::exception& error) { spdlog::warn("Cache write failed: {}", error.what()); }
+            lock.lock(); writing = false; pendingBytes -= bytes.size();
+            changed.notify_all();
+        }
+    }
+public:
+    ~CacheQueue() {
+        { std::scoped_lock lock(guard); stopping = true; }
+        changed.notify_all();
+        if (worker.joinable()) { worker.join(); }
+    }
+    void add(fs::path file, Bytes bytes) {
+        std::unique_lock lock(guard);
+        changed.wait(lock, [&] { return pendingBytes == 0 || pendingBytes + bytes.size() <= maximumQueuedBytes; });
+        pendingBytes += bytes.size();
+        pending.emplace_back(std::move(file), std::move(bytes));
+        if (!worker.joinable()) { worker = std::thread([this] { run(); }); }
+        changed.notify_all();
+    }
+    void flush() {
+        std::unique_lock lock(guard);
+        changed.wait(lock, [&] { return pending.empty() && !writing; });
+    }
+};
+CacheQueue& cacheQueue() { static CacheQueue queue; return queue; }
 Json vector3(glm::vec3 value) { return {value.x, value.y, value.z}; }
 Json vector4(glm::vec4 value) { return {value.x, value.y, value.z, value.w}; }
 glm::vec3 read3(const Json& value) { return {value.at(0).get<float>(), value.at(1).get<float>(), value.at(2).get<float>()}; }
@@ -77,18 +124,25 @@ void writeCacheFile(const fs::path& file, std::span<const std::byte> bytes) {
     else { throw Error("Cache writes require a managed scenes, captures, or pipelines directory."); }
     CacheWriteLock lock(root);
     fs::create_directories(parent);
-    uint64_t used = 0;
-    for (fs::recursive_directory_iterator entry(root); entry != fs::recursive_directory_iterator(); ++entry) {
-        if (entry->is_symlink()) { entry.disable_recursion_pending(); continue; }
-        if (entry->is_regular_file()) { used += entry->file_size(); }
+    std::scoped_lock usageLock(cacheUsageGuard);
+    auto [usage, unmeasured] = cacheUsage.try_emplace(root, 0);
+    if (unmeasured) {
+        for (fs::recursive_directory_iterator entry(root); entry != fs::recursive_directory_iterator(); ++entry) {
+            if (entry->is_symlink()) { entry.disable_recursion_pending(); continue; }
+            if (entry->is_regular_file()) { usage->second += entry->file_size(); }
+        }
     }
+    auto& used = usage->second;
     auto replaced = fs::exists(file) ? fs::file_size(file) : 0;
     require(used >= replaced && used - replaced <= cacheBudget - bytes.size(), "Cache disk budget reached; no further cache files were stored. Clear an old cache or raise --cache-limit-mb explicitly.");
     require(fs::space(root).available >= cacheReserve + bytes.size(), "Cache write skipped to retain at least 8 GiB of free disk space.");
     TemporaryFile temporary(".cache", parent);
     writeFile(temporary.path, bytes);
     require(MoveFileExW(temporary.path.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING) != 0, "Cannot publish a cache file.");
+    used += bytes.size() - replaced;
 }
+void queueCacheFile(fs::path file, Bytes bytes) { cacheQueue().add(std::move(file), std::move(bytes)); }
+void flushCacheWrites() { cacheQueue().flush(); }
 void writeSceneCache(const fs::path& file, const Scene& scene, const Assets& assets) {
     uint64_t estimated = scene.vertices.size() * sizeof(Vertex) + scene.indices.size() * sizeof(uint32_t);
     for (const auto& image : scene.images) { estimated += image.pixels.size(); }
@@ -122,7 +176,7 @@ void writeSceneCache(const fs::path& file, const Scene& scene, const Assets& ass
     auto description = metadata.dump();
     Bytes bytes; std::array<uint32_t, 3> header{0x434d4353, cacheVersion, static_cast<uint32_t>(description.size())};
     append(bytes, std::span<const uint32_t>(header)); append(bytes, std::span<const char>(description)); append(bytes, std::span<const std::byte>(payload));
-    writeCacheFile(file, bytes);
+    queueCacheFile(file, std::move(bytes));
 }
 std::optional<Scene> readSceneCache(const fs::path& file, Assets& assets) {
     if (!fs::exists(file)) { return {}; }
