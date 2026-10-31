@@ -151,8 +151,12 @@ bool WorldLighting::visible(glm::vec3 start, glm::vec3 end, bool sky) const {
     Reader nodeReader(nodes, "lighting trace nodes"), planeReader(planes, "lighting trace planes"), leafReader(leaves, "lighting trace leaves");
     Reader brushReader(brushes, "lighting trace brushes"), sideReader(brushSides, "lighting trace sides"), referenceReader(leafBrushes, "lighting trace brush references"), textureReader(texInfo, "lighting trace textures");
     struct Segment { int32_t node; float begin, end; };
-    std::vector<Segment> stack{{0, 0, 1}};
-    std::vector<bool> checkedBrushes(brushes.size() / 12);
+    thread_local std::vector<Segment> stack;
+    thread_local std::vector<uint32_t> checkedBrushes;
+    thread_local uint32_t trace = 0;
+    stack.assign(1, {0, 0, 1});
+    if (checkedBrushes.size() < brushes.size() / 12) { checkedBrushes.assign(brushes.size() / 12, 0); trace = 0; }
+    if (++trace == 0) { std::fill(checkedBrushes.begin(), checkedBrushes.end(), 0u); trace = 1; }
     float nearest = 1;
     bool hitSky = false;
     size_t visits = 0;
@@ -179,8 +183,8 @@ bool WorldLighting::visible(glm::vec3 start, glm::vec3 end, bool sky) const {
         auto first = leafReader.at<uint16_t>(leaf + 24), count = leafReader.at<uint16_t>(leaf + 26);
         for (uint32_t i = 0; i < count; ++i) {
             auto brush = referenceReader.at<uint16_t>((size_t(first) + i) * 2);
-            require(brush < checkedBrushes.size(), "Lighting trace references an invalid brush.");
-            if (checkedBrushes[brush]) { continue; } checkedBrushes[brush] = true;
+            require(brush < brushes.size() / 12, "Lighting trace references an invalid brush.");
+            if (checkedBrushes[brush] == trace) { continue; } checkedBrushes[brush] = trace;
             size_t record = size_t(brush) * 12;
             if (!(brushReader.at<uint32_t>(record + 8) & 1)) { continue; }
             auto sideFirst = brushReader.at<uint32_t>(record), sideCount = brushReader.at<uint32_t>(record + 4);
