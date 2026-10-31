@@ -1,4 +1,4 @@
-param([ValidateSet('release', 'debug')][string]$Preset = 'release', [switch]$ConfigureOnly, [switch]$Fresh, [switch]$SkipConfigure, [string[]]$Target)
+param([ValidateSet('release', 'debug')][string]$Preset = 'release', [switch]$ConfigureOnly, [switch]$Fresh, [switch]$SkipConfigure, [string[]]$Target, [string]$Version)
 $ErrorActionPreference = 'Stop'
 $taskVswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 $env:PATH = (Split-Path $taskVswhere -Parent) + ';' + $env:PATH
@@ -17,6 +17,7 @@ Push-Location (Split-Path $PSScriptRoot -Parent)
 try {
     $taskArguments = @('--preset', $Preset)
     if ($Fresh) { $taskArguments += '--fresh' }
+    if ($Version) { $taskArguments += "-DSCM_RELEASE_VERSION=$Version" }
     if (!$SkipConfigure -or $ConfigureOnly -or $Fresh) {
         & $taskCmake @taskArguments
         if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed ($LASTEXITCODE)." }
