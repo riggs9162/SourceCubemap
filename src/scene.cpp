@@ -678,6 +678,12 @@ Scene Builder::build() {
     std::vector<std::vector<uint64_t>> visibilityMasks;
     std::map<std::tuple<uint32_t, uint32_t, bool, uint32_t>, std::vector<uint32_t>> batches;
     std::map<std::pair<uint32_t, int>, uint32_t> brushMaterials;
+    struct NamedMaterial { std::string name; uint32_t index = UINT32_MAX; };
+    std::vector<NamedMaterial> texDataMaterials(texData.size());
+    std::vector<uint64_t> visible((bsp.probes.size() + 63) / 64);
+    std::vector<glm::vec3> polygon;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
     for (size_t faceIndex = 0; faceIndex < faces.size(); ++faceIndex) {
         const auto& face = faces[faceIndex];
         const auto& brush = brushStates[faceModels[faceIndex]];
@@ -692,18 +698,23 @@ Scene Builder::build() {
             auto area = Reader(leafData, "displacement leaf").at<uint16_t>(size_t(leafAt(point)) * 32 + 6) & 511;
             inSkyWorld = area == skyArea;
         }
-        std::vector<uint64_t> visible((bsp.probes.size() + 63) / 64);
-        bool anyVisible = false;
+        std::fill(visible.begin(), visible.end(), uint64_t(0));
+        bool anyVisible = false, everywhere = scene.hasWater || faceModels[faceIndex] != 0 || inSkyWorld || !referencedFaces.contains(faceIndex);
         for (size_t p = 0; p < probeFaces.size(); ++p) {
-            if (scene.hasWater || faceModels[faceIndex] != 0 || inSkyWorld || !referencedFaces.contains(static_cast<uint32_t>(faceIndex)) || probeFaces[p].contains(static_cast<uint32_t>(faceIndex))) { visible[p / 64] |= uint64_t(1) << (p % 64); anyVisible = true; }
+            if (everywhere || probeFaces[p].contains(faceIndex)) { visible[p / 64] |= uint64_t(1) << (p % 64); anyVisible = true; }
         }
         if (!anyVisible) { continue; }
-        auto [foundVisibility, insertedVisibility] = visibilityIds.emplace(visible, static_cast<uint32_t>(visibilityMasks.size()));
-        if (insertedVisibility) { visibilityMasks.push_back(visible); }
+        auto foundVisibility = visibilityIds.find(visible);
+        if (foundVisibility == visibilityIds.end()) { foundVisibility = visibilityIds.emplace(visible, static_cast<uint32_t>(visibilityMasks.size())).first; visibilityMasks.push_back(visible); }
         const auto& tex = texData.at(info.textureData);
-        uint32_t nameOffset = offsets.at<uint32_t>(size_t(tex.nameStringTableID) * 4);
-        auto name = strings.string(nameOffset, stringsData.size() - nameOffset);
-        auto materialIndex = material(name);
+        auto& named = texDataMaterials[info.textureData];
+        if (named.index == UINT32_MAX) {
+            uint32_t nameOffset = offsets.at<uint32_t>(size_t(tex.nameStringTableID) * 4);
+            named.name = strings.string(nameOffset, stringsData.size() - nameOffset);
+            named.index = material(named.name);
+        }
+        const auto& name = named.name;
+        auto materialIndex = named.index;
         if (brush.renderMode != 0) {
             auto key = std::pair(materialIndex, brush.renderMode);
             if (!brushMaterials.contains(key)) {
@@ -719,7 +730,7 @@ Scene Builder::build() {
         bool bumped = (info.flags & 0x800) != 0;
         require(!(mat.flags & SSBump) || bumped, "SSBump material '{}' has no directional lightmaps.", name);
         auto placement = lightmap(face, bumped);
-        std::vector<glm::vec3> polygon;
+        polygon.clear();
         for (int i = 0; i < face.numEdges; ++i) {
             int edgeIndex = surfEdges.at(size_t(face.firstEdge) + i).surfEdge;
             const auto& edge = edges.at(static_cast<size_t>(std::abs(int64_t(edgeIndex))));
@@ -750,8 +761,7 @@ Scene Builder::build() {
             if ((mat.flags & VertexAlpha) && face.dispInfo >= 0) { vertex.color.a *= alpha; }
             return vertex;
         };
-        std::vector<Vertex> vertices;
-        std::vector<uint32_t> indices;
+        vertices.clear(); indices.clear();
         if (face.dispInfo >= 0) {
             require(polygon.size() == 4 && displacements.size() % 176 == 0, "Unsupported displacement base or layout.");
             size_t start = size_t(face.dispInfo) * 176;
