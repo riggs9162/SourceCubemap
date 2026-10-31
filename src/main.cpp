@@ -68,18 +68,36 @@ std::set<std::string> namespaces(const scm::Bsp& bsp) {
         if (end != std::string::npos) { names.insert(name.substr(15, end - 15)); }
     }
     if (names.empty()) { names.insert(scm::lower(bsp.path.stem().string())); }
-    scm::require(names.size() == 1, "Multiple embedded map namespaces require explicit binding resolution, which is not implemented yet.");
     return names;
 }
-bool needsDefaultSky(const scm::Bsp& bsp, scm::Assets& assets, bool hdr, std::string_view mapName) {
-    auto prefix = "maps/" + std::string(mapName) + "/";
-    std::set<std::string> probes;
-    for (const auto& probe : bsp.probes) { probes.insert(prefix + probe.name()); }
-    bool needed = bsp.pakNames.contains("materials/" + prefix + "cubemapdefault.vtf") || bsp.pakNames.contains("materials/" + prefix + "cubemapdefault.hdr.vtf");
+/// Picks the namespace recorded in build metadata: the map's own name when embedded, otherwise the one holding the most embedded files.
+std::string primaryNamespace(const scm::Bsp& bsp, const std::set<std::string>& names) {
+    auto own = scm::lower(bsp.path.stem().string());
+    if (names.contains(own)) { return own; }
+    std::string best = *names.begin();
+    size_t bestCount = 0;
+    for (const auto& name : names) {
+        auto prefix = "materials/maps/" + name + "/";
+        auto count = static_cast<size_t>(std::count_if(bsp.pakNames.begin(), bsp.pakNames.end(), [&](const auto& entry) { return entry.first.starts_with(prefix); }));
+        if (count > bestCount) { best = name; bestCount = count; }
+    }
+    return best;
+}
+bool needsDefaultSky(const scm::Bsp& bsp, scm::Assets& assets, bool hdr, const std::set<std::string>& mapNames, bool experimental) {
+    std::set<std::string> probes, defaults;
+    bool needed = false;
+    for (const auto& mapName : mapNames) {
+        auto prefix = "maps/" + mapName + "/";
+        for (const auto& probe : bsp.probes) { probes.insert(prefix + probe.name()); }
+        defaults.insert(prefix + "cubemapdefault");
+        needed = needed || bsp.pakNames.contains("materials/" + prefix + "cubemapdefault.vtf") || bsp.pakNames.contains("materials/" + prefix + "cubemapdefault.hdr.vtf");
+    }
     auto names = bsp.lump(43); scm::Reader strings(names, "compiled material names");
     for (size_t offset = 0; offset < names.size();) {
         auto name = strings.string(offset, names.size() - offset); offset += name.size() + 1;
-        auto material = scm::readMaterial(assets, name, hdr);
+        scm::MaterialDefinition material;
+        try { material = scm::readMaterial(assets, name, hdr); }
+        catch (const scm::Error&) { continue; }
         auto binding = material.value("$envmap");
         if (binding.empty()) { continue; }
         binding = scm::assetPath(binding);
@@ -87,8 +105,11 @@ bool needsDefaultSky(const scm::Bsp& bsp, scm::Assets& assets, bool hdr, std::st
         if (binding.ends_with(".vtf")) { binding.resize(binding.size() - 4); }
         if (binding.ends_with(".hdr")) { binding.resize(binding.size() - 4); }
         if (!binding.starts_with("maps/")) { continue; }
-        if (binding == prefix + "cubemapdefault") { needed = true; }
-        else { scm::require(probes.contains(binding), std::format("Material '{}' references cubemap '{}' without a matching BSP sample. The binding was preserved; output was not written.", name, binding)); }
+        if (defaults.contains(binding)) { needed = true; }
+        else if (!probes.contains(binding)) {
+            scm::require(experimental, "Material '{}' references cubemap '{}' without a matching BSP sample. The binding was preserved; output was not written.", name, binding);
+            spdlog::warn("Material '{}' references cubemap '{}' without a matching BSP sample; the binding was preserved.", name, binding);
+        }
     }
     return needed;
 }
@@ -270,8 +291,8 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
     scm::Bsp bsp(options.input);
     bsp.validateDestination(output, options.overwrite, options.inPlace);
     scm::require(!bsp.probes.empty(), "The map contains no cubemap samples.");
-    auto names = namespaces(bsp);
-    auto mapNamespace = *names.begin();
+    auto boundNamespaces = namespaces(bsp), names = boundNamespaces;
+    auto mapNamespace = primaryNamespace(bsp, boundNamespaces);
     names.insert(scm::lower(output.stem().string()));
     scm::Json times{{"parsing", parsing.seconds()}};
     std::vector<bool> variants;
@@ -306,7 +327,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
             cancellation.check();
             scm::Stopwatch loading;
             LoadedScene result;
-            result.defaultSky = needsDefaultSky(bsp, assets, hdr, mapNamespace);
+            result.defaultSky = needsDefaultSky(bsp, assets, hdr, boundNamespaces, options.experimental);
             auto settings = sceneSettings(options, hdr, result.defaultSky);
             result.scene = scm::loadScene(bsp, assets, settings);
             result.sceneKey = scm::sceneCacheKey(bsp, assets, settings);
