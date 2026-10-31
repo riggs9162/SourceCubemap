@@ -968,6 +968,7 @@ void Builder::addProps() {
         mdlpp::StudioModel model;
         mdlpp::BakedModel baked;
         std::map<int, uint32_t> materials;
+        bool omitted = false;
     };
     struct PropInstance {
         uint32_t index = 0;
@@ -986,26 +987,28 @@ void Builder::addProps() {
     auto loadModel = [&](size_t modelIndex) -> PropModel& {
         auto& loaded = propModels[modelIndex];
         if (loaded) { return *loaded; }
-        auto result = std::make_unique<PropModel>();
+        loaded = std::make_unique<PropModel>();
+        auto& result = *loaded;
         const auto& name = modelNames[modelIndex];
         auto stem = name.substr(0, name.size() - 4);
-        result->name = &name;
-        result->mdl = assets.get(name, "static prop"); result->vtx = assets.get(stem + ".dx90.vtx", name); result->vvd = assets.get(stem + ".vvd", name);
-        result->checksum = Reader(result->mdl->bytes, name).at<uint32_t>(8);
-        require(result->checksum == Reader(result->vtx->bytes, name).at<uint32_t>(16) && result->checksum == Reader(result->vvd->bytes, name).at<uint32_t>(8), "Model companion checksums differ: {}", name);
-        require(result->model.open(result->mdl->bytes, result->vtx->bytes, result->vvd->bytes), "Cannot load MDL/VTX/VVD model: {}", name);
-        for (const auto& part : result->model.mdl.bodyParts) { require(part.models.size() <= 1, "Static-prop bodygroups are not supported: {}", name); }
-        result->baked = result->model.processModelData(0);
-        require(result->baked.vertices.size() <= 65535, "Model exceeds SourcePP's current 16-bit baked index range: {}", name);
-        loaded = std::move(result);
-        return *loaded;
+        result.name = &name;
+        result.mdl = assets.get(name, "static prop"); result.vtx = assets.get(stem + ".dx90.vtx", name); result.vvd = assets.get(stem + ".vvd", name);
+        result.checksum = Reader(result.mdl->bytes, name).at<uint32_t>(8);
+        result.omitted = true;
+        if (result.checksum != Reader(result.vtx->bytes, name).at<uint32_t>(16) || result.checksum != Reader(result.vvd->bytes, name).at<uint32_t>(8)) { approximate(std::format("Model companion checksums differ, so '{}' is omitted.", name)); return result; }
+        if (!result.model.open(result.mdl->bytes, result.vtx->bytes, result.vvd->bytes)) { approximate(std::format("Cannot load MDL/VTX/VVD model '{}', so it is omitted.", name)); return result; }
+        for (const auto& part : result.model.mdl.bodyParts) { if (part.models.size() > 1) { approximate(std::format("Static-prop bodygroups in '{}' use the default body.", name)); break; } }
+        result.baked = result.model.processModelData(0);
+        if (result.baked.vertices.size() > 65535) { approximate(std::format("Model '{}' exceeds SourcePP's 16-bit baked index range and is omitted.", name)); return result; }
+        result.omitted = false;
+        return result;
     };
     std::vector<PropInstance> instances;
     for (uint32_t i = 0; i < count; ++i) {
         size_t record = reader.cursor + size_t(i) * stride;
         uint32_t propFlags = version == 10 ? reader.at<uint32_t>(record + 64) : reader.at<uint8_t>(record + 31);
-        require((propFlags & ~0x1ffu) == 0, "Unknown static-prop flags.");
-        if (version == 10) { require(reader.at<uint32_t>(record + 68) == 0, "Per-texel static-prop lightmaps are not implemented."); }
+        if (propFlags & ~0x1ffu) { approximate(std::format("Static prop {} has unknown flags {:#x}, which are ignored.", i, propFlags)); }
+        if (version == 10 && reader.at<uint32_t>(record + 68) != 0) { approximate("Per-texel static-prop lightmaps are not implemented; those props use vertex lighting."); }
         if (propFlags & 4) { continue; }
         if (version >= 6) {
             auto minimum = reader.at<uint16_t>(record + 60), maximum = reader.at<uint16_t>(record + 62);
@@ -1015,6 +1018,7 @@ void Builder::addProps() {
         auto modelIndex = reader.at<uint16_t>(record + 24);
         require(modelIndex < modelNames.size(), "Static prop references an invalid model.");
         auto& source = loadModel(modelIndex);
+        if (source.omitted) { continue; }
         auto matrix = transform(origin, angles);
         auto lightingOrigin = (propFlags & 2) ? reader.at<glm::vec3>(record + 44) : glm::vec3(matrix * glm::vec4(vec3(source.model.mdl.illuminationPosition), 1));
         auto vertexLighting = assets.findEmbedded(std::format("sp_{}{}.vhv", options.hdr ? "hdr_" : "", i));
@@ -1031,7 +1035,7 @@ void Builder::addProps() {
         auto& lighting = prop.lighting = propWorldLighting.sample(prop.lightingOrigin); lighting.ambient = ambient;
         auto& bakedColors = prop.bakedColors;
         bakedColors.assign(baked.vertices.size(), glm::vec3(-1));
-        if (prop.vertexLighting && !(prop.flags & 64)) {
+        if (prop.vertexLighting && !(prop.flags & 64)) try {
             auto meshes = readVertexLighting(prop.vertexLighting->bytes, prop.source->checksum);
             size_t meshIndex = 0;
             for (size_t body = 0; body < model.mdl.bodyParts.size(); ++body) {
@@ -1060,7 +1064,12 @@ void Builder::addProps() {
             }
             require(meshIndex == meshes.size(), "VHV contains strip groups absent from the model.");
             lighting.baked = true;
-        } else { require(!(prop.flags & 8), "Props that ignore lighting normals require baked VHV colors."); }
+        } catch (const Error& error) {
+            prop.notes.push_back(std::format("Baked lighting for static prop {} '{}' is unusable: {}", prop.index, *prop.source->name, error.what()));
+            std::fill(bakedColors.begin(), bakedColors.end(), glm::vec3(-1));
+        } else {
+            if (prop.flags & 8) { prop.notes.push_back(std::format("Static prop {} '{}' ignores lighting normals but has no baked colors.", prop.index, *prop.source->name)); }
+        }
         prop.vertices.reserve(baked.vertices.size());
         for (size_t sourceIndex = 0; sourceIndex < baked.vertices.size(); ++sourceIndex) {
             const auto& source = baked.vertices[sourceIndex];
@@ -1097,7 +1106,7 @@ void Builder::addProps() {
         require(skin >= 0 && !model.mdl.skins.empty(), "Static prop {} '{}' has invalid skin metadata.", i, name);
         if (size_t(skin) >= model.mdl.skins.size()) {
             require(options.experimental, "Static prop {} '{}' requests skin {} but the model has {} skin families. Use --experimental to select skin zero.", i, name, skin, model.mdl.skins.size());
-            scene.diagnostics["warnings"].push_back(std::format("Static prop {} '{}' requests missing skin {}; experimental rendering uses skin zero.", i, name, skin)); skin = 0;
+            warn(std::format("Static prop {} '{}' requests missing skin {}; experimental rendering uses skin zero.", i, name, skin)); skin = 0;
         }
         for (const auto& mesh : baked.meshes) {
             auto slot = model.mdl.skins.at(skin).at(mesh.materialIndex);
@@ -1114,6 +1123,11 @@ void Builder::addProps() {
                 known = prop.source->materials.emplace(slot, resolvedId).first;
             }
             auto id = known->second;
+            if (scene.materials[id].flags & Omitted) { continue; }
+            if (std::any_of(mesh.indices.begin(), mesh.indices.end(), [&](auto index) { return index >= baked.vertices.size(); })) {
+                approximate(std::format("A mesh of model '{}' has indices outside its vertices and is omitted.", name));
+                continue;
+            }
             remap.assign(propVertices.size(), UINT32_MAX);
             scene.draws.push_back({static_cast<uint32_t>(scene.indices.size()), static_cast<uint32_t>(mesh.indices.size()), id});
             scene.draws.back().lighting = lightingIndex;
@@ -1122,8 +1136,8 @@ void Builder::addProps() {
                 require(j + 2 < mesh.indices.size(), "Incomplete model triangle.");
                 const auto& uvTransform = materialUv(id);
                 for (auto k : {0u, 2u, 1u}) {
-                    auto index = mesh.indices[j + k]; require(index < baked.vertices.size(), "Model index exceeds vertex count.");
-                    require(!lighting.baked || bakedColors[index].x >= 0, "VHV is missing a rendered model vertex.");
+                    auto index = mesh.indices[j + k];
+                    if (lighting.baked && bakedColors[index].x < 0) { approximate(std::format("VHV for '{}' is missing a rendered vertex, which uses ambient light.", name)); }
                     if (remap[index] == UINT32_MAX) {
                         auto vertex = propVertices[index];
                         vertex.secondaryUV = glm::vec4(uvTransform.secondary(vertex.uv), uvTransform.blend(vertex.uv));
