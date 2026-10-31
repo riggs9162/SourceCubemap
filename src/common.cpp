@@ -95,12 +95,22 @@ glm::vec3 parseVector(std::string_view value, glm::vec3 fallback) {
     require(static_cast<bool>(stream >> result.x), "Invalid vector: {}", value);
     stream >> std::ws;
     if (stream.eof()) { result.y = result.z = result.x; }
-    else { require(static_cast<bool>(stream >> result.y >> result.z), "Invalid vector: {}", value); stream >> std::ws; }
+    else {
+        require(static_cast<bool>(stream >> result.y >> result.z), "Invalid vector: {}", value);
+        for (float ignored = 0; stream >> ignored;) {}
+        stream >> std::ws;
+    }
     require(stream.eof() && std::isfinite(result.x) && std::isfinite(result.y) && std::isfinite(result.z), "Invalid or nonfinite vector: {}", value);
     return result;
 }
 float parseFloat(std::string_view value, float fallback) {
     if (value.empty()) { return fallback; }
+    if (value.front() == '[' || value.front() == '{') {
+        value.remove_prefix(1);
+        value.remove_prefix(std::min(value.find_first_not_of(" \t"), value.size()));
+        value = value.substr(0, value.find_first_of(" \t]}"));
+    }
+    value = value.substr(0, value.find(','));
     std::istringstream stream{std::string(value)};
     float result = 0;
     require(static_cast<bool>(stream >> result) && std::isfinite(result), "Invalid or nonfinite number: {}", value);

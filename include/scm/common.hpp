@@ -49,7 +49,9 @@ std::string assetPath(std::string value);
 std::string digest(std::span<const std::byte> bytes);
 /// Runs body(0..count-1) across CPU threads and rethrows the first failure after every item has finished.
 void parallelFor(size_t count, const std::function<void(size_t)>& body);
+/// Parses one or three finite components. Further numbers are ignored, as the engine ignores a fourth color component.
 glm::vec3 parseVector(std::string_view value, glm::vec3 fallback = {});
+/// Parses one finite number. A bracketed vector yields its first component, as material variables do, and text after a comma is ignored.
 float parseFloat(std::string_view value, float fallback = 0.0f);
 
 /// Reads little-endian fields after checking the complete requested byte range. The label is borrowed and must outlive the reader.
