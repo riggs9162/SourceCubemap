@@ -19,12 +19,12 @@ EntityPose initialTrackTrainPose(const Bsp& bsp, const bsppp::BSPEntityKeyValues
         if (entity["classname"].getValue() != "path_track") { continue; }
         auto name = std::string(entity["targetname"].getValue());
         if (name.empty()) { continue; }
-        require(nodes.emplace(name, &entity).second, std::format("Ambiguous path_track name '{}'.", name));
+        require(nodes.emplace(name, &entity).second, "Ambiguous path_track name '{}'.", name);
     }
     auto resolve = [&](std::string_view name) -> const Entity* {
         if (name.empty()) { return nullptr; }
         auto found = nodes.find(std::string(name));
-        require(found != nodes.end(), std::format("Missing path_track '{}'.", name));
+        require(found != nodes.end(), "Missing path_track '{}'.", name);
         require(found->second->operator[]("parentname").getValue().empty(), "Parented path tracks require runtime transforms.");
         return found->second;
     };
@@ -81,9 +81,9 @@ EntityPose initialPathTrainPose(const Bsp& bsp, const bsppp::BSPEntityKeyValues&
     const bsppp::BSPEntityKeyValues* found = nullptr;
     for (const auto& entity : bsp.entities) {
         if (entity["targetname"].getValue() != target) { continue; }
-        require(!found, std::format("Ambiguous path train target '{}'.", target)); found = &entity;
+        require(!found, "Ambiguous path train target '{}'.", target); found = &entity;
     }
-    require(found && (*found)["classname"].getValue() == "path_corner", std::format("Missing path_corner '{}' for path train.", target));
+    require(found && (*found)["classname"].getValue() == "path_corner", "Missing path_corner '{}' for path train.", target);
     require((*found)["parentname"].getValue().empty(), "Parented path corners require runtime transforms.");
     return {parseVector((*found)["origin"].getValue()) - center, parseVector(train["angles"].getValue())};
 }

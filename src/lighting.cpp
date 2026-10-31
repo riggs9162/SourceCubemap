@@ -66,7 +66,7 @@ std::array<float, 256> initialLightStyles(const Bsp& bsp) {
         auto pattern = std::string(entity["pattern"].getValue());
         int preset = static_cast<int>(parseFloat(entity["defaultstyle"].getValue()));
         bool off = (static_cast<int>(parseFloat(entity["spawnflags"].getValue())) & 1) != 0;
-        require(off || ((!preset || preset >= 13) && pattern.empty()) || pattern == "m" || pattern == "a", std::format("Animated light style {} requires unsupported runtime evaluation.", style));
+        require(off || ((!preset || preset >= 13) && pattern.empty()) || pattern == "m" || pattern == "a", "Animated light style {} requires unsupported runtime evaluation.", style);
         float value = off || pattern == "a" ? 0.0f : 1.0f;
         require(!std::isfinite(result[style]) || result[style] == value, "Light entities disagree on a shared initial style.");
         result[style] = value;

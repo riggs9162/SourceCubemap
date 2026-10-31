@@ -6,28 +6,26 @@
 #include <xxhash.h>
 
 namespace scm {
-void require(bool condition, std::string_view message) {
-    if (!condition) { throw Error(std::string(message)); }
-}
+void fail(std::string_view message) { throw Error(std::string(message)); }
 
 Bytes readFile(const fs::path& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
-    require(file.good(), std::format("Cannot read {}.", path.string()));
+    require(file.good(), "Cannot read {}.", path.string());
     auto length = file.tellg();
     require(length >= 0 && length <= 2LL * 1024 * 1024 * 1024, "File exceeds the supported 2 GiB limit.");
     Bytes bytes(static_cast<size_t>(length));
     file.seekg(0);
     file.read(reinterpret_cast<char*>(bytes.data()), length);
-    require(file.good(), std::format("Incomplete read of {}.", path.string()));
+    require(file.good(), "Incomplete read of {}.", path.string());
     return bytes;
 }
 
 void writeFile(const fs::path& path, std::span<const std::byte> bytes) {
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    require(file.good(), std::format("Cannot create {}.", path.string()));
+    require(file.good(), "Cannot create {}.", path.string());
     file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     file.flush();
-    require(file.good(), std::format("Incomplete write of {}.", path.string()));
+    require(file.good(), "Incomplete write of {}.", path.string());
 }
 
 std::string textOf(std::span<const std::byte> bytes) { return {reinterpret_cast<const char*>(bytes.data()), bytes.size()}; }
@@ -51,30 +49,30 @@ glm::vec3 parseVector(std::string_view value, glm::vec3 fallback) {
     for (char& c : input) { if (c == '[' || c == ']' || c == '{' || c == '}') { c = ' '; } }
     std::istringstream stream(input);
     glm::vec3 result;
-    require(static_cast<bool>(stream >> result.x), std::format("Invalid vector: {}", value));
+    require(static_cast<bool>(stream >> result.x), "Invalid vector: {}", value);
     stream >> std::ws;
     if (stream.eof()) { result.y = result.z = result.x; }
-    else { require(static_cast<bool>(stream >> result.y >> result.z), std::format("Invalid vector: {}", value)); stream >> std::ws; }
-    require(stream.eof() && std::isfinite(result.x) && std::isfinite(result.y) && std::isfinite(result.z), std::format("Invalid or nonfinite vector: {}", value));
+    else { require(static_cast<bool>(stream >> result.y >> result.z), "Invalid vector: {}", value); stream >> std::ws; }
+    require(stream.eof() && std::isfinite(result.x) && std::isfinite(result.y) && std::isfinite(result.z), "Invalid or nonfinite vector: {}", value);
     return result;
 }
 float parseFloat(std::string_view value, float fallback) {
     if (value.empty()) { return fallback; }
     std::istringstream stream{std::string(value)};
     float result = 0;
-    require(static_cast<bool>(stream >> result) && std::isfinite(result), std::format("Invalid or nonfinite number: {}", value));
+    require(static_cast<bool>(stream >> result) && std::isfinite(result), "Invalid or nonfinite number: {}", value);
     stream >> std::ws;
-    require(stream.eof(), std::format("Unexpected text after number: {}", value));
+    require(stream.eof(), "Unexpected text after number: {}", value);
     return result;
 }
 std::span<const std::byte> Reader::slice(size_t offset, size_t length) const {
-    require(offset <= data.size() && length <= data.size() - offset, std::format("Out-of-bounds range in {}.", label));
+    require(offset <= data.size() && length <= data.size() - offset, "Out-of-bounds range in {}.", label);
     return data.subspan(offset, length);
 }
 std::string Reader::string(size_t offset, size_t limit) const {
     auto bytes = slice(offset, limit);
     auto end = std::find(bytes.begin(), bytes.end(), std::byte{0});
-    require(end != bytes.end(), std::format("Unterminated string in {}.", label));
+    require(end != bytes.end(), "Unterminated string in {}.", label);
     return textOf(bytes.first(static_cast<size_t>(end - bytes.begin())));
 }
 TemporaryFile::TemporaryFile(std::string_view suffix, const fs::path& directory) {

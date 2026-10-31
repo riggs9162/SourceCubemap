@@ -12,12 +12,12 @@
 namespace scm {
 void validateVtf(std::span<const std::byte> data, std::string_view name) {
     Reader reader(data, std::string(name));
-    require(data.size() >= 64 && reader.at<uint32_t>(0) == 0x00465456 && reader.at<uint32_t>(4) == 7, std::format("Invalid VTF header: {}", name));
+    require(data.size() >= 64 && reader.at<uint32_t>(0) == 0x00465456 && reader.at<uint32_t>(4) == 7, "Invalid VTF header: {}", name);
     auto minor = reader.at<uint32_t>(8), header = reader.at<uint32_t>(12);
-    require(minor <= 5 && header >= (minor >= 2 ? 65u : 64u) && header <= data.size(), std::format("Unsupported or truncated VTF header: {}", name));
+    require(minor <= 5 && header >= (minor >= 2 ? 65u : 64u) && header <= data.size(), "Unsupported or truncated VTF header: {}", name);
     uint32_t width = reader.at<uint16_t>(16), height = reader.at<uint16_t>(18), frames = reader.at<uint16_t>(24), mips = reader.at<uint8_t>(56);
     uint32_t depth = minor >= 2 ? reader.at<uint16_t>(63) : 1;
-    require(width && height && frames && depth && mips && width <= 16384 && height <= 16384 && depth <= 2048 && frames <= 4096 && mips <= uint32_t(std::bit_width(std::max({width, height, depth}))), std::format("Invalid VTF image dimensions: {}", name));
+    require(width && height && frames && depth && mips && width <= 16384 && height <= 16384 && depth <= 2048 && frames <= 4096 && mips <= uint32_t(std::bit_width(std::max({width, height, depth}))), "Invalid VTF image dimensions: {}", name);
     auto format = static_cast<vtfpp::ImageFormat>(reader.at<uint32_t>(52));
     uint32_t faces = (reader.at<uint32_t>(20) & 0x4000) ? (minor < 5 && reader.at<uint16_t>(26) != 0xffff ? 7 : 6) : 1;
     require(faces == 1 || depth == 1, "A VTF cubemap cannot also be a volume texture.");
@@ -25,7 +25,7 @@ void validateVtf(std::span<const std::byte> data, std::string_view name) {
     for (uint32_t mip = 0; mip < mips; ++mip) {
         required += uint64_t(vtfpp::ImageFormatDetails::getDataLength(format, uint16_t(std::max(1u, width >> mip)), uint16_t(std::max(1u, height >> mip)))) * std::max(1u, depth >> mip) * faces * frames;
     }
-    require(required > 0 && required <= (1ull << 30), std::format("Unsupported VTF format or image size: {}", name));
+    require(required > 0 && required <= (1ull << 30), "Unsupported VTF format or image size: {}", name);
     uint64_t imageOffset = header, imageEnd = data.size();
     if (minor >= 3) {
         require(header >= 80, "VTF resource header is truncated.");
@@ -48,7 +48,7 @@ void validateVtf(std::span<const std::byte> data, std::string_view name) {
         auto thumbnailFormat = static_cast<vtfpp::ImageFormat>(reader.at<uint32_t>(57));
         imageOffset += vtfpp::ImageFormatDetails::getDataLength(thumbnailFormat, reader.at<uint8_t>(61), reader.at<uint8_t>(62));
     }
-    require(imageOffset >= header && imageOffset <= imageEnd && imageEnd <= data.size() && required <= imageEnd - imageOffset, std::format("Truncated VTF image resource: {}", name));
+    require(imageOffset >= header && imageOffset <= imageEnd && imageEnd <= data.size() && required <= imageEnd - imageOffset, "Truncated VTF image resource: {}", name);
 }
 std::string Probe::name() const { return std::format("c{}_{}_{}", origin.x, origin.y, origin.z); }
 
@@ -60,7 +60,7 @@ Bsp::Bsp(const fs::path& filename) : path(fs::absolute(filename)), bytes(readFil
     for (size_t i = 0; i < lumps.size(); ++i) {
         auto& item = lumps[i] = header.at<Lump>(8 + i * 16);
         if (!item.length) { continue; }
-        require(item.offset >= 1036, std::format("Lump {} overlaps the BSP header.", i));
+        require(item.offset >= 1036, "Lump {} overlaps the BSP header.", i);
         header.slice(item.offset, item.length);
         require(item.uncompressed <= 1024u * 1024u * 1024u, "Decompressed lump exceeds the 1 GiB limit.");
         if (item.uncompressed) {
@@ -120,15 +120,15 @@ Bsp::Bsp(const fs::path& filename) : path(fs::absolute(filename)), bytes(readFil
             mz_zip_file* info = nullptr;
             require(mz_zip_reader_entry_get_info(archive.handle, &info) == MZ_OK && info, "Cannot read an embedded ZIP directory record.");
             auto name = assetPath(info->filename);
-            require(!pakNames.contains(name), std::format("Duplicate embedded path: {}", name));
+            require(!pakNames.contains(name), "Duplicate embedded path: {}", name);
             require(info->uncompressed_size >= 0 && info->uncompressed_size <= (1ll << 30), "An embedded ZIP entry exceeds the 1 GiB memory limit.");
             totalSize += static_cast<uint64_t>(info->uncompressed_size);
             require(totalSize <= (2ull << 30), "The expanded BSP PAK exceeds the 2 GiB memory limit.");
             Bytes payload(static_cast<size_t>(info->uncompressed_size));
             if (payload.empty()) {
-                require(mz_zip_reader_entry_open(archive.handle) == MZ_OK && mz_zip_reader_entry_close(archive.handle) == MZ_OK, std::format("Embedded ZIP entry failed validation: {}", name));
+                require(mz_zip_reader_entry_open(archive.handle) == MZ_OK && mz_zip_reader_entry_close(archive.handle) == MZ_OK, "Embedded ZIP entry failed validation: {}", name);
             } else {
-                require(mz_zip_reader_entry_save_buffer(archive.handle, payload.data(), static_cast<int32_t>(payload.size())) == MZ_OK, std::format("Embedded ZIP entry failed decompression or checksum validation: {}", name));
+                require(mz_zip_reader_entry_save_buffer(archive.handle, payload.data(), static_cast<int32_t>(payload.size())) == MZ_OK, "Embedded ZIP entry failed decompression or checksum validation: {}", name);
             }
             pakNames.emplace(name, info->filename); pakData.emplace(std::move(name), std::move(payload));
         }
@@ -140,7 +140,7 @@ Bytes Bsp::lump(int index) const {
     require(index >= 0 && index < 64, "Invalid BSP lump index.");
     if (!lumps[index].length) { return {}; }
     auto result = source->getLumpData(static_cast<bsppp::BSPLump>(index));
-    require(result.has_value(), std::format("Cannot decode lump {}.", index));
+    require(result.has_value(), "Cannot decode lump {}.", index);
     require(!lumps[index].uncompressed || result->size() == lumps[index].uncompressed, "Decompressed lump size mismatch.");
     return std::move(*result);
 }
@@ -198,14 +198,14 @@ void Bsp::validateTextures() const {
         auto data = embedded(name);
         validateVtf(*data, name);
         vtfpp::VTF texture(*data);
-        require(static_cast<bool>(texture), std::format("Invalid VTF: {}", name));
+        require(static_cast<bool>(texture), "Invalid VTF: {}", name);
         if (!(texture.getFlags() & vtfpp::VTF::FLAG_V0_ENVMAP)) { continue; }
-        require(texture.getWidth() == texture.getHeight(), std::format("Cubemap is not square: {}", name));
-        require(texture.getFaceCount() == 6 || texture.getFaceCount() == 7, std::format("Invalid cubemap face count: {}", name));
-        require(texture.getWidth() > 0 && texture.getMipCount() > 0 && texture.getMipCount() <= std::bit_width(texture.getWidth()), std::format("Invalid cubemap dimensions or mip count: {}", name));
+        require(texture.getWidth() == texture.getHeight(), "Cubemap is not square: {}", name);
+        require(texture.getFaceCount() == 6 || texture.getFaceCount() == 7, "Invalid cubemap face count: {}", name);
+        require(texture.getWidth() > 0 && texture.getMipCount() > 0 && texture.getMipCount() <= std::bit_width(texture.getWidth()), "Invalid cubemap dimensions or mip count: {}", name);
         for (uint8_t mip = 0; mip < texture.getMipCount(); ++mip) {
             auto expected = vtfpp::ImageFormatDetails::getDataLength(texture.getFormat(), texture.getWidth(mip), texture.getHeight(mip));
-            for (uint16_t frame = 0; frame < texture.getFrameCount(); ++frame) { for (uint8_t face = 0; face < texture.getFaceCount(); ++face) { require(texture.getImageDataRaw(mip, frame, face).size() == expected, std::format("Missing or truncated VTF image data: {}", name)); } }
+            for (uint16_t frame = 0; frame < texture.getFrameCount(); ++frame) { for (uint8_t face = 0; face < texture.getFaceCount(); ++face) { require(texture.getImageDataRaw(mip, frame, face).size() == expected, "Missing or truncated VTF image data: {}", name); } }
         }
     }
 }
@@ -214,15 +214,15 @@ void Bsp::verifyPreserved(const Bsp& original, const std::map<std::string, Bytes
     require(source->getMapRevision() == original.source->getMapRevision(), "Map revision changed unexpectedly.");
     for (size_t i = 0; i < 64; ++i) {
         if (i == 40) { continue; }
-        require(std::memcmp(&lumps[i], &original.lumps[i], sizeof(Lump)) == 0, std::format("Lump {} metadata changed.", i));
+        require(std::memcmp(&lumps[i], &original.lumps[i], sizeof(Lump)) == 0, "Lump {} metadata changed.", i);
         const auto& l = lumps[i];
         if (l.length == 0) { continue; }
-        require(std::equal(bytes.begin() + l.offset, bytes.begin() + l.offset + l.length, original.bytes.begin() + l.offset), std::format("Lump {} payload changed.", i));
+        require(std::equal(bytes.begin() + l.offset, bytes.begin() + l.offset + l.length, original.bytes.begin() + l.offset), "Lump {} payload changed.", i);
     }
     for (const auto& [name, unused] : original.pakNames) {
-        if (!replacements.contains(name)) { require(embedded(name) == original.embedded(name), std::format("Unrelated embedded asset changed: {}", name)); }
+        if (!replacements.contains(name)) { require(embedded(name) == original.embedded(name), "Unrelated embedded asset changed: {}", name); }
     }
-    for (const auto& [name, expected] : replacements) { auto value = embedded(name); require(value && *value == expected, std::format("Written cubemap differs: {}", name)); }
+    for (const auto& [name, expected] : replacements) { auto value = embedded(name); require(value && *value == expected, "Written cubemap differs: {}", name); }
 }
 
 void Bsp::validateDestination(const fs::path& destination, bool overwrite, bool inPlace) const {
@@ -247,9 +247,9 @@ void Bsp::writeCubemaps(const std::map<std::string, Bytes>& textures, const fs::
         require(name.size() <= UINT16_MAX && data.size() <= INT32_MAX, "An output ZIP entry exceeds its size limit.");
         mz_zip_file info{}; info.filename = name.c_str(); info.filename_size = static_cast<uint16_t>(name.size());
         info.flag = MZ_ZIP_FLAG_UTF8; info.compression_method = MZ_COMPRESS_METHOD_STORE; info.uncompressed_size = static_cast<int64_t>(data.size());
-        require(mz_zip_writer_entry_open(zip.handle, &info) == MZ_OK, std::format("Cannot create embedded entry: {}", name));
-        if (!data.empty()) { require(mz_zip_writer_entry_write(zip.handle, data.data(), static_cast<int32_t>(data.size())) == static_cast<int32_t>(data.size()), std::format("Cannot write embedded entry: {}", name)); }
-        require(mz_zip_writer_entry_close(zip.handle) == MZ_OK, std::format("Cannot finish embedded entry: {}", name));
+        require(mz_zip_writer_entry_open(zip.handle, &info) == MZ_OK, "Cannot create embedded entry: {}", name);
+        if (!data.empty()) { require(mz_zip_writer_entry_write(zip.handle, data.data(), static_cast<int32_t>(data.size())) == static_cast<int32_t>(data.size()), "Cannot write embedded entry: {}", name); }
+        require(mz_zip_writer_entry_close(zip.handle) == MZ_OK, "Cannot finish embedded entry: {}", name);
     };
     for (const auto& [name, originalName] : pakNames) {
         if (textures.contains(name)) { continue; }
@@ -285,6 +285,6 @@ void Bsp::writeCubemaps(const std::map<std::string, Bytes>& textures, const fs::
         require(CopyFileW(output.c_str(), backup.c_str(), TRUE) != 0, "Cannot create the original BSP backup.");
     }
     DWORD flags = MOVEFILE_WRITE_THROUGH | ((overwrite || same) ? MOVEFILE_REPLACE_EXISTING : 0);
-    require(MoveFileExW(temporary.path.c_str(), output.c_str(), flags) != 0, std::format("Cannot publish the output BSP (Windows error {}).", GetLastError()));
+    require(MoveFileExW(temporary.path.c_str(), output.c_str(), flags) != 0, "Cannot publish the output BSP (Windows error {}).", GetLastError());
 }
 }

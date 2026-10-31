@@ -7,7 +7,7 @@ namespace scm {
 void Assets::mount(const fs::path& input, bool required, bool scanArchives) {
     auto path = fs::absolute(input).lexically_normal();
     if (!fs::exists(path)) {
-        require(!required, std::format("Mount does not exist: {}", path.string()));
+        require(!required, "Mount does not exist: {}", path.string());
         spdlog::debug("Skipped absent optional mount: {}", path.string());
         return;
     }
@@ -28,7 +28,7 @@ void Assets::mount(const fs::path& input, bool required, bool scanArchives) {
     if (extension == ".vpk") { archive = vpkpp::VPK::open(path.string()); }
     else if (extension == ".gma") { archive = vpkpp::GMA::open(path.string()); }
     else { throw Error(std::format("Unsupported archive mount: {}", path.string())); }
-    require(archive != nullptr, std::format("Cannot open archive: {}", path.string()));
+    require(archive != nullptr, "Cannot open archive: {}", path.string());
     sources.push_back({path, std::move(archive)});
 }
 Assets::Assets(const Bsp& map, const fs::path& game, const std::vector<std::string>& mounts, std::string profile) : bsp(map) {
@@ -123,14 +123,14 @@ std::string MaterialDefinition::value(std::string_view key, std::string fallback
 }
 bool MaterialDefinition::flag(std::string_view key) const { return parseFloat(value(key), 0) != 0; }
 MaterialDefinition readMaterial(Assets& assets, std::string name, bool hdr, unsigned depth) {
-    require(depth < 32, std::format("VMT include cycle or excessive nesting: {}", name));
+    require(depth < 32, "VMT include cycle or excessive nesting: {}", name);
     name = assetPath(name);
     if (!name.starts_with("materials/")) { name = "materials/" + name; }
     if (!name.ends_with(".vmt")) { name += ".vmt"; }
     auto bytes = assets.get(name, "material");
     auto text = textOf(bytes->bytes);
     kvpp::KV1 document(text);
-    require(document.getChildCount() == 1, std::format("Invalid VMT root: {}", name));
+    require(document.getChildCount() == 1, "Invalid VMT root: {}", name);
     const auto& root = document[0];
     MaterialDefinition result;
     result.shader = lower(std::string(root.getKey()));
@@ -138,14 +138,14 @@ MaterialDefinition readMaterial(Assets& assets, std::string name, bool hdr, unsi
         result.proxies.emplace_back(proxy.getKey());
         std::map<std::string, std::string> parameters;
         for (const auto& entry : proxy) {
-            require(entry.getChildCount() == 0, std::format("Unsupported nested proxy parameter in {}.", name));
+            require(entry.getChildCount() == 0, "Unsupported nested proxy parameter in {}.", name);
             parameters[lower(std::string(entry.getKey()))] = std::string(entry.getValue());
         }
         result.proxyParameters.push_back(std::move(parameters));
     };
     if (result.shader == "patch") {
         auto include = root["include"].getValue();
-        require(!include.empty(), std::format("Patch has no include: {}", name));
+        require(!include.empty(), "Patch has no include: {}", name);
         result = readMaterial(assets, std::string(include), hdr, depth + 1);
         for (const auto& block : root) {
             auto kind = lower(std::string(block.getKey()));
@@ -161,7 +161,7 @@ MaterialDefinition readMaterial(Assets& assets, std::string name, bool hdr, unsi
     for (const auto& entry : root) {
         auto conditional = lower(std::string(entry.getConditional()));
         if (!conditional.empty()) {
-            require(conditional == "$win32" || conditional == "$hdr" || conditional == "!$hdr" || conditional == "$ldr", std::format("Unsupported VMT conditional '{}' in {}.", conditional, name));
+            require(conditional == "$win32" || conditional == "$hdr" || conditional == "!$hdr" || conditional == "$ldr", "Unsupported VMT conditional '{}' in {}.", conditional, name);
             if ((conditional == "$hdr" && !hdr) || ((conditional == "!$hdr" || conditional == "$ldr") && hdr)) { continue; }
         }
         auto key = lower(std::string(entry.getKey()));
@@ -173,7 +173,7 @@ MaterialDefinition readMaterial(Assets& assets, std::string name, bool hdr, unsi
             for (const auto& child : entry) {
                 auto childKey = lower(std::string(child.getKey()));
                 if (childKey == "proxies") { for (const auto& proxy : child) { addProxy(proxy); } }
-                else { require(child.getChildCount() == 0, std::format("Unsupported nested material block '{}' in {}.", childKey, name)); result.parameters[childKey] = std::string(child.getValue()); }
+                else { require(child.getChildCount() == 0, "Unsupported nested material block '{}' in {}.", childKey, name); result.parameters[childKey] = std::string(child.getValue()); }
             }
         }
         else { throw Error(std::format("Unsupported material fallback block '{}' in {}.", key, name)); }

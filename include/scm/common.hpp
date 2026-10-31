@@ -25,7 +25,15 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-void require(bool condition, std::string_view message);
+[[noreturn]] void fail(std::string_view message);
+/// Throws Error with the message when a validated condition does not hold.
+inline void require(bool condition, std::string_view message) {
+    if (!condition) [[unlikely]] { fail(message); }
+}
+/// Throws Error with a formatted message; arguments are formatted only on failure so hot validation stays free.
+template<class... Args> inline void require(bool condition, std::format_string<Args...> message, Args&&... arguments) {
+    if (!condition) [[unlikely]] { fail(std::vformat(message.get(), std::make_format_args(arguments...))); }
+}
 Bytes readFile(const fs::path& path);
 void writeFile(const fs::path& path, std::span<const std::byte> bytes);
 std::string textOf(std::span<const std::byte> bytes);
@@ -41,7 +49,7 @@ public:
     explicit Reader(std::span<const std::byte> bytes, std::string context = "binary data") : data(bytes), label(std::move(context)) {}
     template<class T> T at(size_t offset) const {
         static_assert(std::is_trivially_copyable_v<T>);
-        require(offset <= data.size() && sizeof(T) <= data.size() - offset, std::format("Truncated {} at byte {}.", label, offset));
+        require(offset <= data.size() && sizeof(T) <= data.size() - offset, "Truncated {} at byte {}.", label, offset);
         T value;
         std::memcpy(&value, data.data() + offset, sizeof(T));
         return value;

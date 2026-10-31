@@ -14,7 +14,7 @@
 
 namespace scm {
 namespace {
-void checked(VkResult result, std::string_view operation) { require(result == VK_SUCCESS, std::format("{} failed (Vulkan result {}).", operation, int(result))); }
+void checked(VkResult result, std::string_view operation) { require(result == VK_SUCCESS, "{} failed (Vulkan result {}).", operation, int(result)); }
 float linear(float value) { return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f); }
 struct Buffer { VkBuffer buffer{}; VmaAllocation allocation{}; void* mapping{}; VkDeviceSize size{}; };
 struct GpuImage { VkImage image{}; VmaAllocation allocation{}; VkImageView view{}; uint32_t mips = 1; };
