@@ -7,7 +7,10 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/packing.hpp>
 #include <spdlog/spdlog.h>
+#include <atomic>
+#include <exception>
 #include <sstream>
+#include <thread>
 #include <tuple>
 
 namespace scm {
@@ -20,6 +23,18 @@ template<class T> std::vector<T> records(const Bytes& bytes, std::string_view la
 }
 template<class V> glm::vec3 vec3(const V& value) { return {value[0], value[1], value[2]}; }
 template<class V> glm::vec4 vec4(const V& value) { return {value[0], value[1], value[2], value[3]}; }
+/// Runs work for every index across the hardware threads and rethrows the failure with the lowest index.
+template<class Work> void parallelFor(size_t count, const Work& work) {
+    std::vector<std::exception_ptr> failures(count);
+    std::atomic_size_t next = 0;
+    auto run = [&] { for (size_t i = next++; i < count; i = next++) { try { work(i); } catch (...) { failures[i] = std::current_exception(); } } };
+    {
+        std::vector<std::jthread> workers;
+        for (size_t i = 1; i < std::min<size_t>(count, std::max(1u, std::thread::hardware_concurrency())); ++i) { workers.emplace_back(run); }
+        run();
+    }
+    for (const auto& failure : failures) { if (failure) { std::rethrow_exception(failure); } }
+}
 float linearColor(float value) { return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f); }
 /// Linearizes sRGB pixels, rejects nonfinite values, and stores half floats unless a value needs full precision.
 void storeFloatPixels(Image& image, std::vector<glm::vec4> pixels) {
@@ -128,7 +143,7 @@ glm::vec2 transformedUV(glm::vec2 uv, std::string_view description) {
     return glm::vec2(std::cos(radians) * uv.x - std::sin(radians) * uv.y, std::sin(radians) * uv.x + std::cos(radians) * uv.y) + center + translation;
 }
 
-/// A texture whose asset is resolved and ready for VTF decoding.
+/// A texture whose asset is resolved and whose VTF decoding waits for the parallel pass at the end of the build.
 struct PendingTexture { uint32_t index; std::shared_ptr<const Asset> asset; bool srgb; int frame; };
 class Builder {
 public:
@@ -151,7 +166,7 @@ public:
         auto asset = assets.get(name, requester);
         uint32_t index = static_cast<uint32_t>(scene.images.size());
         scene.images.push_back({name});
-        decodeTexture({index, std::move(asset), srgb, frame});
+        pendingTextures.push_back({index, std::move(asset), srgb, frame});
         textureIds.emplace(key, index);
         return index;
     }
@@ -210,7 +225,8 @@ public:
         storeFloatPixels(image, std::move(pixels));
     }
     void finishImages() {
-        for (auto& [index, pixels] : lightmapPages) { storeFloatPixels(scene.images[index], std::move(pixels)); }
+        parallelFor(pendingTextures.size(), [&](size_t i) { decodeTexture(pendingTextures[i]); });
+        parallelFor(lightmapPages.size(), [&](size_t i) { storeFloatPixels(scene.images[lightmapPages[i].first], std::move(lightmapPages[i].second)); });
     }
     uint32_t material(std::string name) {
         name = lower(std::move(name));
@@ -466,6 +482,7 @@ public:
     std::set<uint32_t> skyFaces;
     int skyArea = -1;
     std::map<std::string, uint32_t> textureIds, materialIds;
+    std::vector<PendingTexture> pendingTextures;
     std::vector<std::pair<uint32_t, std::vector<glm::vec4>>> lightmapPages;
     std::array<glm::vec4*, 4> pagePixels{};
     std::array<uint32_t, 4> pageIds{};
