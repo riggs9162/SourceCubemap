@@ -5,6 +5,7 @@
 #include <thread>
 #include <set>
 #include <bit>
+#include <spdlog/spdlog.h>
 #include <vtfpp/VTF.h>
 #include <sourcepp/compression/LZMA.h>
 #include <mz.h>
@@ -91,6 +92,7 @@ void validateVtf(std::span<const std::byte> data, std::string_view name) {
 }
 std::string Probe::name() const { return std::format("c{}_{}_{}", origin.x, origin.y, origin.z); }
 
+/// Opens a map and loads its embedded files. Packing tools can leave one file in the ZIP twice, often under a different case or slash, so a later entry replaces an earlier one, as in any updated ZIP.
 Bsp::Bsp(const fs::path& filename) : path(fs::absolute(filename)), bytes(readFile(path)) {
     auto label = path.string();
     Reader header(bytes, label);
@@ -151,31 +153,37 @@ Bsp::Bsp(const fs::path& filename) : path(fs::absolute(filename)), bytes(readFil
     entities = source->getLumpData<bsppp::BSPLump::ENTITIES>();
     auto zip = view(40);
     if (!zip.empty()) {
-        struct PendingEntry { const std::string* name; int64_t position; uint32_t crc; Bytes* payload; };
-        std::vector<PendingEntry> pending;
+        struct PendingEntry { std::string original; int64_t position; uint32_t crc; int64_t size; };
+        std::map<std::string, PendingEntry> latest;
         require(zip.size() <= INT32_MAX, "The embedded ZIP archive cannot be read.");
         ZipView directory(zip);
-        uint64_t totalSize = 0; auto status = mz_zip_goto_first_entry(directory.zip);
+        size_t duplicates = 0; auto status = mz_zip_goto_first_entry(directory.zip);
         for (; status == MZ_OK; status = mz_zip_goto_next_entry(directory.zip)) {
             if (mz_zip_entry_is_dir(directory.zip) == MZ_OK) { continue; }
             mz_zip_file* info = nullptr;
             require(mz_zip_entry_get_info(directory.zip, &info) == MZ_OK && info, "Cannot read an embedded ZIP directory record.");
-            auto name = assetPath(info->filename);
-            require(!pakNames.contains(name), "Duplicate embedded path: {}", name);
-            require(info->uncompressed_size >= 0 && info->uncompressed_size <= (1ll << 30), "An embedded ZIP entry exceeds the 1 GiB memory limit.");
-            totalSize += static_cast<uint64_t>(info->uncompressed_size);
-            require(totalSize <= (2ull << 30), "The expanded BSP PAK exceeds the 2 GiB memory limit.");
-            pakNames.emplace(name, info->filename);
-            auto [entry, inserted] = pakData.emplace(std::move(name), Bytes(static_cast<size_t>(info->uncompressed_size)));
-            pending.push_back({&entry->first, mz_zip_get_entry(directory.zip), info->crc, &entry->second});
+            auto [entry, added] = latest.insert_or_assign(assetPath(info->filename), PendingEntry{info->filename, mz_zip_get_entry(directory.zip), info->crc, info->uncompressed_size});
+            if (!added) { spdlog::debug("Using the later copy of embedded path {}", entry->first); ++duplicates; }
         }
         require(status == MZ_END_OF_LIST, "The embedded ZIP directory is truncated or invalid.");
+        if (duplicates) { spdlog::warn("{} embedded files were stored more than once; keeping the latest copy of each.", duplicates); }
+        uint64_t totalSize = 0;
+        std::vector<const std::pair<const std::string, PendingEntry>*> pending;
+        for (const auto& item : latest) {
+            const auto& [name, entry] = item;
+            require(entry.size >= 0 && entry.size <= (1ll << 30), "An embedded ZIP entry exceeds the 1 GiB memory limit.");
+            totalSize += static_cast<uint64_t>(entry.size);
+            require(totalSize <= (2ull << 30), "The expanded BSP PAK exceeds the 2 GiB memory limit.");
+            pakNames.emplace(name, entry.original);
+            pakData.emplace(name, Bytes(static_cast<size_t>(entry.size)));
+            pending.push_back(&item);
+        }
         std::atomic_size_t next = 0;
         parallelFor(std::min<size_t>(pending.size(), std::max(1u, std::thread::hardware_concurrency())), [&](size_t) {
             ZipView worker(zip);
             for (size_t i = next++; i < pending.size(); i = next++) {
-                const auto& entry = pending[i];
-                require(readZipEntry(worker.zip, entry.position, entry.crc, *entry.payload), "Embedded ZIP entry failed decompression or checksum validation: {}", *entry.name);
+                const auto& [name, entry] = *pending[i];
+                require(readZipEntry(worker.zip, entry.position, entry.crc, pakData.at(name)), "Embedded ZIP entry failed decompression or checksum validation: {}", name);
             }
         });
     }
