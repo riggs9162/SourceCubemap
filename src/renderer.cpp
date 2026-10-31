@@ -11,6 +11,8 @@
 #include <spdlog/spdlog.h>
 #include <bit>
 #include <numeric>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace scm {
 namespace {
@@ -70,6 +72,7 @@ struct Renderer::Impl {
     bool anisotropy = false;
     std::array<VkPipeline, 16> pipelines{};
     std::vector<GpuImage> images;
+    std::unordered_map<std::string, GpuImage> imageCache;
     std::vector<VkDescriptorSet> descriptors;
     Buffer vertices, indices, readback, uniforms, staging;
     std::vector<ImageCopy> imageCopies;
@@ -83,7 +86,7 @@ struct Renderer::Impl {
     uint64_t captureCount = 0;
     uint64_t drawCalls = 0, culledDraws = 0;
     uint64_t waterViews = 0;
-    uint64_t textureUploadBytes = 0, uploadSubmissions = 0;
+    uint64_t textureUploadBytes = 0, uploadSubmissions = 0, reusedTextures = 0;
     double uploadWaitSeconds = 0, uploadTotalSeconds = 0, pipelineSeconds = 0;
 
     explicit Impl(RenderOptions settings) : options(std::move(settings)) {}
@@ -95,7 +98,7 @@ struct Renderer::Impl {
                 if (count <= (64u << 20)) { Bytes data(count); checked(vkGetPipelineCacheData(device, pipelineCache, &count, data.data()), "Read pipeline cache"); data.resize(count); writeCacheFile(cacheFile, data); }
             } catch (const std::exception& error) { spdlog::warn("Pipeline cache write failed: {}", error.what()); }
         }
-        releaseScene(); releaseTargets(); destroy(staging);
+        releaseScene(); releaseTargets(); releaseImages(); destroy(staging);
         for (auto pipeline : pipelines) { if (pipeline) { vkDestroyPipeline(device, pipeline, nullptr); } }
         if (vertexShader) { vkDestroyShaderModule(device, vertexShader, nullptr); }
         if (fragmentShader) { vkDestroyShaderModule(device, fragmentShader, nullptr); }
@@ -121,8 +124,11 @@ struct Renderer::Impl {
     }
     void releaseScene() {
         if (descriptorPool) { vkDestroyDescriptorPool(device, descriptorPool, nullptr); descriptorPool = {}; }
-        for (auto& image : images) { destroy(image); }
         images.clear(); descriptors.clear(); destroy(vertices); destroy(indices); destroy(uniforms);
+    }
+    void releaseImages() {
+        for (auto& [key, image] : imageCache) { destroy(image); }
+        imageCache.clear(); images.clear();
     }
     void releaseTargets() {
         for (auto& view : colorViews) { if (view) { vkDestroyImageView(device, view, nullptr); view = {}; } }
@@ -389,6 +395,23 @@ struct Renderer::Impl {
         textureUploadBytes += total;
         return image;
     }
+    /// Keeps GPU copies of unchanged textures, so a later lighting variant uploads only what differs.
+    void uploadImages(const Scene& scene) {
+        std::vector<std::string> keys; keys.reserve(scene.images.size());
+        for (const auto& source : scene.images) { keys.push_back(std::format("{}:{}:{}:{}:{}:{}", digest(source.pixels), source.width, source.height, source.mipCount, static_cast<uint32_t>(source.format), source.srgb)); }
+        std::unordered_set<std::string> wanted(keys.begin(), keys.end());
+        for (auto entry = imageCache.begin(); entry != imageCache.end();) {
+            if (wanted.contains(entry->first)) { ++entry; }
+            else { destroy(entry->second); entry = imageCache.erase(entry); }
+        }
+        images.reserve(scene.images.size());
+        for (size_t i = 0; i < scene.images.size(); ++i) {
+            auto found = imageCache.find(keys[i]);
+            if (found == imageCache.end()) { found = imageCache.emplace(keys[i], uploadImage(scene.images[i])).first; }
+            else { ++reusedTextures; }
+            images.push_back(found->second);
+        }
+    }
     void writeDraws(const Scene& scene) {
         uint32_t count = static_cast<uint32_t>(scene.draws.size());
         auto alignment = properties.limits.minUniformBufferOffsetAlignment;
@@ -461,10 +484,10 @@ struct Renderer::Impl {
         checked(vmaFlushAllocation(allocator, vertices.allocation, 0, VK_WHOLE_SIZE), "Flush vertices"); checked(vmaFlushAllocation(allocator, indices.allocation, 0, VK_WHOLE_SIZE), "Flush indices");
         Stopwatch uploadTimer;
         try {
-            for (const auto& source : scene.images) { images.push_back(uploadImage(source)); }
+            uploadImages(scene);
             writeDraws(scene);
             flushTransfers();
-        } catch (...) { vkDeviceWaitIdle(device); imageCopies.clear(); stagingUsed = 0; transferOpen = false; throw; }
+        } catch (...) { vkDeviceWaitIdle(device); imageCopies.clear(); stagingUsed = 0; transferOpen = false; releaseImages(); throw; }
         uploadTotalSeconds += uploadTimer.seconds();
     }
     void renderViews(const Scene& scene, glm::vec3 cameraOrigin, size_t probeIndex, bool skyOnly, unsigned mode, bool submerged, glm::vec4 clipPlane) {
@@ -574,6 +597,6 @@ Renderer::~Renderer() = default;
 void Renderer::prepare(const Scene& scene) { impl->prepare(scene); }
 Cube Renderer::capture(const Scene& scene, const Probe& probe, bool skyOnly) { return impl->capture(scene, probe, skyOnly); }
 Json Renderer::statistics() const {
-    return {{"device", impl->properties.deviceName}, {"driver_version", impl->properties.driverVersion}, {"gpu_seconds", impl->gpuSeconds}, {"captures", impl->captureCount}, {"draw_calls", impl->drawCalls}, {"culled_draws", impl->culledDraws}, {"water_secondary_views", impl->waterViews}, {"water_reflection_levels", impl->waterViews ? 1 : 0}, {"texture_upload_bytes", impl->textureUploadBytes}, {"upload_submissions", impl->uploadSubmissions}, {"upload_total_seconds", impl->uploadTotalSeconds}, {"upload_wait_seconds", impl->uploadWaitSeconds}, {"pipeline_seconds", impl->pipelineSeconds}, {"swapchain", false}};
+    return {{"device", impl->properties.deviceName}, {"driver_version", impl->properties.driverVersion}, {"gpu_seconds", impl->gpuSeconds}, {"captures", impl->captureCount}, {"draw_calls", impl->drawCalls}, {"culled_draws", impl->culledDraws}, {"water_secondary_views", impl->waterViews}, {"water_reflection_levels", impl->waterViews ? 1 : 0}, {"texture_upload_bytes", impl->textureUploadBytes}, {"reused_textures", impl->reusedTextures}, {"upload_submissions", impl->uploadSubmissions}, {"upload_total_seconds", impl->uploadTotalSeconds}, {"upload_wait_seconds", impl->uploadWaitSeconds}, {"pipeline_seconds", impl->pipelineSeconds}, {"swapchain", false}};
 }
 }
