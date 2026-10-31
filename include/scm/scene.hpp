@@ -2,14 +2,21 @@
 #include "assets.hpp"
 
 namespace scm {
+enum class PixelFormat : uint32_t { RGBA8, BGRA8, BC1, BC2, BC3, RGBA16F, RGBA32F };
+/// A GPU-ready texture: a tightly packed mip chain, largest level first, stored in its upload format.
 struct Image {
     std::string name;
     uint32_t width = 1, height = 1;
     bool srgb = false;
     bool clamp = false;
-    std::vector<glm::vec4> pixels{glm::vec4(1)};
+    Bytes pixels;
     uint32_t mipCount = 1;
+    PixelFormat format = PixelFormat::RGBA16F;
 };
+/// Returns the byte length of one mip level; block formats round up to whole 4x4 blocks.
+size_t pixelBytes(PixelFormat format, uint32_t width, uint32_t height);
+/// Returns a one-pixel image of a linear color.
+Image solidImage(std::string name, glm::vec4 color);
 struct Vertex {
     glm::vec3 position{};
     glm::vec3 normal{0, 0, 1};

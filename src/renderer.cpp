@@ -16,8 +16,22 @@ namespace scm {
 namespace {
 void checked(VkResult result, std::string_view operation) { require(result == VK_SUCCESS, "{} failed (Vulkan result {}).", operation, int(result)); }
 float linear(float value) { return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f); }
+VkFormat textureFormat(const Image& image) {
+    switch (image.format) {
+        case PixelFormat::RGBA8: return image.srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+        case PixelFormat::BGRA8: return image.srgb ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
+        case PixelFormat::BC1: return image.srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        case PixelFormat::BC2: return image.srgb ? VK_FORMAT_BC2_SRGB_BLOCK : VK_FORMAT_BC2_UNORM_BLOCK;
+        case PixelFormat::BC3: return image.srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+        case PixelFormat::RGBA16F: return VK_FORMAT_R16G16B16A16_SFLOAT;
+        case PixelFormat::RGBA32F: return VK_FORMAT_R32G32B32A32_SFLOAT;
+    }
+    throw Error("Unknown texture pixel format.");
+}
 struct Buffer { VkBuffer buffer{}; VmaAllocation allocation{}; void* mapping{}; VkDeviceSize size{}; };
 struct GpuImage { VkImage image{}; VmaAllocation allocation{}; VkImageView view{}; uint32_t mips = 1; };
+struct ImageCopy { VkImage image{}; uint32_t mips = 1; std::vector<VkBufferImageCopy> regions; };
+enum class Memory { Device, Upload, Readback };
 struct Push { glm::mat4 projection; glm::vec4 eye, clipPlane, waterView; };
 struct DrawUniform {
     glm::vec4 tint, controls;
@@ -54,10 +68,13 @@ struct Renderer::Impl {
     VkSampler wrapSampler{}, clampSampler{};
     VkQueryPool queries{};
     bool anisotropy = false;
-    std::map<unsigned, VkPipeline> pipelines;
+    std::array<VkPipeline, 16> pipelines{};
     std::vector<GpuImage> images;
     std::vector<VkDescriptorSet> descriptors;
-    Buffer vertices, indices, readback, uniforms;
+    Buffer vertices, indices, readback, uniforms, staging;
+    std::vector<ImageCopy> imageCopies;
+    VkDeviceSize stagingUsed = 0;
+    bool transferOpen = false;
     GpuImage color, depth, waterReflection, waterRefraction;
     std::array<VkImageView, 6> colorViews{}, depthViews{};
     uint32_t targetSize = 0;
@@ -78,8 +95,8 @@ struct Renderer::Impl {
                 if (count <= (64u << 20)) { Bytes data(count); checked(vkGetPipelineCacheData(device, pipelineCache, &count, data.data()), "Read pipeline cache"); data.resize(count); writeCacheFile(cacheFile, data); }
             } catch (const std::exception& error) { spdlog::warn("Pipeline cache write failed: {}", error.what()); }
         }
-        releaseScene(); releaseTargets();
-        for (auto [key, pipeline] : pipelines) { vkDestroyPipeline(device, pipeline, nullptr); }
+        releaseScene(); releaseTargets(); destroy(staging);
+        for (auto pipeline : pipelines) { if (pipeline) { vkDestroyPipeline(device, pipeline, nullptr); } }
         if (vertexShader) { vkDestroyShaderModule(device, vertexShader, nullptr); }
         if (fragmentShader) { vkDestroyShaderModule(device, fragmentShader, nullptr); }
         if (queries) { vkDestroyQueryPool(device, queries, nullptr); }
@@ -112,11 +129,12 @@ struct Renderer::Impl {
         for (auto& view : depthViews) { if (view) { vkDestroyImageView(device, view, nullptr); view = {}; } }
         destroy(color); destroy(depth); destroy(waterReflection); destroy(waterRefraction); destroy(readback); targetSize = 0;
     }
-    Buffer makeBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host) {
+    Buffer makeBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Memory memory) {
         Buffer buffer; buffer.size = size;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; info.size = size; info.usage = usage;
-        VmaAllocationCreateInfo allocation{}; allocation.usage = VMA_MEMORY_USAGE_AUTO;
-        if (host) { allocation.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT; }
+        VmaAllocationCreateInfo allocation{}; allocation.usage = memory == Memory::Device ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE : VMA_MEMORY_USAGE_AUTO;
+        if (memory == Memory::Upload) { allocation.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT; }
+        if (memory == Memory::Readback) { allocation.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT; }
         VmaAllocationInfo result{};
         checked(vmaCreateBuffer(allocator, &info, &allocation, &buffer.buffer, &buffer.allocation, &result), "Create buffer");
         buffer.mapping = result.pMappedData;
@@ -193,12 +211,18 @@ struct Renderer::Impl {
             require((support.optimalTilingFeatures & required) == required, "GPU lacks the required floating-point texture filtering formats.");
             if (format == VK_FORMAT_R32G32B32A32_SFLOAT) { require((support.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0, "GPU lacks floating-point capture targets."); }
         }
+        for (auto format : {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK, VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC2_SRGB_BLOCK, VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK}) {
+            VkFormatProperties support{}; vkGetPhysicalDeviceFormatProperties(physical, format, &support);
+            auto required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+            require((support.optimalTilingFeatures & required) == required, "GPU lacks the required block-compressed texture formats.");
+        }
         VkFormatProperties depthSupport{}; vkGetPhysicalDeviceFormatProperties(physical, VK_FORMAT_D32_SFLOAT, &depthSupport);
         require((depthSupport.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0, "GPU lacks D32 depth attachments.");
         VkPhysicalDeviceVulkan13Features supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; features.pNext = &supported;
         vkGetPhysicalDeviceFeatures2(physical, &features);
         require(supported.dynamicRendering && supported.synchronization2, "GPU lacks Vulkan dynamic rendering or synchronization2.");
+        require(features.features.textureCompressionBC, "GPU lacks block-compressed texture support.");
         anisotropy = features.features.samplerAnisotropy != 0;
         uint32_t queueCount = 0; vkGetPhysicalDeviceQueueFamilyProperties(physical, &queueCount, nullptr);
         std::vector<VkQueueFamilyProperties> queues(queueCount); vkGetPhysicalDeviceQueueFamilyProperties(physical, &queueCount, queues.data());
@@ -208,7 +232,7 @@ struct Renderer::Impl {
         float priority = 1;
         VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; queueInfo.queueFamilyIndex = queueIndex; queueInfo.queueCount = 1; queueInfo.pQueuePriorities = &priority;
         VkPhysicalDeviceVulkan13Features enabled{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES}; enabled.dynamicRendering = VK_TRUE; enabled.synchronization2 = VK_TRUE;
-        VkPhysicalDeviceFeatures basic{}; basic.samplerAnisotropy = anisotropy;
+        VkPhysicalDeviceFeatures basic{}; basic.samplerAnisotropy = anisotropy; basic.textureCompressionBC = VK_TRUE;
         VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO}; deviceInfo.pNext = &enabled; deviceInfo.queueCreateInfoCount = 1; deviceInfo.pQueueCreateInfos = &queueInfo; deviceInfo.pEnabledFeatures = &basic;
         checked(vkCreateDevice(physical, &deviceInfo, nullptr, &device), "Create Vulkan device"); volkLoadDevice(device); vkGetDeviceQueue(device, queueIndex, 0, &queue);
         VmaVulkanFunctions functions{}; functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr; functions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
@@ -259,7 +283,7 @@ struct Renderer::Impl {
         spdlog::info("Rendering on {}", properties.deviceName);
     }
     VkPipeline pipeline(unsigned key) {
-        if (pipelines.contains(key)) { return pipelines.at(key); }
+        if (pipelines[key]) { return pipelines[key]; }
         std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
         stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertexShader, "VSMain", nullptr};
         stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragmentShader, "PSMain", nullptr};
@@ -284,7 +308,7 @@ struct Renderer::Impl {
         VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; rendering.colorAttachmentCount = 1; rendering.pColorAttachmentFormats = &format; rendering.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}; info.pNext = &rendering; info.stageCount = 2; info.pStages = stages.data(); info.pVertexInputState = &vertex; info.pInputAssemblyState = &assembly; info.pViewportState = &viewport; info.pRasterizationState = &raster; info.pMultisampleState = &multisample; info.pDepthStencilState = &depthState; info.pColorBlendState = &blendState; info.pDynamicState = &dynamic; info.layout = pipelineLayout;
         Stopwatch compiling;
-        VkPipeline value{}; checked(vkCreateGraphicsPipelines(device, pipelineCache, 1, &info, nullptr, &value), "Create graphics pipeline"); pipelineSeconds += compiling.seconds(); pipelines.emplace(key, value); return value;
+        VkPipeline value{}; checked(vkCreateGraphicsPipelines(device, pipelineCache, 1, &info, nullptr, &value), "Create graphics pipeline"); pipelineSeconds += compiling.seconds(); pipelines[key] = value; return value;
     }
     void targets(uint32_t size, bool water) {
         if (targetSize == size && targetWater == water) { return; }
@@ -298,7 +322,7 @@ struct Renderer::Impl {
             colorViews[i] = makeView(color.image, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, i, 1, 1);
             depthViews[i] = makeView(depth.image, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT, i, 1, 1);
         }
-        readback = makeBuffer(VkDeviceSize(size) * size * 6 * sizeof(glm::vec4), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        readback = makeBuffer(VkDeviceSize(size) * size * 6 * sizeof(glm::vec4), VK_BUFFER_USAGE_TRANSFER_DST_BIT, Memory::Readback);
         uint32_t waterSize = water ? size : 1;
         waterReflection = makeImage(waterSize, waterSize, 6, 1, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, true);
         waterRefraction = makeImage(waterSize, waterSize, 6, 1, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, true);
@@ -311,83 +335,85 @@ struct Renderer::Impl {
         }
         submit();
     }
-    void prepare(const Scene& scene) {
-        checked(vkDeviceWaitIdle(device), "Wait before replacing scene"); releaseScene();
-        require(!scene.vertices.empty() && !scene.indices.empty(), "The scene contains no renderable geometry.");
-        vertices = makeBuffer(scene.vertices.size() * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true);
-        indices = makeBuffer(scene.indices.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true);
-        std::memcpy(vertices.mapping, scene.vertices.data(), static_cast<size_t>(vertices.size)); std::memcpy(indices.mapping, scene.indices.data(), static_cast<size_t>(indices.size));
-        checked(vmaFlushAllocation(allocator, vertices.allocation, 0, VK_WHOLE_SIZE), "Flush vertices"); checked(vmaFlushAllocation(allocator, indices.allocation, 0, VK_WHOLE_SIZE), "Flush indices");
-        std::vector<Buffer> uploads;
-        uint64_t batchBytes = 0;
-        Stopwatch uploadTimer;
-        auto flushUploads = [&] { Stopwatch waiting; submit(); uploadWaitSeconds += waiting.seconds(); ++uploadSubmissions; for (auto& buffer : uploads) { destroy(buffer); } uploads.clear(); batchBytes = 0; };
-        try { for (const auto& source : scene.images) {
-            std::vector<glm::vec4> linearPixels(source.pixels.size());
-            bool halfPrecision = true;
-            for (size_t i = 0; i < source.pixels.size(); ++i) {
-                auto pixel = source.pixels[i];
-                if (source.srgb) { pixel.r = linear(pixel.r); pixel.g = linear(pixel.g); pixel.b = linear(pixel.b); }
-                for (unsigned channel = 0; channel < 4; ++channel) {
-                    if (!std::isfinite(pixel[channel])) { throw Error(std::format("Texture '{}' contains non-finite pixels.", source.name)); }
-                    halfPrecision &= std::abs(pixel[channel]) <= 65504.0f;
-                }
-                linearPixels[i] = pixel;
-            }
-            uint32_t mipCount = source.mipCount;
-            require(mipCount > 0 && mipCount <= std::bit_width(std::max(source.width, source.height)), "Invalid scene texture mip count.");
-            auto image = makeImage(source.width, source.height, 1, mipCount, halfPrecision ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
-            images.push_back(image);
-            if (uploads.empty()) { begin(); }
-            auto staging = makeBuffer(source.pixels.size() * (halfPrecision ? sizeof(uint32_t) * 2 : sizeof(glm::vec4)), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
-            uploads.push_back(staging); batchBytes += staging.size; textureUploadBytes += staging.size;
-            if (halfPrecision) {
-                auto* pixels = static_cast<uint32_t*>(staging.mapping);
-                for (size_t i = 0; i < linearPixels.size(); ++i) {
-                    pixels[i * 2] = glm::packHalf2x16(glm::vec2(linearPixels[i].r, linearPixels[i].g));
-                    pixels[i * 2 + 1] = glm::packHalf2x16(glm::vec2(linearPixels[i].b, linearPixels[i].a));
-                }
-            } else {
-                std::memcpy(staging.mapping, linearPixels.data(), static_cast<size_t>(staging.size));
-            }
-            checked(vmaFlushAllocation(allocator, staging.allocation, 0, VK_WHOLE_SIZE), "Flush texture staging");
-            barrier(image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, mipCount, 1);
-            std::vector<VkBufferImageCopy> copies;
-            size_t pixelOffset = 0;
-            for (uint32_t mip = 0; mip < mipCount; ++mip) {
-                VkBufferImageCopy copy{}; copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
-                copy.imageExtent = {std::max(1u, source.width >> mip), std::max(1u, source.height >> mip), 1};
-                copy.bufferOffset = pixelOffset * (halfPrecision ? 8 : sizeof(glm::vec4));
-                pixelOffset += size_t(copy.imageExtent.width) * copy.imageExtent.height;
-                copies.push_back(copy);
-            }
-            require(pixelOffset == source.pixels.size(), "Scene texture pixels do not match its mip layout.");
-            vkCmdCopyBufferToImage(command, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(copies.size()), copies.data());
-            barrier(image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, mipCount, 1);
-            if (batchBytes >= (128u << 20)) { flushUploads(); }
+    /// Submits queued transfers, moving every queued image from undefined contents to shader-readable data.
+    void flushTransfers() {
+        if (!transferOpen) { return; }
+        std::vector<VkImageMemoryBarrier2> before, after;
+        for (const auto& copy : imageCopies) {
+            VkImageMemoryBarrier2 item{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+            item.srcQueueFamilyIndex = item.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; item.image = copy.image; item.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, copy.mips, 0, 1};
+            item.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; item.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT; item.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; item.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            before.push_back(item);
+            item.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; item.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT; item.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT; item.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT; item.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; item.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            after.push_back(item);
         }
-        if (!uploads.empty()) { flushUploads(); }
-        } catch (...) { vkDeviceWaitIdle(device); for (auto& buffer : uploads) { destroy(buffer); } throw; }
-        uploadTotalSeconds += uploadTimer.seconds();
+        VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO}; dependency.imageMemoryBarrierCount = static_cast<uint32_t>(before.size()); dependency.pImageMemoryBarriers = before.data();
+        if (!before.empty()) { vkCmdPipelineBarrier2(command, &dependency); }
+        for (const auto& copy : imageCopies) { vkCmdCopyBufferToImage(command, staging.buffer, copy.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(copy.regions.size()), copy.regions.data()); }
+        VkMemoryBarrier2 memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2}; memory.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; memory.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT; memory.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT; memory.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT;
+        dependency.imageMemoryBarrierCount = static_cast<uint32_t>(after.size()); dependency.pImageMemoryBarriers = after.data(); dependency.memoryBarrierCount = 1; dependency.pMemoryBarriers = &memory;
+        vkCmdPipelineBarrier2(command, &dependency);
+        checked(vmaFlushAllocation(allocator, staging.allocation, 0, VK_WHOLE_SIZE), "Flush upload staging");
+        Stopwatch waiting; submit(); uploadWaitSeconds += waiting.seconds(); ++uploadSubmissions;
+        imageCopies.clear(); stagingUsed = 0; transferOpen = false;
+    }
+    /// Returns a shared staging offset for the next transfer, submitting queued work when the buffer is full.
+    VkDeviceSize reserveTransfer(VkDeviceSize size) {
+        if (staging.size < size) { flushTransfers(); destroy(staging); staging = makeBuffer(std::max(size, VkDeviceSize(256) << 20), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, Memory::Upload); }
+        if (stagingUsed + size > staging.size) { flushTransfers(); }
+        if (!transferOpen) { begin(); transferOpen = true; }
+        auto alignment = std::max<VkDeviceSize>(16, properties.limits.optimalBufferCopyOffsetAlignment);
+        auto offset = stagingUsed; stagingUsed = std::min(staging.size, (offset + size + alignment - 1) / alignment * alignment);
+        return offset;
+    }
+    GpuImage uploadImage(const Image& source) {
+        uint32_t mipCount = source.mipCount;
+        require(mipCount > 0 && mipCount <= std::bit_width(std::max(source.width, source.height)), "Invalid scene texture mip count.");
+        ImageCopy copy; copy.mips = mipCount;
+        VkDeviceSize total = 0;
+        for (uint32_t mip = 0; mip < mipCount; ++mip) {
+            VkBufferImageCopy region{}; region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+            region.imageExtent = {std::max(1u, source.width >> mip), std::max(1u, source.height >> mip), 1};
+            region.bufferOffset = total;
+            total += pixelBytes(source.format, region.imageExtent.width, region.imageExtent.height);
+            copy.regions.push_back(region);
+        }
+        require(total == source.pixels.size(), "Scene texture pixels do not match its mip layout.");
+        auto image = makeImage(source.width, source.height, 1, mipCount, textureFormat(source), VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        try {
+            auto offset = reserveTransfer(total);
+            std::memcpy(static_cast<std::byte*>(staging.mapping) + offset, source.pixels.data(), source.pixels.size());
+            for (auto& region : copy.regions) { region.bufferOffset += offset; }
+            copy.image = image.image; imageCopies.push_back(std::move(copy));
+        } catch (...) { destroy(image); throw; }
+        textureUploadBytes += total;
+        return image;
+    }
+    void writeDraws(const Scene& scene) {
         uint32_t count = static_cast<uint32_t>(scene.draws.size());
         auto alignment = properties.limits.minUniformBufferOffsetAlignment;
         auto uniformStride = (sizeof(DrawUniform) + alignment - 1) / alignment * alignment;
-        uniforms = makeBuffer(std::max(VkDeviceSize(1), count * uniformStride), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
+        uniforms = makeBuffer(std::max(VkDeviceSize(1), count * uniformStride), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, Memory::Readback);
         std::array<VkDescriptorPoolSize, 3> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, count * 12}, {VK_DESCRIPTOR_TYPE_SAMPLER, count * 2}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, count}}};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; poolInfo.maxSets = count; poolInfo.poolSizeCount = static_cast<uint32_t>(sizes.size()); poolInfo.pPoolSizes = sizes.data();
         checked(vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool), "Create descriptor pool");
         std::vector<VkDescriptorSetLayout> layouts(count, descriptorLayout); descriptors.resize(count);
         VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocation.descriptorPool = descriptorPool; allocation.descriptorSetCount = count; allocation.pSetLayouts = layouts.data();
         checked(vkAllocateDescriptorSets(device, &allocation, descriptors.data()), "Allocate material descriptors");
+        std::vector<VkDescriptorImageInfo> imageInfos; imageInfos.reserve(size_t(count) * 12);
+        std::vector<VkDescriptorBufferInfo> bufferInfos; bufferInfos.reserve(count);
+        std::vector<VkWriteDescriptorSet> writes; writes.reserve(size_t(count) * 13);
+        auto writeImage = [&](uint32_t drawIndex, uint32_t binding, VkDescriptorType type, VkDescriptorImageInfo info) {
+            imageInfos.push_back(info);
+            writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[drawIndex], binding, 0, 1, type, &imageInfos.back(), nullptr, nullptr});
+        };
+        auto writeTexture = [&](uint32_t drawIndex, uint32_t binding, uint32_t image) { writeImage(drawIndex, binding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, {VK_NULL_HANDLE, images.at(image).view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}); };
         for (uint32_t drawIndex = 0; drawIndex < count; ++drawIndex) {
             const auto& draw = scene.draws[drawIndex]; const auto& material = scene.materials[draw.material];
             std::array<uint32_t, 8> slots{material.base, material.second, material.normal, draw.lightmaps[0], draw.lightmaps[1], draw.lightmaps[2], draw.lightmaps[3], material.detail};
-            std::array<VkDescriptorImageInfo, 10> values{}; std::array<VkWriteDescriptorSet, 11> writes{};
-            for (uint32_t i = 0; i < 10; ++i) {
-                if (i < 8) { values[i].imageView = images.at(slots[i]).view; values[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; }
-                else { values[i].sampler = (i == 9 || scene.images[material.base].clamp) ? clampSampler : wrapSampler; }
-                writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[drawIndex], i, 0, 1, i < 8 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER, &values[i], nullptr, nullptr};
-            }
+            for (uint32_t i = 0; i < 8; ++i) { writeTexture(drawIndex, i, slots[i]); }
+            writeImage(drawIndex, 8, VK_DESCRIPTOR_TYPE_SAMPLER, {scene.images[material.base].clamp ? clampSampler : wrapSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
+            writeImage(drawIndex, 9, VK_DESCRIPTOR_TYPE_SAMPLER, {clampSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
             float fogStart = draw.skyWorld ? scene.skyFogStart : scene.fogStart, fogEnd = draw.skyWorld ? scene.skyFogEnd : scene.fogEnd;
             auto fogColor = draw.skyWorld ? scene.skyFogColor : scene.fogColor;
             bool fogEnabled = !draw.skyBox && !material.noFog && fogEnd > fogStart;
@@ -416,19 +442,30 @@ struct Renderer::Impl {
             uniform.waterLayers = {water.scroll1.x, water.scroll1.y, water.scroll2.x, water.scroll2.y};
             uniform.waterTime = {water.scroll1.z, water.scroll2.z, static_cast<float>(scene.captureTime), 0};
             std::memcpy(static_cast<std::byte*>(uniforms.mapping) + drawIndex * uniformStride, &uniform, sizeof(uniform));
-            VkDescriptorBufferInfo bufferInfo{uniforms.buffer, drawIndex * uniformStride, sizeof(DrawUniform)};
-            writes[10] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[drawIndex], 10, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &bufferInfo, nullptr};
-            vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-            VkDescriptorImageInfo blendImage{VK_NULL_HANDLE, images.at(material.blendMask).view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            VkWriteDescriptorSet blendWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,descriptors[drawIndex],13,0,1,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,&blendImage,nullptr,nullptr};
-            vkUpdateDescriptorSets(device, 1, &blendWrite, 0, nullptr);
-            VkDescriptorImageInfo emissionImage{VK_NULL_HANDLE, images.at(material.selfIllumMask).view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            VkWriteDescriptorSet emissionWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,descriptors[drawIndex],14,0,1,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,&emissionImage,nullptr,nullptr};
-            vkUpdateDescriptorSets(device, 1, &emissionWrite, 0, nullptr);
+            bufferInfos.push_back({uniforms.buffer, drawIndex * uniformStride, sizeof(DrawUniform)});
+            writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[drawIndex], 10, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &bufferInfos.back(), nullptr});
+            writeTexture(drawIndex, 13, material.blendMask);
+            writeTexture(drawIndex, 14, material.selfIllumMask);
             unsigned key = (material.translucent ? 1u : 0u) | (material.additive ? 2u : 0u) | (material.noCull ? 4u : 0u) | (draw.skyBox ? 8u : 0u);
             pipeline(key);
         }
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         checked(vmaFlushAllocation(allocator, uniforms.allocation, 0, VK_WHOLE_SIZE), "Flush draw uniforms");
+    }
+    void prepare(const Scene& scene) {
+        checked(vkDeviceWaitIdle(device), "Wait before replacing scene"); releaseScene();
+        require(!scene.vertices.empty() && !scene.indices.empty(), "The scene contains no renderable geometry.");
+        vertices = makeBuffer(scene.vertices.size() * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, Memory::Readback);
+        indices = makeBuffer(scene.indices.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, Memory::Readback);
+        std::memcpy(vertices.mapping, scene.vertices.data(), static_cast<size_t>(vertices.size)); std::memcpy(indices.mapping, scene.indices.data(), static_cast<size_t>(indices.size));
+        checked(vmaFlushAllocation(allocator, vertices.allocation, 0, VK_WHOLE_SIZE), "Flush vertices"); checked(vmaFlushAllocation(allocator, indices.allocation, 0, VK_WHOLE_SIZE), "Flush indices");
+        Stopwatch uploadTimer;
+        try {
+            for (const auto& source : scene.images) { images.push_back(uploadImage(source)); }
+            writeDraws(scene);
+            flushTransfers();
+        } catch (...) { vkDeviceWaitIdle(device); imageCopies.clear(); stagingUsed = 0; transferOpen = false; throw; }
+        uploadTotalSeconds += uploadTimer.seconds();
     }
     void renderViews(const Scene& scene, glm::vec3 cameraOrigin, size_t probeIndex, bool skyOnly, unsigned mode, bool submerged, glm::vec4 clipPlane) {
         uint32_t size = targetSize;

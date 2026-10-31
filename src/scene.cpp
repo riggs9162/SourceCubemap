@@ -5,6 +5,7 @@
 #include <vtfpp/VTF.h>
 #include <mdlpp/mdlpp.h>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/packing.hpp>
 #include <spdlog/spdlog.h>
 #include <sstream>
 #include <tuple>
@@ -19,6 +20,40 @@ template<class T> std::vector<T> records(const Bytes& bytes, std::string_view la
 }
 template<class V> glm::vec3 vec3(const V& value) { return {value[0], value[1], value[2]}; }
 template<class V> glm::vec4 vec4(const V& value) { return {value[0], value[1], value[2], value[3]}; }
+float linearColor(float value) { return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f); }
+/// Linearizes sRGB pixels, rejects nonfinite values, and stores half floats unless a value needs full precision.
+void storeFloatPixels(Image& image, std::vector<glm::vec4> pixels) {
+    bool halfPrecision = true;
+    for (auto& pixel : pixels) {
+        if (image.srgb) { pixel.r = linearColor(pixel.r); pixel.g = linearColor(pixel.g); pixel.b = linearColor(pixel.b); }
+        for (unsigned channel = 0; channel < 4; ++channel) {
+            require(std::isfinite(pixel[channel]), "Texture '{}' contains non-finite pixels.", image.name);
+            halfPrecision &= std::abs(pixel[channel]) <= 65504.0f;
+        }
+    }
+    image.srgb = false;
+    image.format = halfPrecision ? PixelFormat::RGBA16F : PixelFormat::RGBA32F;
+    if (!halfPrecision) { auto bytes = std::as_bytes(std::span(pixels)); image.pixels.assign(bytes.begin(), bytes.end()); return; }
+    image.pixels.resize(pixels.size() * 8);
+    auto* packed = reinterpret_cast<uint32_t*>(image.pixels.data());
+    for (size_t i = 0; i < pixels.size(); ++i) {
+        packed[i * 2] = glm::packHalf2x16(glm::vec2(pixels[i].r, pixels[i].g));
+        packed[i * 2 + 1] = glm::packHalf2x16(glm::vec2(pixels[i].b, pixels[i].a));
+    }
+}
+/// Returns the upload format whose bytes match a VTF format exactly, when one exists.
+std::optional<PixelFormat> directFormat(vtfpp::ImageFormat format) {
+    using enum vtfpp::ImageFormat;
+    switch (format) {
+        case DXT1: case DXT1_ONE_BIT_ALPHA: return PixelFormat::BC1;
+        case DXT3: return PixelFormat::BC2;
+        case DXT5: return PixelFormat::BC3;
+        case RGBA8888: return PixelFormat::RGBA8;
+        case BGRA8888: return PixelFormat::BGRA8;
+        case RGBA16161616F: return PixelFormat::RGBA16F;
+        default: return {};
+    }
+}
 glm::vec3 rgbExp(const Reader& reader, size_t offset) {
     float scale = std::ldexp(1.0f / 255.0f, reader.at<int8_t>(offset + 3));
     return glm::vec3(reader.at<uint8_t>(offset), reader.at<uint8_t>(offset + 1), reader.at<uint8_t>(offset + 2)) * scale;
@@ -93,14 +128,16 @@ glm::vec2 transformedUV(glm::vec2 uv, std::string_view description) {
     return glm::vec2(std::cos(radians) * uv.x - std::sin(radians) * uv.y, std::sin(radians) * uv.x + std::cos(radians) * uv.y) + center + translation;
 }
 
+/// A texture whose asset is resolved and ready for VTF decoding.
+struct PendingTexture { uint32_t index; std::shared_ptr<const Asset> asset; bool srgb; int frame; };
 class Builder {
 public:
     Builder(const Bsp& input, Assets& resolver, const SceneOptions& settings) : bsp(input), assets(resolver), options(settings) {
         scene.hdr = options.hdr;
         scene.captureTime = options.time;
         scene.probes = bsp.probes;
-        scene.images.push_back({"white", 1, 1, false, false, {glm::vec4(1)}});
-        scene.images.push_back({"flat normal", 1, 1, false, false, {glm::vec4(0.5f, 0.5f, 1, 1)}});
+        scene.images.push_back(solidImage("white", glm::vec4(1)));
+        scene.images.push_back(solidImage("flat normal", glm::vec4(0.5f, 0.5f, 1, 1)));
         scene.diagnostics = {{"unsupported", Json::array()}, {"warnings", Json::array()}};
         lightStyles = initialLightStyles(bsp);
     }
@@ -112,31 +149,68 @@ public:
         std::string key = name + (srgb ? ":srgb" : ":linear") + std::format(":{}", frame);
         if (textureIds.contains(key)) { return textureIds.at(key); }
         auto asset = assets.get(name, requester);
-        validateVtf(asset->bytes, name);
-        vtfpp::VTF vtf(asset->bytes, false, options.hdr);
-        require(static_cast<bool>(vtf), "Invalid texture {}.", name);
-        require(vtf.getFrameCount() == 1 || frame >= 0, "Animated VTF is not supported yet: {}", name);
-        require(std::max(frame, 0) < vtf.getFrameCount(), "Texture frame is out of range: {}", name);
-        require(vtf.getFaceCount() == 1 && vtf.getDepth() == 1, "Expected a 2D texture: {}", name);
-        bool floating = vtf.getFormat() == vtfpp::ImageFormat::RGBA16161616F || vtf.getFormat() == vtfpp::ImageFormat::RGB323232F || vtf.getFormat() == vtfpp::ImageFormat::RGBA32323232F;
-        Image image;
-        image.name = name;
-        image.width = vtf.getWidth(); image.height = vtf.getHeight(); image.srgb = srgb && !floating;
-        image.mipCount = vtf.getMipCount();
-        image.clamp = (vtf.getFlags() & (vtfpp::VTF::FLAG_V0_CLAMP_S | vtfpp::VTF::FLAG_V0_CLAMP_T)) != 0;
-        image.pixels.clear();
-        for (uint32_t mip = 0; mip < image.mipCount; ++mip) {
-            size_t count = size_t(std::max(1u, image.width >> mip)) * std::max(1u, image.height >> mip);
-            require((image.pixels.size() + count) * sizeof(glm::vec4) <= (1ull << 30), "Decoded texture '{}' exceeds the 1 GiB limit.", name);
-            auto pixels = vtf.getImageDataAs(vtfpp::ImageFormat::RGBA32323232F, static_cast<uint8_t>(mip), static_cast<uint16_t>(std::max(frame, 0)));
-            require(pixels.size() == count * sizeof(glm::vec4), "Failed to decode mip {} of {}.", mip, name);
-            auto offset = image.pixels.size(); image.pixels.resize(offset + count);
-            std::memcpy(image.pixels.data() + offset, pixels.data(), pixels.size());
-        }
         uint32_t index = static_cast<uint32_t>(scene.images.size());
-        scene.images.push_back(std::move(image));
+        scene.images.push_back({name});
+        decodeTexture({index, std::move(asset), srgb, frame});
         textureIds.emplace(key, index);
         return index;
+    }
+    void decodeTexture(const PendingTexture& pending) {
+        auto& image = scene.images[pending.index];
+        const auto& name = image.name;
+        const auto& bytes = pending.asset->bytes;
+        validateVtf(bytes, name);
+        vtfpp::VTF vtf(bytes, false, options.hdr);
+        require(static_cast<bool>(vtf), "Invalid texture {}.", name);
+        require(vtf.getFrameCount() == 1 || pending.frame >= 0, "Animated VTF is not supported yet: {}", name);
+        require(std::max(pending.frame, 0) < vtf.getFrameCount(), "Texture frame is out of range: {}", name);
+        require(vtf.getFaceCount() == 1 && vtf.getDepth() == 1, "Expected a 2D texture: {}", name);
+        auto format = vtf.getFormat();
+        bool floating = format == vtfpp::ImageFormat::RGBA16161616F || format == vtfpp::ImageFormat::RGB323232F || format == vtfpp::ImageFormat::RGBA32323232F;
+        image.width = vtf.getWidth(); image.height = vtf.getHeight(); image.srgb = pending.srgb && !floating;
+        image.mipCount = vtf.getMipCount();
+        image.clamp = (vtf.getFlags() & (vtfpp::VTF::FLAG_V0_CLAMP_S | vtfpp::VTF::FLAG_V0_CLAMP_T)) != 0;
+        auto frame = static_cast<uint16_t>(std::max(pending.frame, 0));
+        auto mipWidth = [&](uint32_t mip) { return std::max(1u, image.width >> mip); };
+        auto mipHeight = [&](uint32_t mip) { return std::max(1u, image.height >> mip); };
+        auto direct = directFormat(format);
+        if (direct || vtfpp::ImageFormatDetails::containerFormat(format) == vtfpp::ImageFormat::RGBA8888) {
+            image.format = direct.value_or(PixelFormat::RGBA8);
+            size_t total = 0;
+            for (uint32_t mip = 0; mip < image.mipCount; ++mip) { total += pixelBytes(image.format, mipWidth(mip), mipHeight(mip)); }
+            require(total <= (1ull << 30), "Decoded texture '{}' exceeds the 1 GiB limit.", name);
+            image.pixels.reserve(total);
+            for (uint32_t mip = 0; mip < image.mipCount; ++mip) {
+                auto expected = pixelBytes(image.format, mipWidth(mip), mipHeight(mip));
+                if (direct) {
+                    auto raw = vtf.getImageDataRaw(static_cast<uint8_t>(mip), frame);
+                    require(raw.size() == expected, "Failed to decode mip {} of {}.", mip, name);
+                    image.pixels.insert(image.pixels.end(), raw.begin(), raw.end());
+                } else {
+                    auto converted = vtf.getImageDataAs(vtfpp::ImageFormat::RGBA8888, static_cast<uint8_t>(mip), frame);
+                    require(converted.size() == expected, "Failed to decode mip {} of {}.", mip, name);
+                    image.pixels.insert(image.pixels.end(), converted.begin(), converted.end());
+                }
+            }
+            if (image.format == PixelFormat::RGBA16F) {
+                std::span halves(reinterpret_cast<const uint16_t*>(image.pixels.data()), image.pixels.size() / 2);
+                require(std::ranges::none_of(halves, [](uint16_t value) { return (value & 0x7c00) == 0x7c00; }), "Texture '{}' contains non-finite pixels.", name);
+            }
+            return;
+        }
+        std::vector<glm::vec4> pixels;
+        for (uint32_t mip = 0; mip < image.mipCount; ++mip) {
+            size_t count = size_t(mipWidth(mip)) * mipHeight(mip);
+            require((pixels.size() + count) * sizeof(glm::vec4) <= (1ull << 30), "Decoded texture '{}' exceeds the 1 GiB limit.", name);
+            auto converted = vtf.getImageDataAs(vtfpp::ImageFormat::RGBA32323232F, static_cast<uint8_t>(mip), frame);
+            require(converted.size() == count * sizeof(glm::vec4), "Failed to decode mip {} of {}.", mip, name);
+            auto offset = pixels.size(); pixels.resize(offset + count);
+            std::memcpy(pixels.data() + offset, converted.data(), converted.size());
+        }
+        storeFloatPixels(image, std::move(pixels));
+    }
+    void finishImages() {
+        for (auto& [index, pixels] : lightmapPages) { storeFloatPixels(scene.images[index], std::move(pixels)); }
     }
     uint32_t material(std::string name) {
         name = lower(std::move(name));
@@ -357,7 +431,8 @@ public:
             pageX = pageY = pageRow = 0;
             for (unsigned i = 0; i < 4; ++i) {
                 pageIds[i] = static_cast<uint32_t>(scene.images.size());
-                scene.images.push_back({std::format("lightmap-{}-{}", pageIds[0], i), 1024, 1024, false, true, std::vector<glm::vec4>(1024 * 1024, glm::vec4(0, 0, 0, 1))});
+                scene.images.push_back({std::format("lightmap-{}-{}", pageIds[0], i), 1024, 1024, false, true});
+                pagePixels[i] = lightmapPages.emplace_back(pageIds[i], std::vector<glm::vec4>(1024 * 1024, glm::vec4(0, 0, 0, 1))).second.data();
             }
         }
         LightPlacement result{pageIds, glm::vec2(pageX + 1, pageY + 1), glm::vec2(width, height)};
@@ -374,7 +449,7 @@ public:
                     }
                 }
                 auto radiance = lightmapRadiance(samples, bumped, options.hdr);
-                for (unsigned plane = 0; plane < 4; ++plane) { scene.images[pageIds[plane]].pixels[(pageY + 1 + y) * 1024 + pageX + 1 + x] = glm::vec4(radiance[plane], 1); }
+                for (unsigned plane = 0; plane < 4; ++plane) { pagePixels[plane][(pageY + 1 + y) * 1024 + pageX + 1 + x] = glm::vec4(radiance[plane], 1); }
             }
         }
         pageX += width + 2; pageRow = std::max(pageRow, height + 2);
@@ -391,6 +466,8 @@ public:
     std::set<uint32_t> skyFaces;
     int skyArea = -1;
     std::map<std::string, uint32_t> textureIds, materialIds;
+    std::vector<std::pair<uint32_t, std::vector<glm::vec4>>> lightmapPages;
+    std::array<glm::vec4*, 4> pagePixels{};
     std::array<uint32_t, 4> pageIds{};
     std::array<float, 256> lightStyles{};
     uint32_t pageX = 0, pageY = 0, pageRow = 0;
@@ -657,6 +734,7 @@ Scene Builder::build() {
     addProps();
     require(!scene.hasWater || (scene.waterMaterial < scene.materials.size() && (scene.materials[scene.waterMaterial].flags & Water)), "Water volumes require a supported above-water surface material.");
     addSky();
+    finishImages();
     for (auto& draw : scene.draws) {
         glm::vec3 minimum(std::numeric_limits<float>::max()), maximum(std::numeric_limits<float>::lowest());
         for (uint32_t i = 0; i < draw.indexCount; ++i) { auto position = scene.vertices.at(scene.indices.at(draw.firstIndex + i)).position; minimum = glm::min(minimum, position); maximum = glm::max(maximum, position); }
@@ -902,6 +980,22 @@ void Builder::addSky() {
         for (auto index : {0u,1u,2u,0u,2u,3u}) { scene.indices.push_back(base + index); }
     }
 }
+}
+size_t pixelBytes(PixelFormat format, uint32_t width, uint32_t height) {
+    size_t blocks = size_t((width + 3) / 4) * ((height + 3) / 4), pixels = size_t(width) * height;
+    switch (format) {
+        case PixelFormat::RGBA8: case PixelFormat::BGRA8: return pixels * 4;
+        case PixelFormat::BC1: return blocks * 8;
+        case PixelFormat::BC2: case PixelFormat::BC3: return blocks * 16;
+        case PixelFormat::RGBA16F: return pixels * 8;
+        case PixelFormat::RGBA32F: return pixels * 16;
+    }
+    throw Error("Unknown texture pixel format.");
+}
+Image solidImage(std::string name, glm::vec4 color) {
+    Image image{std::move(name)};
+    storeFloatPixels(image, {color});
+    return image;
 }
 Scene loadScene(const Bsp& bsp, Assets& assets, const SceneOptions& options) {
     auto key = sceneCacheKey(bsp, assets, options);

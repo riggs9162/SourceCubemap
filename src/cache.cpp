@@ -4,7 +4,7 @@
 
 namespace scm {
 namespace {
-constexpr uint32_t cacheVersion = 25;
+constexpr uint32_t cacheVersion = 26;
 uint64_t cacheBudget = 2ull << 30;
 constexpr uint64_t cacheReserve = 8ull << 30, maximumSceneCache = 512ull << 20;
 class CacheWriteLock {
@@ -91,7 +91,7 @@ void writeCacheFile(const fs::path& file, std::span<const std::byte> bytes) {
 }
 void writeSceneCache(const fs::path& file, const Scene& scene, const Assets& assets) {
     uint64_t estimated = scene.vertices.size() * sizeof(Vertex) + scene.indices.size() * sizeof(uint32_t);
-    for (const auto& image : scene.images) { estimated += image.pixels.size() * sizeof(glm::vec4); }
+    for (const auto& image : scene.images) { estimated += image.pixels.size(); }
     require(estimated <= maximumSceneCache && estimated <= cacheBudget, "Decoded scene exceeds the 512 MiB scene-cache limit; it was not stored.");
     Json metadata{{"schema", cacheVersion}, {"vertex_stride", sizeof(Vertex)}, {"vertices", scene.vertices.size()}, {"indices", scene.indices.size()}, {"hdr", scene.hdr}, {"sky_origin", vector3(scene.skyOrigin)}, {"sky_scale", scene.skyScale}, {"fog_color", vector3(scene.fogColor)}, {"fog_start", scene.fogStart}, {"fog_end", scene.fogEnd}, {"sky_fog_color", vector3(scene.skyFogColor)}, {"sky_fog_start", scene.skyFogStart}, {"sky_fog_end", scene.skyFogEnd}, {"diagnostics", scene.diagnostics}, {"assets", assets.report()}, {"materials", Json::array()}, {"draws", Json::array()}, {"images", Json::array()}, {"probes", Json::array()}};
     for (const auto& material : scene.materials) {
@@ -114,7 +114,7 @@ void writeSceneCache(const fs::path& file, const Scene& scene, const Assets& ass
         metadata["prop_lighting"].push_back(std::move(item));
     }
     for (const auto& draw : scene.draws) { metadata["draws"].push_back({{"first", draw.firstIndex}, {"count", draw.indexCount}, {"material", draw.material}, {"lightmaps", draw.lightmaps}, {"sky_world", draw.skyWorld}, {"sky_box", draw.skyBox}, {"visibility", draw.visibility}, {"center", vector3(draw.center)}, {"radius", draw.radius}, {"lighting", draw.lighting}}); }
-    for (const auto& image : scene.images) { metadata["images"].push_back({{"name", image.name}, {"width", image.width}, {"height", image.height}, {"srgb", image.srgb}, {"clamp", image.clamp}, {"mips", image.mipCount}}); }
+    for (const auto& image : scene.images) { metadata["images"].push_back({{"name", image.name}, {"width", image.width}, {"height", image.height}, {"srgb", image.srgb}, {"clamp", image.clamp}, {"mips", image.mipCount}, {"format", static_cast<uint32_t>(image.format)}}); }
     for (const auto& probe : scene.probes) { metadata["probes"].push_back({{"origin", {probe.origin.x, probe.origin.y, probe.origin.z}}, {"resolution", probe.resolution}}); }
     Bytes payload; append(payload, std::span(scene.vertices)); append(payload, std::span(scene.indices));
     for (const auto& image : scene.images) { append(payload, std::span(image.pixels)); }
@@ -148,9 +148,12 @@ std::optional<Scene> readSceneCache(const fs::path& file, Assets& assets) {
             require(image.width > 0 && image.height > 0 && image.width <= 32768 && image.height <= 32768, "Invalid cached image dimensions.");
             image.mipCount = item.at("mips");
             require(image.mipCount > 0 && image.mipCount <= std::bit_width(std::max(image.width, image.height)), "Invalid cached image mip count.");
+            auto format = item.at("format").get<uint32_t>();
+            require(format <= static_cast<uint32_t>(PixelFormat::RGBA32F), "Invalid cached image format.");
+            image.format = static_cast<PixelFormat>(format);
             size_t count = 0;
-            for (uint32_t mip = 0; mip < image.mipCount; ++mip) { count += size_t(std::max(1u, image.width >> mip)) * std::max(1u, image.height >> mip); }
-            image.pixels = readArray<glm::vec4>(reader, count); scene.images.push_back(std::move(image));
+            for (uint32_t mip = 0; mip < image.mipCount; ++mip) { count += pixelBytes(image.format, std::max(1u, image.width >> mip), std::max(1u, image.height >> mip)); }
+            image.pixels = readArray<std::byte>(reader, count); scene.images.push_back(std::move(image));
         }
         require(reader.cursor == data.size(), "Unexpected bytes after cached scene data.");
         for (const auto& item : metadata.at("materials")) {
