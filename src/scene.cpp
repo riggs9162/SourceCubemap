@@ -449,8 +449,8 @@ public:
             if (shader != "vertexlitgeneric" || (material.flags & NormalMap)) { approximate(std::format("Separate self-illumination mask in '{}' is applied without native parity.", name)); }
             material.selfIllumMask = texture(definition.value("$selfillummask"), false, name); material.flags |= SelfIllumMask;
         }
-        if (definition.flag("$phong")) {
-            require(shader == "vertexlitgeneric", "Phong is supported only for VertexLitGeneric: {}", name);
+        bool lightmappedPhong = options.profile == "gmod" && (shader == "lightmappedgeneric" || shader == "worldvertextransition");
+        if (definition.flag("$phong") && (shader == "vertexlitgeneric" || lightmappedPhong)) {
             for (auto key : {"$phongwarptexture", "$rimlight", "$phongexponenttexturemask"}) {
                 if (!definition.value(key).empty() && definition.value(key) != "0") { approximate(std::format("Phong control '{}' in '{}' is not implemented and is ignored.", key, name)); }
             }
@@ -463,7 +463,7 @@ public:
             material.phongTint = parseVector(definition.value("$phongtint"), glm::vec3(1));
             require(material.phongExponent > 0 && material.phongBoost >= 0 && material.phongExponentFactor >= 0, "Invalid Phong parameters in '{}'.", name);
             if (!definition.value("$phongexponenttexture").empty() && definition.value("$phongexponent").empty()) {
-                material.second = texture(definition.value("$phongexponenttexture"), false, name); material.flags |= PhongExponentTexture;
+                material.phongTexture = texture(definition.value("$phongexponenttexture"), false, name); material.flags |= PhongExponentTexture;
             }
             if (definition.flag("$basemapalphaphongmask")) { material.flags |= PhongBaseAlpha; }
             if (definition.flag("$invertphongmask")) { material.flags |= PhongInvertMask; }
@@ -592,6 +592,22 @@ public:
                 for (unsigned plane = 0; plane < 4; ++plane) { pages[plane][(pageY + 1 + y) * 1024 + pageX + 1 + x] = glm::vec4(radiance[plane], 1); }
             }
         }
+    }
+    /// Selects world lights for lightmapped Phong on a coarse grid so that neighbouring faces share one draw. Returns zero when no light reaches the cell.
+    uint32_t brushLighting(glm::vec3 position, glm::vec3 normal) {
+        auto cell = glm::ivec3(glm::floor(position / 256.0f));
+        auto dominant = glm::abs(normal);
+        unsigned axis = dominant.x >= dominant.y && dominant.x >= dominant.z ? 0 : dominant.y >= dominant.z ? 1 : 2;
+        auto key = std::tuple(cell.x, cell.y, cell.z, axis * 2 + (normal[axis] < 0 ? 1 : 0));
+        auto [found, inserted] = brushCells.try_emplace(key, 0u);
+        if (!inserted) { return found->second; }
+        if (!worldLighting) { worldLighting.emplace(bsp, options.hdr, options.experimental); }
+        auto lighting = worldLighting->sample(position + normal);
+        if (!lighting.count) { return 0; }
+        lighting.baked = lighting.lightmapped = true;
+        found->second = static_cast<uint32_t>(scene.propLighting.size());
+        scene.propLighting.push_back(lighting);
+        return found->second;
     }
     Scene build();
     void addProps();
@@ -773,7 +789,7 @@ Scene Builder::build() {
     for (size_t i = 0; i < leafFaceData.size(); i += 2) { referencedFaces.insert(referenced.at<uint16_t>(i)); }
     std::map<std::vector<uint64_t>, uint32_t> visibilityIds;
     std::vector<std::vector<uint64_t>> visibilityMasks;
-    std::map<std::tuple<uint32_t, uint32_t, bool, uint32_t>, std::vector<uint32_t>> batches;
+    std::map<std::tuple<uint32_t, uint32_t, bool, uint32_t, uint32_t>, std::vector<uint32_t>> batches;
     std::map<std::pair<uint32_t, int>, uint32_t> brushMaterials;
     struct NamedMaterial { std::string name; uint32_t index = UINT32_MAX; };
     std::vector<NamedMaterial> texDataMaterials(texData.size());
@@ -907,16 +923,23 @@ Scene Builder::build() {
                 }
             }
         }
-        auto& batch = batches[{materialIndex, placement.images[0], inSkyWorld, foundVisibility->second}];
+        uint32_t brushLights = 0;
+        if (mat.flags & Phong) {
+            glm::vec3 center(0);
+            for (const auto& vertex : vertices) { center += vertex.position; }
+            brushLights = brushLighting(center / float(vertices.size()), glm::normalize(glm::mat3(brush.matrix) * normal));
+        }
+        auto& batch = batches[{materialIndex, placement.images[0], inSkyWorld, foundVisibility->second, brushLights}];
         uint32_t base = static_cast<uint32_t>(scene.vertices.size());
         for (auto index : indices) { batch.push_back(base + index); }
         scene.vertices.insert(scene.vertices.end(), vertices.begin(), vertices.end());
     }
     parallelFor(lightmapTasks.size(), [&](size_t task) { fillLightmap(lightmapTasks[task]); });
     for (auto& [key, indices] : batches) {
-        auto [materialIndex, page, sky, visibilityId] = key;
+        auto [materialIndex, page, sky, visibilityId, brushLights] = key;
         Draw draw{static_cast<uint32_t>(scene.indices.size()), static_cast<uint32_t>(indices.size()), materialIndex, {page, page ? page + 1 : 0, page ? page + 2 : 0, page ? page + 3 : 0}, sky};
         draw.visibility = visibilityMasks.at(visibilityId);
+        draw.lighting = brushLights;
         scene.draws.push_back(draw);
         scene.indices.insert(scene.indices.end(), indices.begin(), indices.end());
     }

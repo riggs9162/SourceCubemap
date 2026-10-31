@@ -116,6 +116,7 @@ bool needsDefaultSky(const scm::Bsp& bsp, scm::Assets& assets, bool hdr, const s
 scm::SceneOptions sceneSettings(const Options& options, bool hdr, bool defaultSky) {
     scm::SceneOptions settings{hdr, options.captureTime, options.cache, !options.noCache, options.experimental, defaultSky};
     settings.planarWater = options.water == "planar";
+    settings.profile = options.profile;
     return settings;
 }
 /// Encodes captures on background threads. Submission waits while too many pixels are queued, and the first failure surfaces on the next submission or in finish.

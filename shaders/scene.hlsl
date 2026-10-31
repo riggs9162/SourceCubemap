@@ -60,6 +60,7 @@ struct DrawUniform {
 [[vk::binding(12)]] TextureCube<float4> waterRefraction;
 [[vk::binding(13)]] Texture2D<float4> blendMaskTexture;
 [[vk::binding(14)]] Texture2D<float4> selfIllumMaskTexture;
+[[vk::binding(15)]] Texture2D<float4> phongExponentTexture;
 
 FragmentInput VSMain(VertexInput input) {
     FragmentInput output;
@@ -244,7 +245,7 @@ float4 PSMain(FragmentInput input) : SV_Target0 {
         float exponent = parameters.phong.x;
         float3 specularTint = parameters.phongTint.rgb;
         if ((flags & 131072) != 0) {
-            float4 exponentSample = secondTexture.Sample(materialSampler, input.uv);
+            float4 exponentSample = phongExponentTexture.Sample(materialSampler, input.uv);
             exponent = exponentSample.r * parameters.phongFresnel.w + 1;
             if ((flags & 65536) != 0) { specularTint *= lerp(1, base.rgb, exponentSample.g); }
         }

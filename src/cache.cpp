@@ -8,7 +8,7 @@
 
 namespace scm {
 namespace {
-constexpr uint32_t cacheVersion = 26;
+constexpr uint32_t cacheVersion = 27;
 uint64_t cacheBudget = 2ull << 30;
 constexpr uint64_t cacheReserve = 8ull << 30, maximumSceneCache = 512ull << 20, maximumQueuedBytes = 512ull << 20;
 std::mutex cacheUsageGuard;
@@ -113,6 +113,7 @@ void setCacheBudget(uint64_t bytes) { cacheBudget = bytes; }
 std::string sceneCacheKey(const Bsp& bsp, const Assets& assets, const SceneOptions& options) {
     Json key{{"schema", cacheVersion}, {"bsp", digest(bsp.bytes)}, {"mounts", assets.report()["mounts"]}, {"hdr", options.hdr}, {"time", options.time}, {"experimental", options.experimental}, {"default_sky", options.defaultSky}};
     key["planar_water"] = options.planarWater;
+    key["profile"] = options.profile;
     auto text = key.dump(); return digest(std::as_bytes(std::span(text.data(), text.size())));
 }
 void writeCacheFile(const fs::path& file, std::span<const std::byte> bytes) {
@@ -153,6 +154,7 @@ void writeSceneCache(const fs::path& file, const Scene& scene, const Assets& ass
         metadata["materials"].back()["phong"] = {{"exponent", material.phongExponent}, {"boost", material.phongBoost}, {"exponent_factor", material.phongExponentFactor}, {"fresnel", vector3(material.phongFresnel)}, {"tint", vector3(material.phongTint)}, {"blend_tint", material.blendTintOverBase}};
         metadata["materials"].back()["proxy_parameters"] = material.definition.proxyParameters;
         metadata["materials"].back()["blend_mask"] = material.blendMask;
+        metadata["materials"].back()["phong_texture"] = material.phongTexture;
         metadata["materials"].back()["emission"] = {{"mask", material.selfIllumMask}, {"tint", vector3(material.selfIllumTint)}};
         const auto& water = material.water;
         metadata["materials"].back()["water"] = {{"fog_color", vector3(water.fogColor)}, {"reflect_tint", vector3(water.reflectTint)}, {"refract_tint", vector3(water.refractTint)}, {"scroll1", vector3(water.scroll1)}, {"scroll2", vector3(water.scroll2)}, {"scroll_scale", {water.scroll.x, water.scroll.y, water.scale.x, water.scale.y}}, {"fog_start", water.fogStart}, {"fog_end", water.fogEnd}, {"reflect_amount", water.reflectAmount}, {"refract_amount", water.refractAmount}, {"above", water.above}, {"reflection", water.reflection}, {"entities", water.reflectEntities}, {"no_fresnel", water.noFresnel}};
@@ -162,7 +164,7 @@ void writeSceneCache(const fs::path& file, const Scene& scene, const Assets& ass
     metadata["painted_sky"] = {{"enabled", sky.enabled}, {"top", vector4({sky.top, sky.fadeBias})}, {"bottom", vector4({sky.bottom, sky.hdrScale})}, {"sun", vector4({sky.sunDirection, sky.sunSize})}, {"sun_color", vector3(sky.sunColor)}, {"dusk", vector4({sky.duskColor, sky.duskIntensity})}, {"dusk_scale", sky.duskScale}, {"stars", sky.stars}, {"star_layers", sky.starLayers}, {"star_parameters", {sky.starScale, sky.starFade, sky.starPosition}}};
     metadata["prop_lighting"] = Json::array();
     for (const auto& lighting : scene.propLighting) {
-        Json item{{"count", lighting.count}, {"baked", lighting.baked}, {"ambient", Json::array()}, {"lights", Json::array()}};
+        Json item{{"count", lighting.count}, {"baked", lighting.baked}, {"lightmapped", lighting.lightmapped}, {"ambient", Json::array()}, {"lights", Json::array()}};
         for (auto color : lighting.ambient) { item["ambient"].push_back(vector3(color)); }
         for (const auto& light : lighting.lights) { item["lights"].push_back({vector4(light.positionType), vector4(light.color), vector4(light.attenuation), vector4(light.directionCone)}); }
         metadata["prop_lighting"].push_back(std::move(item));
@@ -215,6 +217,7 @@ std::optional<Scene> readSceneCache(const fs::path& file, Assets& assets) {
             material.definition.parameters = item.at("parameters").get<std::map<std::string, std::string>>(); material.definition.proxies = item.at("proxies").get<std::vector<std::string>>();
             material.definition.proxyParameters = item.at("proxy_parameters").get<std::vector<std::map<std::string, std::string>>>();
             material.blendMask = item.at("blend_mask"); require(material.blendMask < scene.images.size(), "Invalid cached blend mask.");
+            material.phongTexture = item.at("phong_texture"); require(material.phongTexture < scene.images.size(), "Invalid cached Phong texture.");
             material.selfIllumMask = item.at("emission").at("mask"); material.selfIllumTint = read3(item.at("emission").at("tint"));
             require(material.selfIllumMask < scene.images.size(), "Invalid cached self-illumination mask.");
             auto& water = material.water; const auto& source = item.at("water");
@@ -241,7 +244,7 @@ std::optional<Scene> readSceneCache(const fs::path& file, Assets& assets) {
         require(sky.stars < scene.images.size(), "Invalid cached painted sky texture.");
         scene.propLighting.clear();
         for (const auto& item : metadata.at("prop_lighting")) {
-            PropLighting lighting; lighting.count = item.at("count"); lighting.baked = item.at("baked");
+            PropLighting lighting; lighting.count = item.at("count"); lighting.baked = item.at("baked"); lighting.lightmapped = item.at("lightmapped");
             require(lighting.count <= lighting.lights.size(), "Invalid cached prop light count.");
             for (size_t i = 0; i < 6; ++i) { lighting.ambient[i] = read3(item.at("ambient").at(i)); }
             for (size_t i = 0; i < 4; ++i) { const auto& light = item.at("lights").at(i); lighting.lights[i] = {read4(light.at(0)), read4(light.at(1)), read4(light.at(2)), read4(light.at(3))}; }

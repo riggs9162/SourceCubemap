@@ -52,6 +52,7 @@ struct PropLighting {
     std::array<PropLight, 4> lights{};
     uint32_t count = 0;
     bool baked = false;
+    bool lightmapped = false;
 };
 struct WaterMaterial {
     glm::vec3 fogColor{}, reflectTint{1}, refractTint{1}, scroll1{}, scroll2{};
@@ -65,6 +66,7 @@ struct Material {
     uint32_t base = 0, second = 0, normal = 1, detail = 0;
     uint32_t blendMask = 0;
     uint32_t selfIllumMask = 0;
+    uint32_t phongTexture = 0;
     glm::vec3 selfIllumTint{1};
     uint32_t flags = 0;
     glm::vec4 tint{1};
@@ -108,6 +110,6 @@ struct Scene {
     double captureTime = 0;
     Json diagnostics;
 };
-struct SceneOptions { bool hdr = false; double time = 0; fs::path cache; bool useCache = true; bool experimental = false; bool defaultSky = false; bool planarWater = false; };
+struct SceneOptions { bool hdr = false; double time = 0; fs::path cache; bool useCache = true; bool experimental = false; bool defaultSky = false; bool planarWater = false; std::string profile = "gmod"; };
 Scene loadScene(const Bsp& bsp, Assets& assets, const SceneOptions& options);
 }

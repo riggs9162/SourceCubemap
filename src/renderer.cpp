@@ -257,13 +257,14 @@ struct Renderer::Impl {
         VkCommandBufferAllocateInfo commandInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; commandInfo.commandPool = pool; commandInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; commandInfo.commandBufferCount = 1;
         checked(vkAllocateCommandBuffers(device, &commandInfo, &command), "Allocate command buffer");
         VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; checked(vkCreateFence(device, &fenceInfo, nullptr, &fence), "Create fence");
-        std::array<VkDescriptorSetLayoutBinding, 15> bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 16> bindings{};
         for (uint32_t i = 0; i < 10; ++i) { bindings[i] = {i, i < 8 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}; }
         bindings[10] = {10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         bindings[11] = {11, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         bindings[12] = {12, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         bindings[13] = {13, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         bindings[14] = {14, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        bindings[15] = {15, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size()); layoutInfo.pBindings = bindings.data();
         checked(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorLayout), "Create descriptor layout");
         VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Push)};
@@ -443,16 +444,16 @@ struct Renderer::Impl {
         auto alignment = properties.limits.minUniformBufferOffsetAlignment;
         auto uniformStride = (sizeof(DrawUniform) + alignment - 1) / alignment * alignment;
         uniforms = makeBuffer(std::max(VkDeviceSize(1), count * uniformStride), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, Memory::Device);
-        std::array<VkDescriptorPoolSize, 3> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, count * 12}, {VK_DESCRIPTOR_TYPE_SAMPLER, count * 2}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, count}}};
+        std::array<VkDescriptorPoolSize, 3> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, count * 13}, {VK_DESCRIPTOR_TYPE_SAMPLER, count * 2}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, count}}};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; poolInfo.maxSets = count; poolInfo.poolSizeCount = static_cast<uint32_t>(sizes.size()); poolInfo.pPoolSizes = sizes.data();
         checked(vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool), "Create descriptor pool");
         std::vector<VkDescriptorSetLayout> layouts(count, descriptorLayout); descriptors.resize(count);
         VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocation.descriptorPool = descriptorPool; allocation.descriptorSetCount = count; allocation.pSetLayouts = layouts.data();
         checked(vkAllocateDescriptorSets(device, &allocation, descriptors.data()), "Allocate material descriptors");
         Bytes uniformData(count * uniformStride);
-        std::vector<VkDescriptorImageInfo> imageInfos; imageInfos.reserve(size_t(count) * 12);
+        std::vector<VkDescriptorImageInfo> imageInfos; imageInfos.reserve(size_t(count) * 13);
         std::vector<VkDescriptorBufferInfo> bufferInfos; bufferInfos.reserve(count);
-        std::vector<VkWriteDescriptorSet> writes; writes.reserve(size_t(count) * 13);
+        std::vector<VkWriteDescriptorSet> writes; writes.reserve(size_t(count) * 14);
         drawPipelines.resize(count);
         auto writeImage = [&](uint32_t drawIndex, uint32_t binding, VkDescriptorType type, VkDescriptorImageInfo info) {
             imageInfos.push_back(info);
@@ -480,7 +481,7 @@ struct Renderer::Impl {
             uniform.skyDusk = {sky.duskColor, sky.duskIntensity}; uniform.skyControls = {sky.duskScale, float(sky.starLayers), 0, 0};
             uniform.stars = {sky.starScale, sky.starFade, sky.starPosition, 0};
             const auto& lighting = scene.propLighting.at(draw.lighting);
-            uniform.phong = {material.phongExponent, material.phongBoost, float(lighting.count), lighting.baked && !(material.flags & Phong) ? 1.0f : 0.0f};
+            uniform.phong = {material.phongExponent, material.phongBoost, float(lighting.count), lighting.baked && (lighting.lightmapped || !(material.flags & Phong)) ? 1.0f : 0.0f};
             uniform.phongFresnel = {material.phongFresnel, material.phongExponentFactor}; uniform.phongTint = {material.phongTint, material.blendTintOverBase};
             for (size_t i = 0; i < lighting.ambient.size(); ++i) { uniform.ambient[i] = {lighting.ambient[i], 0}; }
             uniform.lights = lighting.lights;
@@ -497,6 +498,7 @@ struct Renderer::Impl {
             writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[drawIndex], 10, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &bufferInfos.back(), nullptr});
             writeTexture(drawIndex, 13, material.blendMask);
             writeTexture(drawIndex, 14, material.selfIllumMask);
+            writeTexture(drawIndex, 15, material.phongTexture);
             unsigned key = pipelineKey(material, draw);
             drawPipelines[drawIndex] = pipeline(key);
             passDraws[draw.skyBox ? 0 : draw.skyWorld ? 1 : 2][material.translucent || material.additive ? 1 : 0].push_back(drawIndex);
@@ -527,7 +529,7 @@ struct Renderer::Impl {
             for (uint32_t i : passDraws[pass][transparent]) {
                 const auto& draw = scene.draws[i]; const auto& material = scene.materials[draw.material];
                 if (mode && ((material.flags & Water) || material.translucent || material.additive)) { continue; }
-                if (mode == 1 && draw.lighting && !scene.materials.at(scene.waterMaterial).water.reflectEntities) { continue; }
+                if (mode == 1 && draw.lighting && !scene.propLighting[draw.lighting].lightmapped && !scene.materials.at(scene.waterMaterial).water.reflectEntities) { continue; }
                 if (!mode && !draw.visibility.empty() && probeIndex < scene.probes.size() && !(draw.visibility.at(probeIndex / 64) & (uint64_t(1) << (probeIndex % 64)))) { culledDraws += 6; continue; }
                 auto delta = draw.center - origin;
                 viewOrder.emplace_back(glm::dot(delta, delta), i);
