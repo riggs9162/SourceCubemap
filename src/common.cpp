@@ -69,8 +69,8 @@ bool normalized(std::string_view path) {
 std::string assetPath(std::string value) {
     value = lower(std::move(value));
     std::replace(value.begin(), value.end(), '\\', '/');
-    while (value.starts_with("./")) { value.erase(0, 2); }
-    require(!value.empty() && value.front() != '/' && value.find(':') == std::string::npos, "Asset paths must be relative.");
+    while (value.starts_with("./") || value.starts_with('/')) { value.erase(0, value.starts_with('/') ? 1 : 2); }
+    require(!value.empty() && value.find(':') == std::string::npos, "Asset paths must be relative: {}", value);
     if (normalized(value)) { return value; }
     fs::path path(value);
     for (const auto& segment : path) { require(segment != "..", "Asset paths cannot escape a mount."); }
