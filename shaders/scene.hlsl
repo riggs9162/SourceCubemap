@@ -195,6 +195,11 @@ float4 PSMain(FragmentInput input) : SV_Target0 {
         base = lerp(base, secondTexture.Sample(materialSampler, input.secondaryUV.xy), blend);
     }
     if ((flags & 4) != 0) { clip(base.a * parameters.tint.a - parameters.controls.x); }
+    if ((flags & 8388608) != 0) {
+        float3 factor = base.rgb;
+        if ((flags & 16777216) != 0) { factor = pow(max(lerp(0.5, pow(max(base.rgb, 0), rcp(2.2)), base.a) * 2, 0), 2.2); }
+        return float4(factor, 1);
+    }
     float3 light = lightTexture.Sample(lightSampler, input.lightUV).rgb;
     if ((flags & 24) == 24) {
         float3 encoded = normalTexture.Sample(materialSampler, input.uv).xyz;

@@ -31,7 +31,7 @@ enum MaterialFlags : uint32_t {
     Unlit = 1, Blend = 2, AlphaTest = 4, NormalMap = 8, BumpLight = 16,
     SelfIllum = 32, Detail = 64, VertexLit = 128, Sky = 256, VertexAlpha = 512, SSBump = 1024,
     Painted = 2048, Phong = 4096, HalfLambert = 8192, PhongBaseAlpha = 16384,
-    PhongInvertMask = 32768, PhongAlbedoTint = 65536, PhongExponentTexture = 131072, BlendTintByAlpha = 262144, Water = 524288, BlendModulation = 1048576, SelfIllumMask = 2097152, TwoTexture = 4194304, Omitted = 0x80000000u
+    PhongInvertMask = 32768, PhongAlbedoTint = 65536, PhongExponentTexture = 131072, BlendTintByAlpha = 262144, Water = 524288, BlendModulation = 1048576, SelfIllumMask = 2097152, TwoTexture = 4194304, Modulate = 8388608, Modulate2x = 16777216, Omitted = 0x80000000u
 };
 struct PaintedSky {
     bool enabled = false;

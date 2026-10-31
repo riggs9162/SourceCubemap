@@ -304,9 +304,17 @@ public:
             material.noCull = true;
             return store();
         }
-        bool painted = shader == "g_sky";
-        require(shader == "lightmappedgeneric" || shader == "unlitgeneric" || shader == "unlittwotexture" || shader == "worldvertextransition" || shader == "vertexlitgeneric" || shader == "sky" || painted, "Unsupported shader '{}' in '{}'. No BSP was written.", shader, name);
-        int baseFrame = -1;
+        bool shattered = shader == "shatteredglass";
+        if (shattered) { approximate(std::format("Shattered glass '{}' renders as an intact lightmapped pane.", name)); shader = "lightmappedgeneric"; }
+        if (shader == "worldtwotextureblend") { shader = "lightmappedgeneric"; }
+        bool painted = shader == "g_sky", sprite = shader == "sprite" || shader == "spritecard", modulate = shader == "modulate" || shader == "decalmodulate";
+        if (!(shader == "lightmappedgeneric" || shader == "unlitgeneric" || shader == "unlittwotexture" || shader == "worldvertextransition" || shader == "vertexlitgeneric" || shader == "sky" || painted || sprite || modulate)) {
+            require(options.experimental, "Unsupported shader '{}' in '{}'. No BSP was written.", shader, name);
+            warn(std::format("Shader '{}' in '{}' is not implemented; surfaces using it are omitted.", shader, name));
+            material.flags = Omitted;
+            return store();
+        }
+        int baseFrame = sprite ? 0 : -1;
         if (!definition.value("$frame").empty()) {
             auto frame = parseFloat(definition.value("$frame"));
             require(frame >= 0 && frame <= 65535 && std::floor(frame) == frame, "Invalid authored texture frame."); baseFrame = static_cast<int>(frame);
@@ -383,8 +391,11 @@ public:
                 warn(std::format("Ignored a material proxy in '{}': {}", name, error.what()));
             }
         }
-        if (shader == "unlitgeneric" || shader == "unlittwotexture" || shader == "sky" || painted) { material.flags |= Unlit; }
-        if (shader == "unlittwotexture") { material.flags |= TwoTexture; require(!definition.flag("$cloakpassenabled"), "UnlitTwoTexture cloak passes are not implemented."); }
+        if (shader == "unlitgeneric" || shader == "unlittwotexture" || shader == "sky" || painted || sprite || modulate) { material.flags |= Unlit; }
+        if (shader == "unlittwotexture") {
+            material.flags |= TwoTexture;
+            if (definition.flag("$cloakpassenabled")) { approximate(std::format("UnlitTwoTexture cloak pass in '{}' is ignored.", name)); }
+        }
         if (shader == "worldvertextransition") { material.flags |= Blend; }
         if (shader == "vertexlitgeneric") { material.flags |= VertexLit; }
         if (painted) { material.flags |= Painted; }
@@ -454,9 +465,17 @@ public:
             material.blendTintOverBase = parseFloat(definition.value("$blendtintcoloroverbase"), 0);
             require(material.blendTintOverBase >= 0 && material.blendTintOverBase <= 1, "Invalid material tint replacement factor.");
         }
-        uint32_t index = static_cast<uint32_t>(scene.materials.size());
-        scene.materials.push_back(std::move(material)); materialIds.emplace(name, index);
-        return index;
+        if (shattered) { material.translucent = true; material.flags &= ~Detail; }
+        if (sprite) {
+            auto mode = static_cast<int>(parseFloat(definition.value("$spriterendermode")));
+            material.additive = material.additive || mode == 3 || mode == 5 || mode == 7 || mode == 8 || mode == 9;
+            material.translucent = !material.additive; material.noCull = true; material.noFog = true;
+        }
+        if (modulate) {
+            material.flags |= Modulate; material.translucent = true; material.noFog = true;
+            if (shader == "decalmodulate" || definition.flag("$mod2x")) { material.flags |= Modulate2x; }
+        }
+        return store();
     }
     int leafAt(glm::vec3 point) const {
         Reader nodes(nodesData, "nodes"), planes(planeData, "planes");

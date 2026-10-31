@@ -47,6 +47,10 @@ struct DrawUniform {
     glm::vec4 selfIllumTint;
 };
 static_assert(sizeof(Push) == 112 && sizeof(DrawUniform) == 704 && sizeof(PropLight) == 64);
+/// Packs the fixed-function state a draw needs into a pipeline cache key.
+unsigned pipelineKey(const Material& material, const Draw& draw) {
+    return (material.translucent ? 1u : 0u) | (material.additive ? 2u : 0u) | (material.noCull ? 4u : 0u) | (draw.skyBox ? 8u : 0u) | ((material.flags & Modulate) ? 16u : 0u);
+}
 }
 
 struct Renderer::Impl {
@@ -309,7 +313,7 @@ struct Renderer::Impl {
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO}; multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineDepthStencilStateCreateInfo depthState{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO}; depthState.depthTestEnable = !(key & 8); depthState.depthWriteEnable = !(key & (8 | 1 | 2)); depthState.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
         VkPipelineColorBlendAttachmentState blend{}; blend.colorWriteMask = 15; blend.blendEnable = (key & 3) != 0;
-        blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA; blend.dstColorBlendFactor = key & 2 ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; blend.colorBlendOp = VK_BLEND_OP_ADD;
+        blend.srcColorBlendFactor = key & 16 ? VK_BLEND_FACTOR_DST_COLOR : VK_BLEND_FACTOR_SRC_ALPHA; blend.dstColorBlendFactor = key & 16 ? VK_BLEND_FACTOR_ZERO : key & 2 ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; blend.colorBlendOp = VK_BLEND_OP_ADD;
         blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE; blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO; blend.alphaBlendOp = VK_BLEND_OP_ADD;
         VkPipelineColorBlendStateCreateInfo blendState{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO}; blendState.attachmentCount = 1; blendState.pAttachments = &blend;
         const std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
@@ -493,7 +497,7 @@ struct Renderer::Impl {
             writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[drawIndex], 10, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &bufferInfos.back(), nullptr});
             writeTexture(drawIndex, 13, material.blendMask);
             writeTexture(drawIndex, 14, material.selfIllumMask);
-            unsigned key = (material.translucent ? 1u : 0u) | (material.additive ? 2u : 0u) | (material.noCull ? 4u : 0u) | (draw.skyBox ? 8u : 0u);
+            unsigned key = pipelineKey(material, draw);
             drawPipelines[drawIndex] = pipeline(key);
             passDraws[draw.skyBox ? 0 : draw.skyWorld ? 1 : 2][material.translucent || material.additive ? 1 : 0].push_back(drawIndex);
         }
