@@ -73,21 +73,24 @@ std::array<glm::vec3, 4> lightmapRadiance(std::array<glm::vec3, 4> samples, bool
     return samples;
 }
 
-std::array<float, 256> initialLightStyles(const Bsp& bsp) {
-    std::array<float, 256> result; result.fill(std::numeric_limits<float>::quiet_NaN()); result[0] = 1;
+std::array<float, 256> initialLightStyles(const Bsp& bsp, bool experimental, std::vector<std::string>* warnings) {
+    static constexpr std::array<std::string_view, 13> presets{"m", "mmnmmommommnonmmonqnmmo", "abcdefghijklmnopqrstuvwxyzyxwvutsrqponmlkjihgfedcba", "mmmmmaaaaammmmmaaaaaabcdefgabcdefg", "mamamamamama", "jklmnopqrstuvwxyzyxwvutsrqponmlkj", "nmonqnmomnmomomno", "mmmaaaabcdefgmmmmaaaammmaamm", "mmmaaammmaaammmabcdefaaaammmmabcdefmmmaaaa", "aaaaaaaazzzzzzzz", "mmamammmmammamamaaamammma", "abcdefghijklmnopqrrqponmlkjihgfedcba", "mmnnmmnnnmmnn"};
+    std::array<float, 256> result; result.fill(1.0f);
     for (const auto& entity : bsp.entities) {
         auto type = entity["classname"].getValue();
         if (type != "light" && type != "light_spot" && type != "light_environment") { continue; }
         int style = static_cast<int>(parseFloat(entity["style"].getValue()));
-        require(style >= 0 && style < 255, "Light entity has an invalid style index.");
-        if (!style) { continue; }
+        if (style <= 0 || style >= 255) { continue; }
         auto pattern = std::string(entity["pattern"].getValue());
         int preset = static_cast<int>(parseFloat(entity["defaultstyle"].getValue()));
         bool off = (static_cast<int>(parseFloat(entity["spawnflags"].getValue())) & 1) != 0;
-        require(off || ((!preset || preset >= 13) && pattern.empty()) || pattern == "m" || pattern == "a", "Animated light style {} requires unsupported runtime evaluation.", style);
-        float value = off || pattern == "a" ? 0.0f : 1.0f;
-        require(!std::isfinite(result[style]) || result[style] == value, "Light entities disagree on a shared initial style.");
-        result[style] = value;
+        if (pattern.empty() && preset > 0 && preset < 13) { pattern = presets[preset]; }
+        if (!off && pattern.size() > 1) {
+            require(experimental, "Animated light style {} requires unsupported runtime evaluation. Use --experimental to capture its first frame.", style);
+            if (warnings) { warnings->push_back(std::format("Animated light style {} is captured at its first frame.", style)); }
+        }
+        char first = pattern.empty() ? 'm' : static_cast<char>(std::tolower(static_cast<unsigned char>(pattern.front())));
+        result[style] = off ? 0.0f : std::clamp(first - 'a', 0, 25) / 12.0f;
     }
     return result;
 }
@@ -125,10 +128,10 @@ std::vector<VertexLightingMesh> readVertexLighting(std::span<const std::byte> by
     return result;
 }
 
-WorldLighting::WorldLighting(const Bsp& bsp, bool hdr)
+WorldLighting::WorldLighting(const Bsp& bsp, bool hdr, bool experimental)
     : nodes(bsp.view(5)), planes(bsp.view(1)), leaves(bsp.view(10)), brushes(bsp.view(18)), brushSides(bsp.view(19)), leafBrushes(bsp.view(17)), texInfo(bsp.view(6)) {
     int id = hdr ? 54 : 15;
-    auto styles = initialLightStyles(bsp);
+    auto styles = initialLightStyles(bsp, experimental);
     auto bytes = bsp.view(id); Reader reader(bytes, "world lights");
     require(bsp.lumps[id].version == 0 && bytes.size() % 88 == 0, "Unsupported world-light record layout.");
     require(brushes.size() % 12 == 0 && brushSides.size() % 8 == 0 && leafBrushes.size() % 2 == 0, "Unsupported lighting trace brush layout.");
@@ -139,7 +142,7 @@ WorldLighting::WorldLighting(const Bsp& bsp, bool hdr)
         light.inner = reader.at<float>(offset + 48); light.outer = reader.at<float>(offset + 52); light.exponent = reader.at<float>(offset + 56); light.radius = reader.at<float>(offset + 60);
         light.attenuation = reader.at<glm::vec3>(offset + 64); light.flags = reader.at<int32_t>(offset + 76);
         require(light.type >= 0 && light.type <= 5, "Unsupported world-light type.");
-        require(light.style >= 0 && light.style < 255 && std::isfinite(styles[light.style]), "World light has an unresolved initial light style.");
+        require(light.style >= 0 && light.style < 255, "World light has an invalid light style.");
         light.intensity *= styles[light.style];
         for (float value : {light.origin.x, light.origin.y, light.origin.z, light.intensity.x, light.intensity.y, light.intensity.z, light.normal.x, light.normal.y, light.normal.z, light.attenuation.x, light.attenuation.y, light.attenuation.z, light.inner, light.outer, light.radius, light.exponent}) { require(std::isfinite(value), "Nonfinite world-light data."); }
         require(light.radius >= 0 && light.exponent >= 0 && glm::all(glm::greaterThanEqual(light.intensity, glm::vec3(0))) && glm::all(glm::greaterThanEqual(light.attenuation, glm::vec3(0))), "Invalid negative world-light parameters.");

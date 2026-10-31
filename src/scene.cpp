@@ -171,7 +171,18 @@ public:
         scene.images.push_back(solidImage("white", glm::vec4(1)));
         scene.images.push_back(solidImage("flat normal", glm::vec4(0.5f, 0.5f, 1, 1)));
         scene.diagnostics = {{"unsupported", Json::array()}, {"warnings", Json::array()}};
-        lightStyles = initialLightStyles(bsp);
+        std::vector<std::string> styleWarnings;
+        lightStyles = initialLightStyles(bsp, options.experimental, &styleWarnings);
+        for (auto& message : styleWarnings) { warn(std::move(message)); }
+    }
+    /// Records a report warning once per distinct message.
+    void warn(std::string message) {
+        if (warned.insert(message).second) { scene.diagnostics["warnings"].push_back(std::move(message)); }
+    }
+    /// Refuses an approximation in strict mode; experimental captures continue and report it.
+    void approximate(std::string message) {
+        require(options.experimental, "{} Use --experimental to accept this approximation.", message);
+        warn(std::move(message));
     }
     uint32_t texture(std::string name, bool srgb, std::string_view requester, int frame = -1) {
         if (name.empty()) { return 0; }
@@ -541,6 +552,9 @@ public:
     std::vector<PendingTexture> pendingTextures;
     std::vector<std::pair<uint32_t, std::vector<glm::vec4>>> lightmapPages;
     std::array<glm::vec4*, 4> pagePixels{};
+    std::set<std::string> warned;
+    std::optional<WorldLighting> worldLighting;
+    std::map<std::tuple<int, int, int, unsigned>, uint32_t> brushCells;
     std::array<uint32_t, 4> pageIds{};
     std::array<float, 256> lightStyles{};
     uint32_t pageX = 0, pageY = 0, pageRow = 0;
@@ -866,7 +880,7 @@ void Builder::addProps() {
     size_t stride = version == 4 ? 56 : version == 5 ? 60 : version == 6 ? 64 : 72;
     require(data.size() - reader.cursor == size_t(count) * stride, "Static-prop byte count does not match its version.");
     auto ambientIndexData = bsp.view(options.hdr ? 51 : 52), ambientSampleData = bsp.view(options.hdr ? 55 : 56);
-    WorldLighting worldLighting(bsp, options.hdr);
+    WorldLighting propWorldLighting(bsp, options.hdr, options.experimental);
     uint32_t bakedProps = 0, ambientProps = 0;
     Reader ambientIndices(ambientIndexData, "leaf ambient indices"), ambientSamples(ambientSampleData, "leaf ambient samples"), leavesReader(leafData, "prop leaves");
     auto ambientAt = [&](glm::vec3 position) {
@@ -911,6 +925,7 @@ void Builder::addProps() {
         PropLighting lighting;
         std::vector<glm::vec3> bakedColors;
         std::vector<Vertex> vertices;
+        std::vector<std::string> notes;
     };
     std::vector<std::unique_ptr<PropModel>> propModels(modelNames.size());
     auto loadModel = [&](size_t modelIndex) -> PropModel& {
@@ -955,8 +970,10 @@ void Builder::addProps() {
         const auto& model = prop.source->model;
         const auto& baked = prop.source->baked;
         auto normalMatrix = glm::mat3(prop.matrix);
-        auto ambient = ambientAt(prop.lightingOrigin);
-        auto& lighting = prop.lighting = worldLighting.sample(prop.lightingOrigin); lighting.ambient = ambient;
+        std::array<glm::vec3, 6> ambient{};
+        try { ambient = ambientAt(prop.lightingOrigin); }
+        catch (const Error& error) { prop.notes.push_back(std::format("Static prop '{}' uses neutral ambient light: {}", *prop.source->name, error.what())); ambient.fill(glm::vec3(0.25f)); }
+        auto& lighting = prop.lighting = propWorldLighting.sample(prop.lightingOrigin); lighting.ambient = ambient;
         auto& bakedColors = prop.bakedColors;
         bakedColors.assign(baked.vertices.size(), glm::vec3(-1));
         if (prop.vertexLighting && !(prop.flags & 64)) {
@@ -1010,6 +1027,7 @@ void Builder::addProps() {
     scene.vertices.reserve(scene.vertices.size() + propVertexCount); scene.indices.reserve(scene.indices.size() + propIndexCount);
     std::vector<uint32_t> remap;
     for (auto& prop : instances) {
+        for (auto& note : prop.notes) { approximate(std::move(note)); }
         auto i = prop.index;
         const auto& model = prop.source->model;
         const auto& baked = prop.source->baked;

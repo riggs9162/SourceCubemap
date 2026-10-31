@@ -7,12 +7,13 @@ struct VertexLightingMesh {
     std::vector<glm::vec3> colors;
 };
 std::vector<VertexLightingMesh> readVertexLighting(std::span<const std::byte> bytes, uint32_t checksum);
-std::array<float, 256> initialLightStyles(const Bsp& bsp);
+/// Returns each light style's brightness at capture start. Strict mode refuses animated styles; experimental mode uses their first frame and reports it through warnings.
+std::array<float, 256> initialLightStyles(const Bsp& bsp, bool experimental, std::vector<std::string>* warnings = nullptr);
 std::array<glm::vec3, 4> lightmapRadiance(std::array<glm::vec3, 4> samples, bool bumped, bool hdr);
 
 class WorldLighting {
 public:
-    WorldLighting(const Bsp& bsp, bool hdr);
+    WorldLighting(const Bsp& bsp, bool hdr, bool experimental);
     PropLighting sample(glm::vec3 position) const;
 private:
     struct Light {
