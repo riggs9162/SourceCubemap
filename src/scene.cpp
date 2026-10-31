@@ -892,6 +892,45 @@ void Builder::addProps() {
         for (auto& side : cube) { side /= total; }
         return cube;
     };
+    struct PropModel {
+        const std::string* name = nullptr;
+        std::shared_ptr<const Asset> mdl, vtx, vvd;
+        uint32_t checksum = 0;
+        mdlpp::StudioModel model;
+        mdlpp::BakedModel baked;
+        std::map<int, uint32_t> materials;
+    };
+    struct PropInstance {
+        uint32_t index = 0;
+        size_t record = 0;
+        uint32_t flags = 0;
+        PropModel* source = nullptr;
+        glm::vec3 origin{}, lightingOrigin{};
+        glm::mat4 matrix{1};
+        std::shared_ptr<const Asset> vertexLighting;
+        PropLighting lighting;
+        std::vector<glm::vec3> bakedColors;
+        std::vector<Vertex> vertices;
+    };
+    std::vector<std::unique_ptr<PropModel>> propModels(modelNames.size());
+    auto loadModel = [&](size_t modelIndex) -> PropModel& {
+        auto& loaded = propModels[modelIndex];
+        if (loaded) { return *loaded; }
+        auto result = std::make_unique<PropModel>();
+        const auto& name = modelNames[modelIndex];
+        auto stem = name.substr(0, name.size() - 4);
+        result->name = &name;
+        result->mdl = assets.get(name, "static prop"); result->vtx = assets.get(stem + ".dx90.vtx", name); result->vvd = assets.get(stem + ".vvd", name);
+        result->checksum = Reader(result->mdl->bytes, name).at<uint32_t>(8);
+        require(result->checksum == Reader(result->vtx->bytes, name).at<uint32_t>(16) && result->checksum == Reader(result->vvd->bytes, name).at<uint32_t>(8), "Model companion checksums differ: {}", name);
+        require(result->model.open(result->mdl->bytes, result->vtx->bytes, result->vvd->bytes), "Cannot load MDL/VTX/VVD model: {}", name);
+        for (const auto& part : result->model.mdl.bodyParts) { require(part.models.size() <= 1, "Static-prop bodygroups are not supported: {}", name); }
+        result->baked = result->model.processModelData(0);
+        require(result->baked.vertices.size() <= 65535, "Model exceeds SourcePP's current 16-bit baked index range: {}", name);
+        loaded = std::move(result);
+        return *loaded;
+    };
+    std::vector<PropInstance> instances;
     for (uint32_t i = 0; i < count; ++i) {
         size_t record = reader.cursor + size_t(i) * stride;
         uint32_t propFlags = version == 10 ? reader.at<uint32_t>(record + 64) : reader.at<uint8_t>(record + 31);
@@ -905,24 +944,23 @@ void Builder::addProps() {
         auto origin = reader.at<glm::vec3>(record), angles = reader.at<glm::vec3>(record + 12);
         auto modelIndex = reader.at<uint16_t>(record + 24);
         require(modelIndex < modelNames.size(), "Static prop references an invalid model.");
-        const auto& name = modelNames[modelIndex];
-        auto stem = name.substr(0, name.size() - 4);
-        auto mdl = assets.get(name, "static prop"), vtx = assets.get(stem + ".dx90.vtx", name), vvd = assets.get(stem + ".vvd", name);
-        mdlpp::StudioModel model;
-        require(Reader(mdl->bytes, name).at<uint32_t>(8) == Reader(vtx->bytes, name).at<uint32_t>(16) && Reader(mdl->bytes, name).at<uint32_t>(8) == Reader(vvd->bytes, name).at<uint32_t>(8), "Model companion checksums differ: {}", name);
-        require(model.open(mdl->bytes, vtx->bytes, vvd->bytes), "Cannot load MDL/VTX/VVD model: {}", name);
-        for (const auto& part : model.mdl.bodyParts) { require(part.models.size() <= 1, "Static-prop bodygroups are not supported: {}", name); }
-        auto baked = model.processModelData(0);
-        require(baked.vertices.size() <= 65535, "Model exceeds SourcePP's current 16-bit baked index range: {}", name);
+        auto& source = loadModel(modelIndex);
         auto matrix = transform(origin, angles);
-        auto normalMatrix = glm::mat3(matrix);
-        auto lightingOrigin = (propFlags & 2) ? reader.at<glm::vec3>(record + 44) : glm::vec3(matrix * glm::vec4(vec3(model.mdl.illuminationPosition), 1));
-        auto ambient = ambientAt(lightingOrigin);
-        auto lighting = worldLighting.sample(lightingOrigin); lighting.ambient = ambient;
-        std::vector<glm::vec3> bakedColors(baked.vertices.size(), glm::vec3(-1));
-        auto lightingAsset = assets.find(std::format("sp_{}{}.vhv", options.hdr ? "hdr_" : "", i));
-        if (lightingAsset && !(propFlags & 64)) {
-            auto meshes = readVertexLighting(lightingAsset->bytes, Reader(mdl->bytes, name).at<uint32_t>(8));
+        auto lightingOrigin = (propFlags & 2) ? reader.at<glm::vec3>(record + 44) : glm::vec3(matrix * glm::vec4(vec3(source.model.mdl.illuminationPosition), 1));
+        auto vertexLighting = assets.findEmbedded(std::format("sp_{}{}.vhv", options.hdr ? "hdr_" : "", i));
+        instances.push_back({i, record, propFlags, &source, origin, lightingOrigin, matrix, std::move(vertexLighting)});
+    }
+    parallelFor(instances.size(), [&](size_t instance) {
+        auto& prop = instances[instance];
+        const auto& model = prop.source->model;
+        const auto& baked = prop.source->baked;
+        auto normalMatrix = glm::mat3(prop.matrix);
+        auto ambient = ambientAt(prop.lightingOrigin);
+        auto& lighting = prop.lighting = worldLighting.sample(prop.lightingOrigin); lighting.ambient = ambient;
+        auto& bakedColors = prop.bakedColors;
+        bakedColors.assign(baked.vertices.size(), glm::vec3(-1));
+        if (prop.vertexLighting && !(prop.flags & 64)) {
+            auto meshes = readVertexLighting(prop.vertexLighting->bytes, prop.source->checksum);
             size_t meshIndex = 0;
             for (size_t body = 0; body < model.mdl.bodyParts.size(); ++body) {
                 const auto& part = model.mdl.bodyParts[body];
@@ -949,24 +987,40 @@ void Builder::addProps() {
                 }
             }
             require(meshIndex == meshes.size(), "VHV contains strip groups absent from the model.");
-            lighting.baked = true; ++bakedProps;
-        } else { require(!(propFlags & 8), "Props that ignore lighting normals require baked VHV colors."); ++ambientProps; }
-        uint32_t lightingIndex = static_cast<uint32_t>(scene.propLighting.size());
-        scene.propLighting.push_back(lighting);
-        std::vector<Vertex> propVertices;
-        propVertices.reserve(baked.vertices.size());
+            lighting.baked = true;
+        } else { require(!(prop.flags & 8), "Props that ignore lighting normals require baked VHV colors."); }
+        prop.vertices.reserve(baked.vertices.size());
         for (size_t sourceIndex = 0; sourceIndex < baked.vertices.size(); ++sourceIndex) {
             const auto& source = baked.vertices[sourceIndex];
             Vertex vertex;
-            vertex.position = glm::vec3(matrix * glm::vec4(vec3(source.position), 1)); vertex.normal = glm::normalize(normalMatrix * vec3(source.normal));
+            vertex.position = glm::vec3(prop.matrix * glm::vec4(vec3(source.position), 1)); vertex.normal = glm::normalize(normalMatrix * vec3(source.normal));
             vertex.tangent = glm::vec4(normalMatrix * glm::vec3(vec4(source.tangent)), source.tangent[3]);
             vertex.uv = {source.uv[0], source.uv[1]};
             glm::vec3 light(0);
             for (unsigned axis = 0; axis < 3; ++axis) { light += ambient[axis * 2 + (vertex.normal[axis] < 0 ? 1 : 0)] * vertex.normal[axis] * vertex.normal[axis]; }
             if (lighting.baked && bakedColors[sourceIndex].x >= 0) { light = bakedColors[sourceIndex]; }
-            vertex.color = glm::vec4(light, 1); propVertices.push_back(vertex);
+            vertex.color = glm::vec4(light, 1); prop.vertices.push_back(vertex);
         }
-        int skin = reader.at<int32_t>(record + 32);
+    });
+    size_t propVertexCount = 0, propIndexCount = 0;
+    for (const auto& prop : instances) {
+        propVertexCount += prop.vertices.size();
+        for (const auto& mesh : prop.source->baked.meshes) { propIndexCount += mesh.indices.size(); }
+    }
+    scene.vertices.reserve(scene.vertices.size() + propVertexCount); scene.indices.reserve(scene.indices.size() + propIndexCount);
+    std::vector<uint32_t> remap;
+    for (auto& prop : instances) {
+        auto i = prop.index;
+        const auto& model = prop.source->model;
+        const auto& baked = prop.source->baked;
+        const auto& name = *prop.source->name;
+        const auto& lighting = prop.lighting;
+        const auto& bakedColors = prop.bakedColors;
+        const auto& propVertices = prop.vertices;
+        if (lighting.baked) { ++bakedProps; } else { ++ambientProps; }
+        uint32_t lightingIndex = static_cast<uint32_t>(scene.propLighting.size());
+        scene.propLighting.push_back(lighting);
+        int skin = reader.at<int32_t>(prop.record + 32);
         require(skin >= 0 && !model.mdl.skins.empty(), "Static prop {} '{}' has invalid skin metadata.", i, name);
         if (size_t(skin) >= model.mdl.skins.size()) {
             require(options.experimental, "Static prop {} '{}' requests skin {} but the model has {} skin families. Use --experimental to select skin zero.", i, name, skin, model.mdl.skins.size());
@@ -974,19 +1028,23 @@ void Builder::addProps() {
         }
         for (const auto& mesh : baked.meshes) {
             auto slot = model.mdl.skins.at(skin).at(mesh.materialIndex);
-            const auto& materialName = model.mdl.materials.at(slot).name;
-            std::string resolved;
-            for (const auto& directory : model.mdl.materialDirectories) {
-                auto candidate = assetPath(directory + "/" + materialName);
-                if (assets.find("materials/" + candidate + ".vmt")) { resolved = std::move(candidate); break; }
+            auto known = prop.source->materials.find(slot);
+            if (known == prop.source->materials.end()) {
+                const auto& materialName = model.mdl.materials.at(slot).name;
+                std::string resolved;
+                for (const auto& directory : model.mdl.materialDirectories) {
+                    auto candidate = assetPath(directory + "/" + materialName);
+                    if (assets.find("materials/" + candidate + ".vmt")) { resolved = std::move(candidate); break; }
+                }
+                require(!resolved.empty(), "Missing model material '{}' requested by '{}'. Check mounted content and model material directories.", materialName, name);
+                auto resolvedId = material(resolved); scene.materials[resolvedId].flags |= VertexLit;
+                known = prop.source->materials.emplace(slot, resolvedId).first;
             }
-            require(!resolved.empty(), "Missing model material '{}' requested by '{}'. Check mounted content and model material directories.", materialName, name);
-            auto id = material(resolved); scene.materials[id].flags |= VertexLit;
-            const auto& definition = scene.materials[id].definition;
-            std::vector<uint32_t> remap(propVertices.size(), UINT32_MAX);
+            auto id = known->second;
+            remap.assign(propVertices.size(), UINT32_MAX);
             scene.draws.push_back({static_cast<uint32_t>(scene.indices.size()), static_cast<uint32_t>(mesh.indices.size()), id});
             scene.draws.back().lighting = lightingIndex;
-            if (skyArea >= 0) { scene.draws.back().skyWorld = (leavesReader.at<uint16_t>(size_t(leafAt(origin)) * 32 + 6) & 511) == skyArea; }
+            if (skyArea >= 0) { scene.draws.back().skyWorld = (leavesReader.at<uint16_t>(size_t(leafAt(prop.origin)) * 32 + 6) & 511) == skyArea; }
             for (size_t j = 0; j < mesh.indices.size(); j += 3) {
                 require(j + 2 < mesh.indices.size(), "Incomplete model triangle.");
                 const auto& uvTransform = materialUv(id);
@@ -1003,6 +1061,7 @@ void Builder::addProps() {
                 }
             }
         }
+        prop.bakedColors = {}; prop.vertices = {};
     }
     scene.diagnostics["static_props"] = count;
     scene.diagnostics["prop_lighting"] = {{"vhv", bakedProps}, {"ambient_and_world_lights", ambientProps}};
