@@ -145,7 +145,7 @@ WorldLighting::WorldLighting(const Bsp& bsp, bool hdr, bool experimental)
         require(light.style >= 0 && light.style < 255, "World light has an invalid light style.");
         light.intensity *= styles[light.style];
         for (float value : {light.origin.x, light.origin.y, light.origin.z, light.intensity.x, light.intensity.y, light.intensity.z, light.normal.x, light.normal.y, light.normal.z, light.attenuation.x, light.attenuation.y, light.attenuation.z, light.inner, light.outer, light.radius, light.exponent}) { require(std::isfinite(value), "Nonfinite world-light data."); }
-        require(light.radius >= 0 && light.exponent >= 0 && glm::all(glm::greaterThanEqual(light.intensity, glm::vec3(0))) && glm::all(glm::greaterThanEqual(light.attenuation, glm::vec3(0))), "Invalid negative world-light parameters.");
+        if (light.radius < 0 || light.exponent < 0 || !glm::all(glm::greaterThanEqual(light.intensity, glm::vec3(0))) || !glm::all(glm::greaterThanEqual(light.attenuation, glm::vec3(0)))) { continue; }
         lights.push_back(light);
     }
 }
@@ -219,8 +219,7 @@ PropLighting WorldLighting::sample(glm::vec3 position) const {
     struct Candidate { float strength; PropLight light; };
     std::vector<Candidate> candidates;
     for (const auto& light : lights) {
-        if (light.type == 5 || (light.flags & 1)) { continue; }
-        require(light.type != 4, "Quake-style prop lights are not implemented.");
+        if (light.type == 5 || light.type == 4 || (light.flags & 1)) { continue; }
         glm::vec3 direction = light.type == 3 ? -light.normal : light.origin - position;
         float distance = glm::length(direction);
         if (distance < 0.001f) { continue; } direction /= distance;
