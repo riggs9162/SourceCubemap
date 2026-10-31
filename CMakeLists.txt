@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(SourceCubemap VERSION 0.3.0 LANGUAGES C CXX)
+project(SourceCubemap VERSION 0.4.0 LANGUAGES C CXX)
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "SourceCubemap currently requires Windows x64.")
 endif()
