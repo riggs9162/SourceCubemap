@@ -6,12 +6,33 @@
 #include <vtfpp/VTF.h>
 #include <sourcepp/compression/LZMA.h>
 #include <mz.h>
+#include <mz_crypt.h>
 #include <mz_strm.h>
 #include <mz_strm_mem.h>
 #include <mz_zip.h>
 #include <mz_zip_rw.h>
 
 namespace scm {
+namespace {
+/// Returns where a game-lump entry ends. Repacked maps close the directory with a terminator that stores offset zero, so that entry ends at its container.
+uint64_t gameLumpEnd(const Reader& directory, size_t entry, uint32_t index, uint32_t count, uint64_t container) {
+    if (index + 1 >= count) { return container; }
+    auto next = directory.at<uint32_t>(entry + 24);
+    return next ? next : container;
+}
+/// Reads an LZMA entry written without an end marker, as Valve's repacker does. The decoder cannot detect its end, so the entry is read to its recorded size and checked here.
+bool readUnterminatedLzma(void* archive, const mz_zip_file& info, Bytes& payload) {
+    if (mz_zip_reader_entry_open(archive) != MZ_OK) { return false; }
+    size_t offset = 0;
+    while (offset < payload.size()) {
+        auto read = mz_zip_reader_entry_read(archive, payload.data() + offset, static_cast<int32_t>(payload.size() - offset));
+        if (read <= 0) { mz_zip_reader_entry_close(archive); return false; }
+        offset += static_cast<size_t>(read);
+    }
+    mz_zip_reader_entry_close(archive);
+    return mz_crypt_crc32_update(0, reinterpret_cast<const uint8_t*>(payload.data()), static_cast<int32_t>(payload.size())) == info.crc;
+}
+}
 void validateVtf(std::span<const std::byte> data, std::string_view name) {
     Reader reader(data, name);
     require(data.size() >= 64 && reader.at<uint32_t>(0) == 0x00465456 && reader.at<uint32_t>(4) == 7, "Invalid VTF header: {}", name);
@@ -86,10 +107,9 @@ Bsp::Bsp(const fs::path& filename) : path(fs::absolute(filename)), bytes(readFil
             auto signature = directory.at<uint32_t>(entry);
             auto flags = directory.at<uint16_t>(entry + 4);
             auto offset = directory.at<uint32_t>(entry + 8), length = directory.at<uint32_t>(entry + 12);
-            uint64_t end = uint64_t(lumps[35].offset) + lumps[35].length;
-            if (i + 1 < count) { end = directory.at<uint32_t>(entry + 24); }
-            require(flags <= 1 && offset >= uint64_t(lumps[35].offset) + 4 + count * 16 && offset <= end && end <= uint64_t(lumps[35].offset) + lumps[35].length && length <= (1u << 30), "Invalid game-lump directory bounds.");
             if (!signature) { require(i + 1 == count && length == 0, "Invalid game-lump sentinel."); continue; }
+            uint64_t end = gameLumpEnd(directory, entry, i, count, uint64_t(lumps[35].offset) + lumps[35].length);
+            require(flags <= 1 && offset >= uint64_t(lumps[35].offset) + 4 + count * 16 && offset <= end && end <= uint64_t(lumps[35].offset) + lumps[35].length && length <= (1u << 30), "Invalid game-lump directory bounds.");
             require(signatures.insert(signature).second, "Duplicate game-lump signature.");
             if (!flags) { require(length <= end - offset, "Game lumps overlap."); }
             else {
@@ -130,6 +150,8 @@ Bsp::Bsp(const fs::path& filename) : path(fs::absolute(filename)), bytes(readFil
             Bytes payload(static_cast<size_t>(info->uncompressed_size));
             if (payload.empty()) {
                 require(mz_zip_reader_entry_open(archive.handle) == MZ_OK && mz_zip_reader_entry_close(archive.handle) == MZ_OK, "Embedded ZIP entry failed validation: {}", name);
+            } else if (info->compression_method == MZ_COMPRESS_METHOD_LZMA && !(info->flag & MZ_ZIP_FLAG_LZMA_EOS_MARKER)) {
+                require(readUnterminatedLzma(archive.handle, *info, payload), "Embedded ZIP entry failed decompression or checksum validation: {}", name);
             } else {
                 require(mz_zip_reader_entry_save_buffer(archive.handle, payload.data(), static_cast<int32_t>(payload.size())) == MZ_OK, "Embedded ZIP entry failed decompression or checksum validation: {}", name);
             }
@@ -200,8 +222,7 @@ std::optional<GameLump> Bsp::gameLump(uint32_t signature) const {
         auto flags = directory.at<uint16_t>(entry + 4), version = directory.at<uint16_t>(entry + 6);
         auto offset = directory.at<uint32_t>(entry + 8), length = directory.at<uint32_t>(entry + 12);
         require(flags <= 1 && length <= (1u << 30), "Unsupported game-lump flags or size.");
-        size_t end = size_t(lumps[35].offset) + lumps[35].length;
-        if (i + 1 < count) { end = directory.at<uint32_t>(entry + 24); }
+        size_t end = static_cast<size_t>(gameLumpEnd(directory, entry, i, count, uint64_t(lumps[35].offset) + lumps[35].length));
         require(offset >= lumps[35].offset + 4 + size_t(count) * 16 && offset <= end && end <= size_t(lumps[35].offset) + lumps[35].length, "Game-lump offsets are outside their container.");
         auto payload = file.slice(offset, flags ? end - offset : length);
         if (flags) {
