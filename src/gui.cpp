@@ -29,6 +29,7 @@ enum Control : int { Map = 100, Game, Output, BrowseMap, BrowseGame, BrowseOutpu
 struct Choice { const wchar_t* label; const wchar_t* value; };
 constexpr std::array<Choice, 4> lightingChoices{{{L"Same as the map", L"auto"}, {L"LDR only", L"ldr"}, {L"HDR only", L"hdr"}, {L"LDR and HDR", L"both"}}};
 constexpr std::array<Choice, 3> qualityChoices{{{L"Standard", L"standard"}, {L"Fast", L"fast"}, {L"High (sharper, slower)", L"high"}}};
+constexpr size_t shownWarnings = 5;
 constexpr std::array<Choice, 2> variantChoices{{{L"LDR", L""}, {L"HDR", L".hdr"}}};
 struct FaceView { const wchar_t* suffix; int column, row; Gdiplus::RotateFlipType turn; };
 const std::array<FaceView, 6> faceViews{{{L"px", 1, 1, Gdiplus::Rotate90FlipX}, {L"nx", 3, 1, Gdiplus::Rotate270FlipX}, {L"py", 0, 1, Gdiplus::RotateNoneFlipY}, {L"ny", 2, 1, Gdiplus::RotateNoneFlipX}, {L"pz", 1, 0, Gdiplus::Rotate90FlipX}, {L"nz", 1, 2, Gdiplus::Rotate90FlipX}}};
@@ -347,8 +348,11 @@ struct App {
         unsigned count = report.value("probes",0u);
         auto summary = std::format(L"{} {}, {} lighting.\r\n\r\nSaved as {}\r\n\r\nCopy it into your game's maps folder and keep this filename, because the cubemaps are stored under it.", count, count == 1 ? L"cubemap" : L"cubemaps", lighting, fs::path(text(Output)).filename().wstring());
         if (!warnings.empty()) {
+            std::stable_partition(warnings.begin(), warnings.end(), [](const std::string& warning) { return warning.starts_with("Missing asset"); });
             summary += std::format(L"\r\n\r\n{} {} could not be matched exactly:", warnings.size(), warnings.size() == 1 ? L"thing" : L"things");
-            for (const auto& warning : warnings) { summary += L"\r\n- " + wide(warning); }
+            for (size_t i = 0; i < std::min(warnings.size(), shownWarnings); ++i) { summary += L"\r\n- " + wide(warnings[i]); }
+            if (warnings.size() > shownWarnings) { summary += std::format(L"\r\n\r\nThe log lists the other {}.", warnings.size() - shownWarnings); }
+            std::ofstream saved(logPath, std::ios::app); for (const auto& warning : warnings) { saved << warning << '\n'; }
         }
         return summary;
     }
