@@ -3,39 +3,43 @@
 Builds and publishes one GitHub release, with its own Windows download, for each unreleased commit.
 
 .DESCRIPTION
-Run this from a working session after pushing master. Versions are always A.B.cc, such as 0.4.07. A and
-B come from the project version, and cc is a two-digit count of releases within them. After 99, cc wraps
-to 00 and B moves up. After 9, B wraps to 0 and A moves up. The tag, the release title, the download, and
-the version the program reports all use the same number.
+Run this from a working session after pushing master. Versions are always A.B.cc, such as 0.4.07, with A
+for major changes that break compatibility, B for backwards-compatible changes, and cc for bug fixes and
+other small corrections. Raising one part resets the parts after it. Commits count as fixes unless listed
+in -Minor or -Major. The tag, the release title, the download, and the version the program reports all use
+the same number.
 
 Each commit is built on its own in build/publish, a separate checkout of this repository, so a release
 cannot pick up later changes and an open copy of the program cannot block the build. The first run takes
 several minutes because it compiles every dependency. Commits whose subject starts with [skip] are
 agent housekeeping and are not released.
+
+.PARAMETER Minor
+Hashes of commits that add or improve behavior without breaking compatibility. Each raises B and resets cc.
+
+.PARAMETER Major
+Hashes of commits that break compatibility. Each raises A and resets B and cc.
 #>
+param([string[]]$Minor = @(), [string[]]$Major = @())
 $taskRoot = Split-Path $PSScriptRoot -Parent
 Set-Location $taskRoot
 $taskGh = Join-Path $env:ProgramFiles 'GitHub CLI\gh.exe'
 if (!(Test-Path -LiteralPath $taskGh)) { $taskGh = 'gh' }
 
 function Assert-Success([string]$Action) { if ($LASTEXITCODE -ne 0) { throw "$Action failed ($LASTEXITCODE)." } }
-function Get-NextVersion([string]$Previous) {
-    $taskProject = [regex]::Match((Get-Content -Raw 'CMakeLists.txt'), 'project\(SourceCubemap VERSION (\d+)\.(\d+)\.\d+')
-    if (!$taskProject.Success) { throw 'Cannot read the project version.' }
-    $taskMajor = [int]$taskProject.Groups[1].Value
-    $taskMinor = [int]$taskProject.Groups[2].Value
-    $taskPatch = 0
-    if ($Previous) {
-        $taskParts = @($Previous.Split('.') | ForEach-Object { [int]$_ })
-        if ($taskParts[0] -gt $taskMajor -or ($taskParts[0] -eq $taskMajor -and $taskParts[1] -ge $taskMinor)) {
-            $taskMajor = $taskParts[0]
-            $taskMinor = $taskParts[1]
-            $taskPatch = $taskParts[2] + 1
-        }
+function Test-Listed([string]$Commit, [string[]]$Hashes) { @($Hashes | Where-Object { $Commit.StartsWith($_) }).Count -gt 0 }
+function Get-NextVersion([string]$Previous, [string]$Commit) {
+    if (!$Previous) {
+        $taskProject = [regex]::Match((Get-Content -Raw 'CMakeLists.txt'), 'project\(SourceCubemap VERSION (\d+)\.(\d+)\.\d+')
+        if (!$taskProject.Success) { throw 'Cannot read the project version.' }
+        return '{0}.{1}.00' -f $taskProject.Groups[1].Value, $taskProject.Groups[2].Value
     }
-    if ($taskPatch -gt 99) { $taskPatch = 0; $taskMinor += 1 }
-    if ($taskMinor -gt 9) { $taskMinor = 0; $taskMajor += 1 }
-    '{0}.{1}.{2:00}' -f $taskMajor, $taskMinor, $taskPatch
+    $taskParts = @($Previous.Split('.') | ForEach-Object { [int]$_ })
+    if (Test-Listed $Commit $Major) { $taskParts = @(($taskParts[0] + 1), 0, 0) }
+    elseif (Test-Listed $Commit $Minor) { $taskParts = @($taskParts[0], ($taskParts[1] + 1), 0) }
+    elseif ($taskParts[2] -ge 99) { $taskParts = @($taskParts[0], ($taskParts[1] + 1), 0) }
+    else { $taskParts = @($taskParts[0], $taskParts[1], ($taskParts[2] + 1)) }
+    '{0}.{1}.{2:00}' -f $taskParts[0], $taskParts[1], $taskParts[2]
 }
 
 if ((git rev-parse --abbrev-ref HEAD) -ne 'master') { throw 'Releases are published from master.' }
@@ -47,6 +51,9 @@ if ((git rev-parse HEAD) -ne (git rev-parse origin/master)) { throw 'Push master
 $taskLast = git tag --list '[0-9]*.[0-9]*.[0-9][0-9]' --merged HEAD | Sort-Object { [version]$_ } | Select-Object -Last 1
 $taskCommits = if ($taskLast) { @(git rev-list --reverse --first-parent "$taskLast..HEAD") } else { @(git rev-parse HEAD) }
 $taskReleases = @($taskCommits | Where-Object { !(git log -1 --format=%s $_).StartsWith('[skip]') })
+foreach ($taskHash in @($Minor) + @($Major)) {
+    if (@($taskReleases | Where-Object { $_.StartsWith($taskHash) }).Count -ne 1) { throw "$taskHash is not one unreleased commit." }
+}
 if ($taskReleases.Count -eq 0) { Write-Output 'Nothing to release.'; return }
 
 $taskPublish = Join-Path $taskRoot 'build\publish'
@@ -59,14 +66,14 @@ $taskNotesFile = Join-Path $taskWork 'notes.md'
 New-Item -ItemType Directory -Path $taskWork | Out-Null
 try {
     foreach ($taskCommit in $taskReleases) {
-        $taskVersion = Get-NextVersion $taskLast
+        $taskVersion = Get-NextVersion $taskLast $taskCommit
         $taskFolder = Join-Path $taskWork $taskVersion
         $taskArchive = Join-Path $taskWork "SourceCubemap-$taskVersion-windows-x64.zip"
         git -C $taskPublish checkout --quiet --detach $taskCommit
         Assert-Success "Checking out $taskCommit"
         & cmd.exe /d /c "powershell -NoProfile -ExecutionPolicy Bypass -File `"$taskPublish\tools\build.ps1`" -Version $taskVersion"
         Assert-Success "Building $taskVersion"
-        & cmd.exe /d /c "powershell -NoProfile -ExecutionPolicy Bypass -File `"$taskPublish\tools\package.ps1`" -Destination `"$taskFolder\SourceCubemap`""
+        & cmd.exe /d /c "powershell -NoProfile -ExecutionPolicy Bypass -File `"$taskPublish\tools\package.ps1`" -BuildDirectory `"$taskPublish\build\release`" -Destination `"$taskFolder\SourceCubemap`""
         Assert-Success "Packaging $taskVersion"
         Compress-Archive -Path (Join-Path $taskFolder 'SourceCubemap') -DestinationPath $taskArchive
         $taskSubject = git log -1 --format=%s $taskCommit

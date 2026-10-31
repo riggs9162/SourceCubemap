@@ -1,6 +1,6 @@
 # Implementation boundaries
 
-SourceCubemap 0.4.0 is an experimental standalone rendering pipeline, not a complete replacement for every Source branch's buildcubemaps behavior. Production code is C++23. No engine process, engine DLL, VMF decompilation, or Python runtime participates in generation.
+SourceCubemap is an experimental standalone rendering pipeline, not a complete replacement for every Source branch's buildcubemaps behavior. Production code is C++23. No engine process, engine DLL, VMF decompilation, or Python runtime participates in generation.
 
 ## Modules
 
