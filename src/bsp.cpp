@@ -314,7 +314,7 @@ void Bsp::validateDestination(const fs::path& destination, bool overwrite, bool 
     require(fs::is_directory(output.parent_path()), "The output directory does not exist.");
 }
 
-std::string Bsp::writeCubemaps(const TextureMap& textures, const fs::path& destination, bool overwrite, bool inPlace) const {
+std::string Bsp::writeCubemaps(const TextureMap& textures, const fs::path& destination, bool overwrite, bool inPlace, bool backup) const {
     validateDestination(destination, overwrite, inPlace);
     auto output = fs::absolute(destination);
     bool same = fs::exists(output) && fs::equivalent(path, output);
@@ -372,10 +372,10 @@ std::string Bsp::writeCubemaps(const TextureMap& textures, const fs::path& desti
     reopened.verifyPreserved(*this, textures);
     auto validated = digest(reopened.bytes);
     flushing.get();
-    if (same) {
-        auto backup = output;
-        backup += std::format(".{}.bak", GetTickCount64());
-        require(CopyFileW(output.c_str(), backup.c_str(), TRUE) != 0, "Cannot create the original BSP backup.");
+    if (same && backup) {
+        auto copy = output;
+        copy += std::format(".{}.bak", GetTickCount64());
+        require(CopyFileW(output.c_str(), copy.c_str(), TRUE) != 0, "Cannot create the original BSP backup.");
     }
     DWORD flags = MOVEFILE_WRITE_THROUGH | ((overwrite || same) ? MOVEFILE_REPLACE_EXISTING : 0);
     require(MoveFileExW(temporary.path.c_str(), output.c_str(), flags) != 0, "Cannot publish the output BSP (Windows error {}).", GetLastError());

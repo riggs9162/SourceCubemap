@@ -25,7 +25,7 @@ public:
     void validateDestination(const fs::path& output, bool overwrite, bool inPlace) const;
     std::optional<Bytes> embedded(std::string_view name) const;
     /// Publishes a copy with the textures embedded and returns the digest of the bytes that passed validation, so callers can confirm the published file.
-    std::string writeCubemaps(const TextureMap& textures, const fs::path& output, bool overwrite, bool inPlace) const;
+    std::string writeCubemaps(const TextureMap& textures, const fs::path& output, bool overwrite, bool inPlace, bool backup = true) const;
     void verifyPreserved(const Bsp& source, const TextureMap& replacements = {}) const;
     fs::path path;
     Bytes bytes;

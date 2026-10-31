@@ -51,6 +51,7 @@ sourcecubemap validate map_built.bsp
 | `--output FILE` | Wohin die Map geschrieben wird. Standard ist `MAP_built.bsp`. |
 | `--overwrite` | Ersetzt eine vorhandene Ausgabedatei. |
 | `--in-place` | Ersetzt die Original-Map, nachdem eine Sicherung angelegt wurde. |
+| `--no-backup` | Überspringt diese Sicherung, für Tools, die eine eigene Kopie der Map behalten. |
 
 Führe `sourcecubemap build --help` aus, um die vollständige Liste zu sehen. `sourcecubemap inspect map.bsp` zeigt, was eine Map enthält, ohne etwas zu bauen.
 

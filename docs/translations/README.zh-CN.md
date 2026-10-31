@@ -51,6 +51,7 @@ sourcecubemap validate map_built.bsp
 | `--output FILE` | 地图的输出位置。默认为 `MAP_built.bsp`。 |
 | `--overwrite` | 覆盖已有的输出文件。 |
 | `--in-place` | 先备份，再替换原始地图。 |
+| `--no-backup` | 跳过该备份，适用于自行保留地图副本的工具。 |
 
 运行 `sourcecubemap build --help` 查看完整列表。`sourcecubemap inspect map.bsp` 可以查看地图的内容，不会构建任何东西。
 

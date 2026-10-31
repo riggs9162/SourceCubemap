@@ -22,7 +22,7 @@ namespace {
 struct Options {
     std::string input, game, output, report, asset, cache, profile = "gmod", hdr = "auto", quality = "standard", device, previews, water = "strict";
     std::vector<std::string> mounts;
-    bool overwrite = false, inPlace = false, verbose = false, experimental = false, noCache = false, incremental = false;
+    bool overwrite = false, inPlace = false, noBackup = false, verbose = false, experimental = false, noCache = false, incremental = false;
     bool progressJson = false;
     std::string cancelEvent;
     double captureTime = 0;
@@ -405,7 +405,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
     auto textureCount = store.textures.size();
     auto metadata = scm::Json{{"schema", 1}, {"map_namespace", mapNamespace}, {"runtime_map_namespace", scm::lower(output.stem().string())}, {"texture_namespaces", names}}.dump(2);
     store.textures.emplace("sourcecubemap/build.json", std::as_bytes(std::span(metadata.data(), metadata.size())));
-    auto validated = bsp.writeCubemaps(store.textures, output, options.overwrite, options.inPlace);
+    auto validated = bsp.writeCubemaps(store.textures, output, options.overwrite, options.inPlace, !options.noBackup);
     times["bsp_writing_including_transaction_validation"] = writing.seconds();
     scm::Stopwatch validation;
     progress(options, "validating_output");
@@ -456,6 +456,7 @@ int main(int argc, char** argv) {
     generate->add_option("--output", options.output, "Destination BSP; defaults to MAP_built.bsp.");
     generate->add_flag("--overwrite", options.overwrite, "Replace an existing separate output.");
     generate->add_flag("--in-place", options.inPlace, "Replace the input after creating a backup.");
+    generate->add_flag("--no-backup", options.noBackup, "Skip the --in-place backup, for tools that keep their own copy of the map.");
     generate->add_flag("--incremental", options.incremental, "Reuse captures whose map, dependencies, GPU, and settings are unchanged.");
     benchmark->add_option("--runs", options.runs)->check(CLI::Range(1, 100));
     try {
@@ -466,6 +467,7 @@ int main(int argc, char** argv) {
         scm::Json report;
         if (*generate) {
             auto output = options.output.empty() ? scm::fs::path(options.input).parent_path() / (scm::fs::path(options.input).stem().string() + "_built.bsp") : scm::fs::path(options.output);
+            scm::require(options.inPlace || !options.noBackup, "--no-backup only works with --in-place.");
             if (options.inPlace) { scm::require(options.output.empty(), "Use --in-place without --output."); output = options.input; }
             if (!options.report.empty()) { scm::require(!aliases(options.report, output), "The JSON report and output BSP must use different paths."); }
             report = build(options, output);

@@ -30,7 +30,7 @@ Asset resolution gives embedded files priority, followed by explicit mounts and 
 
 The BSP writer preserves unrelated lump offsets and bytes, rebuilds the embedded ZIP, validates a temporary output, flushes it, and atomically publishes it.
 
-Existing destinations require `--overwrite`. Replacing the input requires `--in-place` without `--output` and creates a backup. Output overwrite permission never authorizes input replacement.
+Existing destinations require `--overwrite`. Replacing the input requires `--in-place` without `--output` and creates a backup. `--no-backup` skips that backup for tools that keep their own copy of the map, such as a compile pipeline that can rebuild it. Output overwrite permission never authorizes input replacement.
 
 Each encoded VTF and the final BSP are reopened and checked. Compiled material namespaces stay intact. A renamed output also receives cubemap aliases for runtime static-prop lookups, which is why the generated filename must be kept when installing the BSP. Renaming the output preserves the original `materials/maps/` bindings.
 
