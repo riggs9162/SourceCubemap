@@ -9,8 +9,12 @@ struct Cube {
 glm::vec3 cubeDirection(unsigned face, glm::vec2 uv);
 glm::vec4 sampleCube(const Cube& cube, glm::vec3 direction);
 Bytes encodeCube(const Cube& cube, bool hdr);
+/// Encodes a cube the caller no longer needs, reusing its storage for the top mip.
+Bytes encodeCube(Cube&& cube, bool hdr);
 Cube decodeCube(std::span<const std::byte> texture, bool hdr);
 void writePreview(const Cube& cube, const fs::path& directory, std::string_view name);
+/// Compresses a square RGBA8888 image of whole 4x4 blocks with SourcePP's DXT1 settings. Compressonator's public entry point starts a thread per CPU for every image, so its codec is driven directly and encoders can run side by side.
+void compressDxt1(std::span<const std::byte> rgba, uint32_t size, std::byte* destination);
 
 struct RenderOptions {
     std::string device;

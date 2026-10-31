@@ -1,7 +1,10 @@
 #include <scm/common.hpp>
 #include <Windows.h>
 #include <atomic>
+#include <execution>
 #include <fstream>
+#include <mutex>
+#include <numeric>
 #include <sstream>
 #include <xxhash.h>
 
@@ -43,6 +46,15 @@ std::string assetPath(std::string value) {
     return path.lexically_normal().generic_string();
 }
 std::string digest(std::span<const std::byte> bytes) { return std::format("{:016x}", XXH3_64bits(bytes.data(), bytes.size())); }
+void parallelFor(size_t count, const std::function<void(size_t)>& body) {
+    std::vector<size_t> items(count); std::iota(items.begin(), items.end(), size_t(0));
+    std::exception_ptr failure; std::mutex guard;
+    std::for_each(std::execution::par, items.begin(), items.end(), [&](size_t item) {
+        try { body(item); }
+        catch (...) { std::scoped_lock lock(guard); if (!failure) { failure = std::current_exception(); } }
+    });
+    if (failure) { std::rethrow_exception(failure); }
+}
 glm::vec3 parseVector(std::string_view value, glm::vec3 fallback) {
     if (value.empty()) { return fallback; }
     std::string input(value);

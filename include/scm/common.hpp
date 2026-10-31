@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -40,6 +41,8 @@ std::string textOf(std::span<const std::byte> bytes);
 std::string lower(std::string value);
 std::string assetPath(std::string value);
 std::string digest(std::span<const std::byte> bytes);
+/// Runs body(0..count-1) across CPU threads and rethrows the first failure after every item has finished.
+void parallelFor(size_t count, const std::function<void(size_t)>& body);
 glm::vec3 parseVector(std::string_view value, glm::vec3 fallback = {});
 float parseFloat(std::string_view value, float fallback = 0.0f);
 
