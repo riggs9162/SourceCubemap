@@ -109,14 +109,13 @@ std::vector<VertexLightingMesh> readVertexLighting(std::span<const std::byte> by
         VertexLightingMesh mesh; mesh.lod = reader.at<uint32_t>(record);
         auto count = reader.at<uint32_t>(record + 4), offset = reader.at<uint32_t>(record + 8);
         require(mesh.lod < 8 && count <= vertices && offset >= headerEnd, "Invalid VHV mesh range or LOD.");
-        reader.slice(offset, size_t(count) * 4);
+        auto pixels = reader.slice(offset, size_t(count) * 4).data();
         if (count) { ranges.emplace_back(offset, size_t(offset) + size_t(count) * 4); }
         total += count;
-        mesh.colors.reserve(count);
+        mesh.colors.resize(count);
         for (uint32_t j = 0; j < count; ++j) {
-            size_t pixel = offset + size_t(j) * 4;
-            glm::vec3 encoded(reader.at<uint8_t>(pixel + 2), reader.at<uint8_t>(pixel + 1), reader.at<uint8_t>(pixel));
-            mesh.colors.push_back(glm::pow(encoded * (2.0f / 255.0f), glm::vec3(2.2f)));
+            const auto* pixel = pixels + size_t(j) * 4;
+            mesh.colors[j] = {vertexLightLevels[uint8_t(pixel[2])], vertexLightLevels[uint8_t(pixel[1])], vertexLightLevels[uint8_t(pixel[0])]};
         }
         result.push_back(std::move(mesh));
     }
