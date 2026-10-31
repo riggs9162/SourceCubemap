@@ -6,8 +6,8 @@ Builds and publishes one GitHub release, with its own Windows download, for each
 Run this from a working session after pushing master. Versions are always A.B.cc, such as 0.4.07, with A
 for major changes that break compatibility, B for backwards-compatible changes, and cc for bug fixes and
 other small corrections. Raising one part resets the parts after it. Commits count as fixes unless listed
-in -Minor or -Major. The tag, the release title, the download, and the version the program reports all use
-the same number.
+in -Minor or -Major. The tag, the download, and the version the program reports all use the same number.
+Release titles pair that number with the commit subject, and the commit body's bullets become the notes.
 
 Each commit is built on its own in build/publish, a separate checkout of this repository, so a release
 cannot pick up later changes and an open copy of the program cannot block the build. The first run takes
@@ -28,6 +28,19 @@ if (!(Test-Path -LiteralPath $taskGh)) { $taskGh = 'gh' }
 
 function Assert-Success([string]$Action) { if ($LASTEXITCODE -ne 0) { throw "$Action failed ($LASTEXITCODE)." } }
 function Test-Listed([string]$Commit, [string[]]$Hashes) { @($Hashes | Where-Object { $Commit.StartsWith($_) }).Count -gt 0 }
+function Get-ReleaseNotes([string]$Version, [string]$Previous, [string]$Commit) {
+    $taskChanges = @(git log -1 --format=%b $Commit | Where-Object { $_.StartsWith('- ') })
+    if ($taskChanges.Count -eq 0) { $taskChanges = @("- $(git log -1 --format=%s $Commit)") }
+    $taskRepository = 'https://github.com/riggs9162/SourceCubemap'
+    @(
+        '## What changed', '', ($taskChanges -join "`n"), '',
+        '## Install', '',
+        "1. Download ``SourceCubemap-$Version-windows-x64.zip`` below and unzip it anywhere.",
+        '2. Run `sourcecubemap-gui.exe`, or use `sourcecubemap.exe` from a terminal.', '',
+        "You need 64-bit Windows 10 or 11 and a graphics driver with Vulkan 1.3. The [README]($taskRepository/blob/$Version/README.md) has a full walkthrough.", '',
+        "[All changes since $Previous]($taskRepository/compare/$Previous...$Version)"
+    ) -join "`n"
+}
 function Get-NextVersion([string]$Previous, [string]$Commit) {
     if (!$Previous) {
         $taskProject = [regex]::Match((Get-Content -Raw 'CMakeLists.txt'), 'project\(SourceCubemap VERSION (\d+)\.(\d+)\.\d+')
@@ -77,13 +90,12 @@ try {
         Assert-Success "Packaging $taskVersion"
         Compress-Archive -Path (Join-Path $taskFolder 'SourceCubemap') -DestinationPath $taskArchive
         $taskSubject = git log -1 --format=%s $taskCommit
-        $taskBody = (git log -1 --format=%b $taskCommit | Out-String).Trim()
-        [IO.File]::WriteAllText($taskNotesFile, "$taskSubject`n`n$taskBody".Trim())
+        [IO.File]::WriteAllText($taskNotesFile, (Get-ReleaseNotes $taskVersion $taskLast $taskCommit))
         git tag $taskVersion $taskCommit
         Assert-Success "Tagging $taskVersion"
         git push --quiet origin "refs/tags/$taskVersion"
         Assert-Success "Pushing $taskVersion"
-        & $taskGh release create $taskVersion $taskArchive --title $taskVersion --notes-file $taskNotesFile --verify-tag --latest
+        & $taskGh release create $taskVersion $taskArchive --title "${taskVersion}: $taskSubject" --notes-file $taskNotesFile --verify-tag --latest
         Assert-Success "Publishing $taskVersion"
         $taskLast = $taskVersion
     }
