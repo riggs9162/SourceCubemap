@@ -1,6 +1,8 @@
 #include <scm/bsp.hpp>
 #include <Windows.h>
+#include <atomic>
 #include <future>
+#include <thread>
 #include <set>
 #include <bit>
 #include <vtfpp/VTF.h>
@@ -20,17 +22,31 @@ uint64_t gameLumpEnd(const Reader& directory, size_t entry, uint32_t index, uint
     auto next = directory.at<uint32_t>(entry + 24);
     return next ? next : container;
 }
-/// Reads an LZMA entry written without an end marker, as Valve's repacker does. The decoder cannot detect its end, so the entry is read to its recorded size and checked here.
-bool readUnterminatedLzma(void* archive, const mz_zip_file& info, Bytes& payload) {
-    if (mz_zip_reader_entry_open(archive) != MZ_OK) { return false; }
+/// One independent reader over the embedded ZIP, so several threads can decompress entries from the same memory.
+struct ZipView {
+    void* stream = mz_stream_mem_create();
+    void* zip = mz_zip_create();
+    explicit ZipView(std::span<const std::byte> data) {
+        require(stream && zip, "Cannot allocate an embedded ZIP reader.");
+        mz_stream_mem_open(stream, nullptr, MZ_OPEN_MODE_READ);
+        mz_stream_mem_set_buffer(stream, const_cast<std::byte*>(data.data()), static_cast<int32_t>(data.size()));
+        require(mz_zip_open(zip, stream, MZ_OPEN_MODE_READ) == MZ_OK, "The embedded ZIP archive cannot be read.");
+    }
+    ~ZipView() { mz_zip_close(zip); mz_zip_delete(&zip); mz_stream_mem_delete(&stream); }
+    ZipView(const ZipView&) = delete;
+    ZipView& operator=(const ZipView&) = delete;
+};
+/// Decompresses one entry to its recorded size and checks its CRC here, because Valve's repacker writes LZMA entries without an end marker that the decoder could detect.
+bool readZipEntry(void* zip, int64_t position, uint32_t crc, Bytes& payload) {
+    if (mz_zip_goto_entry(zip, position) != MZ_OK || mz_zip_entry_read_open(zip, 0, nullptr) != MZ_OK) { return false; }
     size_t offset = 0;
     while (offset < payload.size()) {
-        auto read = mz_zip_reader_entry_read(archive, payload.data() + offset, static_cast<int32_t>(payload.size() - offset));
-        if (read <= 0) { mz_zip_reader_entry_close(archive); return false; }
+        auto read = mz_zip_entry_read(zip, payload.data() + offset, static_cast<int32_t>(payload.size() - offset));
+        if (read <= 0) { mz_zip_entry_close(zip); return false; }
         offset += static_cast<size_t>(read);
     }
-    mz_zip_reader_entry_close(archive);
-    return mz_crypt_crc32_update(0, reinterpret_cast<const uint8_t*>(payload.data()), static_cast<int32_t>(payload.size())) == info.crc;
+    mz_zip_entry_close(zip);
+    return payload.empty() || mz_crypt_crc32_update(0, reinterpret_cast<const uint8_t*>(payload.data()), static_cast<int32_t>(payload.size())) == crc;
 }
 }
 void validateVtf(std::span<const std::byte> data, std::string_view name) {
@@ -133,31 +149,35 @@ Bsp::Bsp(const fs::path& filename) : path(fs::absolute(filename)), bytes(readFil
         probes.push_back(probe);
     }
     entities = source->getLumpData<bsppp::BSPLump::ENTITIES>();
-    auto zip = lump(40);
+    auto zip = view(40);
     if (!zip.empty()) {
-        struct ZipReader { void* handle = mz_zip_reader_create(); ~ZipReader() { mz_zip_reader_delete(&handle); } } archive;
-        require(archive.handle && zip.size() <= INT32_MAX && mz_zip_reader_open_buffer(archive.handle, reinterpret_cast<const uint8_t*>(zip.data()), static_cast<int32_t>(zip.size()), 0) == MZ_OK, "The embedded ZIP archive cannot be read.");
-        uint64_t totalSize = 0; auto status = mz_zip_reader_goto_first_entry(archive.handle);
-        for (; status == MZ_OK; status = mz_zip_reader_goto_next_entry(archive.handle)) {
-            if (mz_zip_reader_entry_is_dir(archive.handle) == MZ_OK) { continue; }
+        struct PendingEntry { const std::string* name; int64_t position; uint32_t crc; Bytes* payload; };
+        std::vector<PendingEntry> pending;
+        require(zip.size() <= INT32_MAX, "The embedded ZIP archive cannot be read.");
+        ZipView directory(zip);
+        uint64_t totalSize = 0; auto status = mz_zip_goto_first_entry(directory.zip);
+        for (; status == MZ_OK; status = mz_zip_goto_next_entry(directory.zip)) {
+            if (mz_zip_entry_is_dir(directory.zip) == MZ_OK) { continue; }
             mz_zip_file* info = nullptr;
-            require(mz_zip_reader_entry_get_info(archive.handle, &info) == MZ_OK && info, "Cannot read an embedded ZIP directory record.");
+            require(mz_zip_entry_get_info(directory.zip, &info) == MZ_OK && info, "Cannot read an embedded ZIP directory record.");
             auto name = assetPath(info->filename);
             require(!pakNames.contains(name), "Duplicate embedded path: {}", name);
             require(info->uncompressed_size >= 0 && info->uncompressed_size <= (1ll << 30), "An embedded ZIP entry exceeds the 1 GiB memory limit.");
             totalSize += static_cast<uint64_t>(info->uncompressed_size);
             require(totalSize <= (2ull << 30), "The expanded BSP PAK exceeds the 2 GiB memory limit.");
-            Bytes payload(static_cast<size_t>(info->uncompressed_size));
-            if (payload.empty()) {
-                require(mz_zip_reader_entry_open(archive.handle) == MZ_OK && mz_zip_reader_entry_close(archive.handle) == MZ_OK, "Embedded ZIP entry failed validation: {}", name);
-            } else if (info->compression_method == MZ_COMPRESS_METHOD_LZMA && !(info->flag & MZ_ZIP_FLAG_LZMA_EOS_MARKER)) {
-                require(readUnterminatedLzma(archive.handle, *info, payload), "Embedded ZIP entry failed decompression or checksum validation: {}", name);
-            } else {
-                require(mz_zip_reader_entry_save_buffer(archive.handle, payload.data(), static_cast<int32_t>(payload.size())) == MZ_OK, "Embedded ZIP entry failed decompression or checksum validation: {}", name);
-            }
-            pakNames.emplace(name, info->filename); pakData.emplace(std::move(name), std::move(payload));
+            pakNames.emplace(name, info->filename);
+            auto [entry, inserted] = pakData.emplace(std::move(name), Bytes(static_cast<size_t>(info->uncompressed_size)));
+            pending.push_back({&entry->first, mz_zip_get_entry(directory.zip), info->crc, &entry->second});
         }
         require(status == MZ_END_OF_LIST, "The embedded ZIP directory is truncated or invalid.");
+        std::atomic_size_t next = 0;
+        parallelFor(std::min<size_t>(pending.size(), std::max(1u, std::thread::hardware_concurrency())), [&](size_t) {
+            ZipView worker(zip);
+            for (size_t i = next++; i < pending.size(); i = next++) {
+                const auto& entry = pending[i];
+                require(readZipEntry(worker.zip, entry.position, entry.crc, *entry.payload), "Embedded ZIP entry failed decompression or checksum validation: {}", *entry.name);
+            }
+        });
     }
 }
 
