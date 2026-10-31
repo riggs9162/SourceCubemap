@@ -216,7 +216,7 @@ bool WorldLighting::visible(glm::vec3 start, glm::vec3 end, bool sky) const {
 }
 
 PropLighting WorldLighting::sample(glm::vec3 position) const {
-    struct Candidate { float strength; PropLight light; };
+    struct Candidate { float strength; const Light* source; glm::vec3 direction, factors; };
     std::vector<Candidate> candidates;
     for (const auto& light : lights) {
         if (light.type == 5 || light.type == 4 || (light.flags & 1)) { continue; }
@@ -235,16 +235,19 @@ PropLighting WorldLighting::sample(glm::vec3 position) const {
         }
         float strength = std::max({light.intensity.r, light.intensity.g, light.intensity.b}) * attenuation;
         if (strength < 0.0001f) { continue; }
-        if (!visible(position + direction * 0.05f, light.type == 3 ? position + direction * 131072.0f : light.origin, light.type == 3)) { continue; }
-        PropLight result;
-        result.positionType = {light.type == 3 ? direction : light.origin, light.type == 3 ? 1.0f : light.type == 2 ? 2.0f : 0.0f};
-        result.color = {light.intensity, light.inner}; result.attenuation = {factors, light.exponent}; result.directionCone = {light.normal, light.outer};
-        if (light.type == 0) { result.color *= std::max(0.0f, glm::dot(-direction, light.normal)); }
-        candidates.push_back({strength, result});
+        candidates.push_back({strength, &light, direction, factors});
     }
     std::stable_sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.strength > b.strength; });
-    PropLighting result; result.count = static_cast<uint32_t>(std::min(candidates.size(), result.lights.size()));
-    for (uint32_t i = 0; i < result.count; ++i) { result.lights[i] = candidates[i].light; }
+    PropLighting result;
+    for (const auto& candidate : candidates) {
+        if (result.count == result.lights.size()) { break; }
+        const auto& light = *candidate.source; auto direction = candidate.direction;
+        if (!visible(position + direction * 0.05f, light.type == 3 ? position + direction * 131072.0f : light.origin, light.type == 3)) { continue; }
+        auto& selected = result.lights[result.count++];
+        selected.positionType = {light.type == 3 ? direction : light.origin, light.type == 3 ? 1.0f : light.type == 2 ? 2.0f : 0.0f};
+        selected.color = {light.intensity, light.inner}; selected.attenuation = {candidate.factors, light.exponent}; selected.directionCone = {light.normal, light.outer};
+        if (light.type == 0) { selected.color *= std::max(0.0f, glm::dot(-direction, light.normal)); }
+    }
     return result;
 }
 }
