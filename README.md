@@ -1,5 +1,7 @@
 # SourceCubemap
 
+English | [Deutsch](docs/translations/README.de.md) | [Español](docs/translations/README.es.md) | [Français](docs/translations/README.fr.md) | [Português (Brasil)](docs/translations/README.pt-BR.md) | [Русский](docs/translations/README.ru.md) | [简体中文](docs/translations/README.zh-CN.md)
+
 Generate cubemaps for Source Engine maps in seconds, without launching the game.
 
 SourceCubemap reads a compiled `.bsp` and your installed game content, renders every cubemap on your graphics card, and writes a new `.bsp` with the cubemaps built in. Your original map is left alone.
