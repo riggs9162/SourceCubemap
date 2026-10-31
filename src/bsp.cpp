@@ -13,7 +13,7 @@
 
 namespace scm {
 void validateVtf(std::span<const std::byte> data, std::string_view name) {
-    Reader reader(data, std::string(name));
+    Reader reader(data, name);
     require(data.size() >= 64 && reader.at<uint32_t>(0) == 0x00465456 && reader.at<uint32_t>(4) == 7, "Invalid VTF header: {}", name);
     auto minor = reader.at<uint32_t>(8), header = reader.at<uint32_t>(12);
     require(minor <= 5 && header >= (minor >= 2 ? 65u : 64u) && header <= data.size(), "Unsupported or truncated VTF header: {}", name);
@@ -55,7 +55,8 @@ void validateVtf(std::span<const std::byte> data, std::string_view name) {
 std::string Probe::name() const { return std::format("c{}_{}_{}", origin.x, origin.y, origin.z); }
 
 Bsp::Bsp(const fs::path& filename) : path(fs::absolute(filename)), bytes(readFile(path)) {
-    Reader header(bytes, path.string());
+    auto label = path.string();
+    Reader header(bytes, label);
     require(bytes.size() >= 1036 && header.at<uint32_t>(0) == 0x50534256, "Expected a desktop Source BSP header.");
     require(header.at<uint32_t>(4) == 20, "Only desktop Source BSP v20 is currently supported.");
     std::vector<std::pair<uint64_t, uint64_t>> intervals;

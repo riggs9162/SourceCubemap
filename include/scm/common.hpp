@@ -48,10 +48,12 @@ void parallelFor(size_t count, const std::function<void(size_t)>& body);
 glm::vec3 parseVector(std::string_view value, glm::vec3 fallback = {});
 float parseFloat(std::string_view value, float fallback = 0.0f);
 
-/// Reads little-endian fields after checking the complete requested byte range.
+/// Reads little-endian fields after checking the complete requested byte range. The label is borrowed and must outlive the reader.
 class Reader {
 public:
-    explicit Reader(std::span<const std::byte> bytes, std::string context = "binary data") : data(bytes), label(std::move(context)) {}
+    explicit Reader(std::span<const std::byte> bytes, const char* context = "binary data") : data(bytes), label(context) {}
+    Reader(std::span<const std::byte> bytes, std::string_view context) : data(bytes), label(context) {}
+    Reader(std::span<const std::byte> bytes, std::string&& context) = delete;
     template<class T> T at(size_t offset) const {
         static_assert(std::is_trivially_copyable_v<T>);
         require(offset <= data.size() && sizeof(T) <= data.size() - offset, "Truncated {} at byte {}.", label, offset);
@@ -64,7 +66,7 @@ public:
     std::string string(size_t offset, size_t limit) const;
     size_t cursor = 0;
     std::span<const std::byte> data;
-    std::string label;
+    std::string_view label;
 };
 
 class TemporaryFile {
