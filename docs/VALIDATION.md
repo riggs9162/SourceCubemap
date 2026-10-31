@@ -73,3 +73,22 @@ Version 0.3 measurements before the storage-limit change include a Flatgrass reg
 At approximately 13:57 local time on 2026-10-28, Windows reported an AHCI controller reset, unexpected removal of disk 1, and an NTFS delayed metadata write failure. S: became unavailable, preventing further HL2 native acceptance. Generation and benchmarking were stopped. Read-only evidence does not establish which workload caused the drive failure. No drive repair, reinitialization, remount, or reboot was attempted in this continuation.
 
 About 42 GiB of generated cache/test output was identified for cleanup after the user requested it. Automatic approval review rejected deletion even after explicit confirmation. A reviewed PowerShell cleanup script was supplied for the user to run; deletion has not been claimed as completed. Source, executable builds, test scripts, and delivered BSPs are excluded.
+
+## Version 0.4.0 speed and compatibility
+
+Recorded on 2026-10-31 on the hardware above. All runs used `--profile hl2`, `--experimental`, `--water planar`, and `--hdr auto` against locally installed content, with no game process running. Another desktop process held about 38% GPU utilization during measurement, so these are shared-GPU figures. Baseline is commit `184d56c`. Times are external wall-clock medians with the application cache disabled.
+
+| Map | Probes | 0.3.0 runs | 0.3.0 median | 0.4.0 runs | 0.4.0 median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| gm_flatgrass | 8 | 3 | 6.34 s | 5 | 0.92 s |
+| gm_construct | 28 | 3 | 20.46 s | 5 | 0.91 s |
+
+Other maps, three runs each: vault_example 0.64 s, rp_city17_hlvr 0.45 s, d3_c17_10a&b 1.35 s, gm_coast_bridge 2.00 s, cvr_overwatch 2.66 s, gm_city17_ravenholm (795 probes) 4.63 s, and a 261 MiB compressed map 4.01 s.
+
+With a persistent cache, Flatgrass took 1.17 s on an empty cache, 0.94 s warm, and 0.65 s for unchanged incremental reuse. Construct took 1.97 s, 0.84 s, and 0.42 s. Construct uploads 225 MiB of textures, down from 888 MiB, and reuses 100 textures between its LDR and HDR variants. GPU time for its 56 captures is 0.055 s.
+
+Sending compressed textures directly to the GPU changes output slightly, because GPU BC decoding differs from the previous CPU decoder. Against 0.3.0 on Flatgrass and Construct, mean top-mip difference is about 0.33 of 255 levels in LDR and 0.3-0.5% in HDR. On Construct, 13% of LDR pixels differ by more than 2 levels and 1.9% by more than 8; 12% of HDR pixels differ by more than 1%. The largest differences reach 166 levels and 88% on a handful of pixels. Inspected worst cases sit on hard edges or DXT1 block choices at low resolution, with no wrong texture or mip. The game also decodes these textures on the GPU, but no native comparison has been made for this change, and results can vary a little between GPU vendors.
+
+The other 0.4.0 speed work kept generated cubemaps byte-identical when measured on its own against Flatgrass and Construct. Forty-two local automated tests pass. Vulkan validation layers were not available, so barriers and copy rules were not checked by them.
+
+A build of every BSP on the local drive passed 10 of 28 maps with experimental rendering. Fourteen stop on missing assets because content mounted from `mount.cfg` was deliberately excluded from this run, and four contain no cubemap samples. The Garry's Mod profile was exercised only with a fixture game directory, not with installed content, so lightmapped Phong has no in-game or native comparison yet. Sprite rendering and glow falloff are also uncompared.
