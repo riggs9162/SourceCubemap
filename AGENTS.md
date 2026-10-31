@@ -14,6 +14,8 @@ Decide the kind of each unreleased commit yourself and list it. Commits that are
 
 The script builds each unreleased commit on its own in `build/publish`, then creates a tag and a GitHub release with that commit's Windows download attached. Every release must carry its own build. Commits starting with `[skip]` are not released. Report the release number and link at the end of the session, or say plainly why no release was made.
 
+When the user asks for several commits to ship as one release, add `-Together -Title "<title>"`. The script then builds only the last of them, and all of their bullets become the notes. List the commit that sets the number in `-Minor` or `-Major` as usual.
+
 Release titles are the number and the commit subject, such as `0.5.00: Keep experimental builds going when assets are missing`. The `- ` bullets in the commit body become the release notes, so write them for players and server staff. Technical lines without a bullet stay out of the notes.
 
 Release numbers are always `A.B.cc`, such as `0.4.07`, with no prefix, and the tag, download, and program version all use the same number.
