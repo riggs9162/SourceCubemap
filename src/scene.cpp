@@ -15,7 +15,7 @@
 
 namespace scm {
 namespace {
-template<class T> std::vector<T> records(const Bytes& bytes, std::string_view label) {
+template<class T> std::vector<T> records(std::span<const std::byte> bytes, std::string_view label) {
     require(bytes.size() % sizeof(T) == 0, "Unsupported {} record layout.", label);
     std::vector<T> result(bytes.size() / sizeof(T));
     std::memcpy(result.data(), bytes.data(), bytes.size());
@@ -478,7 +478,7 @@ public:
     const Bsp& bsp;
     Assets& assets;
     SceneOptions options;
-    Bytes nodesData, planeData, leafData, leafFaceData, visData, lightData;
+    std::span<const std::byte> nodesData, planeData, leafData, leafFaceData, visData, lightData;
     std::set<uint32_t> skyFaces;
     int skyArea = -1;
     std::map<std::string, uint32_t> textureIds, materialIds;
@@ -499,20 +499,22 @@ Scene Builder::build() {
         bool runtimeEffect = type == "move_rope" || type == "keyframe_rope" || type == "env_sprite" || type == "env_beam" || type == "env_smokestack" || type == "env_fire" || type == "info_particle_system" || type == "func_smokevolume";
         if (runtimeModel || runtimeEffect) { unsupported(std::format("Runtime-dependent entity '{}' ({}) is not rendered.", type, model.empty() ? std::string(entity["origin"].getValue()) : model)); }
     }
+    std::vector<int> sceneLumps{1, 2, 3, 4, 5, 6, 10, 12, 13, 14, 16, 17, 18, 19, 26, 33, 36, 37, 38, 39, 43, 44};
+    sceneLumps.insert(sceneLumps.end(), {options.hdr ? 53 : 8, options.hdr ? 54 : 15, options.hdr ? 51 : 52, options.hdr ? 55 : 56, options.hdr && bsp.lumps[58].length ? 58 : 7});
+    bsp.decodeLumps(sceneLumps);
     require(bsp.lumps[7].version == 1 && bsp.lumps[10].version == 1, "Only face v1 and leaf v1 layouts are supported.");
     if (options.hdr && bsp.lumps[58].length) { require(bsp.lumps[58].version == 1, "Unsupported HDR face layout."); }
     for (auto [id, stride] : std::array<std::pair<int, size_t>, 17>{{{1,20},{2,32},{3,12},{5,32},{6,72},{12,4},{13,4},{14,48},{16,2},{26,176},{33,20},{37,10},{38,12},{39,2},{43,1},{44,4},{48,2}}}) {
-        require(bsp.lumps[id].version == 0 && bsp.lump(id).size() % stride == 0, "Unsupported record version or stride in lump {}.", id);
+        require(bsp.lumps[id].version == 0 && bsp.view(id).size() % stride == 0, "Unsupported record version or stride in lump {}.", id);
     }
-    require(bsp.lump(10).size() % 32 == 0, "Leaf data has a partial record.");
-    auto faceData = bsp.lump(options.hdr && bsp.lumps[58].length ? 58 : 7);
-    auto faces = records<bsppp::BSPFace_v1>(faceData, "faces");
-    auto points = bsp.source->getLumpData<bsppp::BSPLump::VERTEXES>();
-    auto edges = bsp.source->getLumpData<bsppp::BSPLump::EDGES>();
-    auto surfEdges = bsp.source->getLumpData<bsppp::BSPLump::SURFEDGES>();
-    auto texInfo = bsp.source->getLumpData<bsppp::BSPLump::TEXINFO>();
-    auto texData = bsp.source->getLumpData<bsppp::BSPLump::TEXDATA>();
-    auto brushModels = bsp.source->getLumpData<bsppp::BSPLump::MODELS>();
+    require(bsp.view(10).size() % 32 == 0, "Leaf data has a partial record.");
+    auto faces = records<bsppp::BSPFace_v1>(bsp.view(options.hdr && bsp.lumps[58].length ? 58 : 7), "faces");
+    auto points = records<bsppp::BSPVertex_v0>(bsp.view(3), "vertices");
+    auto edges = records<bsppp::BSPEdge_v0>(bsp.view(12), "edges");
+    auto surfEdges = records<bsppp::BSPSurfEdge_v0>(bsp.view(13), "surface edges");
+    auto texInfo = records<bsppp::BSPTextureInfo_v0>(bsp.view(6), "texture information");
+    auto texData = records<bsppp::BSPTextureData_v0>(bsp.view(2), "texture data");
+    auto brushModels = records<bsppp::BSPBrushModel_v0>(bsp.view(14), "brush models");
     require(!brushModels.empty(), "The BSP has no world model.");
     struct BrushState { glm::mat4 matrix{1}; glm::vec4 color{1}; bool hidden = false; int renderMode = 0; };
     std::vector<BrushState> brushStates(brushModels.size());
@@ -567,9 +569,9 @@ Scene Builder::build() {
         require(model.firstFace >= 0 && model.numFaces >= 0 && size_t(model.firstFace) + model.numFaces <= faces.size(), "Brush model face range is invalid.");
         for (int i = 0; i < model.numFaces; ++i) { faceModels[model.firstFace + i] = static_cast<uint32_t>(m); }
     }
-    nodesData = bsp.lump(5); planeData = bsp.lump(1); leafData = bsp.lump(10); leafFaceData = bsp.lump(16); visData = bsp.lump(4);
+    nodesData = bsp.view(5); planeData = bsp.view(1); leafData = bsp.view(10); leafFaceData = bsp.view(16); visData = bsp.view(4);
     if (options.planarWater && bsp.lumps[36].length) {
-        auto waterData = bsp.lump(36); Reader water(waterData, "water volumes");
+        auto waterData = bsp.view(36); Reader water(waterData, "water volumes");
         require(bsp.lumps[36].version == 0 && waterData.size() % 12 == 0, "Unsupported water volume layout.");
         scene.hasWater = true; scene.waterHeight = water.at<float>(0);
         require(std::isfinite(scene.waterHeight), "Invalid water surface height.");
@@ -579,10 +581,10 @@ Scene Builder::build() {
         scene.diagnostics["warnings"].push_back("Water secondary views omit translucent and additive surfaces. Underwater fog uses the above-water material settings.");
         scene.diagnostics["water"] = {{"mode", "planar"}, {"surface_height", scene.waterHeight}, {"reflection_levels", 1}};
     }
-    lightData = bsp.lump(options.hdr ? 53 : 8);
+    lightData = bsp.view(options.hdr ? 53 : 8);
     require(!lightData.empty(), "Requested compiled lighting is missing.");
-    auto stringsData = bsp.lump(43), stringOffsets = bsp.lump(44), displacements = bsp.lump(26), dispVertices = bsp.lump(33);
-    auto primitiveData = bsp.lump(37), primitiveVertexData = bsp.lump(38), primitiveIndexData = bsp.lump(39);
+    auto stringsData = bsp.view(43), stringOffsets = bsp.view(44), displacements = bsp.view(26), dispVertices = bsp.view(33);
+    auto primitiveData = bsp.view(37), primitiveVertexData = bsp.view(38), primitiveIndexData = bsp.view(39);
     Reader primitives(primitiveData, "primitives"), primitiveVertices(primitiveVertexData, "primitive vertices"), primitiveIndices(primitiveIndexData, "primitive indices");
     require(primitiveData.size() % 10 == 0 && primitiveVertexData.size() % 12 == 0 && primitiveIndexData.size() % 2 == 0, "Unsupported compiled primitive layout.");
     Reader strings(stringsData, "material names"), offsets(stringOffsets, "material string offsets"), planes(planeData, "planes"), disp(displacements, "displacements"), dispVerts(dispVertices, "displacement vertices");
@@ -786,7 +788,7 @@ void Builder::addProps() {
     require((version >= 4 && version <= 6) || version == 10, "Unsupported static-prop layout v{}.", version);
     size_t stride = version == 4 ? 56 : version == 5 ? 60 : version == 6 ? 64 : 72;
     require(data.size() - reader.cursor == size_t(count) * stride, "Static-prop byte count does not match its version.");
-    auto ambientIndexData = bsp.lump(options.hdr ? 51 : 52), ambientSampleData = bsp.lump(options.hdr ? 55 : 56);
+    auto ambientIndexData = bsp.view(options.hdr ? 51 : 52), ambientSampleData = bsp.view(options.hdr ? 55 : 56);
     WorldLighting worldLighting(bsp, options.hdr);
     uint32_t bakedProps = 0, ambientProps = 0;
     Reader ambientIndices(ambientIndexData, "leaf ambient indices"), ambientSamples(ambientSampleData, "leaf ambient samples"), leavesReader(leafData, "prop leaves");
@@ -929,7 +931,7 @@ void Builder::addProps() {
 }
 
 void Builder::addSky() {
-    auto info = bsp.source->getLumpData<bsppp::BSPLump::TEXINFO>();
+    auto info = records<bsppp::BSPTextureInfo_v0>(bsp.view(6), "texture information");
     bool hasSky = std::any_of(info.begin(), info.end(), [](const auto& item) { return (item.flags & 6) != 0; });
     if (!hasSky && !options.defaultSky) { return; }
     std::string name;

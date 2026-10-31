@@ -151,6 +151,34 @@ Bytes Bsp::lump(int index) const {
     return std::move(*result);
 }
 
+std::span<const std::byte> Bsp::view(int index) const {
+    require(index >= 0 && index < 64, "Invalid BSP lump index.");
+    const auto& item = lumps[index];
+    if (!item.length) { return {}; }
+    if (!item.uncompressed) { return std::span<const std::byte>(bytes).subspan(item.offset, item.length); }
+    decodeLumps({&index, 1});
+    std::scoped_lock lock(decodedLock);
+    return decoded.at(index);
+}
+
+void Bsp::decodeLumps(std::span<const int> indices) const {
+    std::vector<int> pending;
+    {
+        std::scoped_lock lock(decodedLock);
+        for (int index : indices) { if (lumps[index].length && lumps[index].uncompressed && !decoded.contains(index)) { pending.push_back(index); } }
+    }
+    std::vector<Bytes> results(pending.size());
+    parallelFor(pending.size(), [&](size_t i) {
+        const auto& item = lumps[pending[i]];
+        auto result = sourcepp::compression::decompressValveLZMA(std::span<const std::byte>(bytes).subspan(item.offset, item.length));
+        require(result.has_value(), "Cannot decode lump {}.", pending[i]);
+        require(result->size() == item.uncompressed, "Decompressed lump size mismatch.");
+        results[i] = std::move(*result);
+    });
+    std::scoped_lock lock(decodedLock);
+    for (size_t i = 0; i < pending.size(); ++i) { decoded.emplace(pending[i], std::move(results[i])); }
+}
+
 std::optional<Bytes> Bsp::embedded(std::string_view name) const {
     auto key = assetPath(std::string(name));
     auto found = pakData.find(key);

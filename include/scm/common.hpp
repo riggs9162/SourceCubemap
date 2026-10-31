@@ -1,17 +1,21 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <format>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #include <glm/glm.hpp>
 #include <nlohmann/json.hpp>
@@ -68,6 +72,26 @@ public:
     std::span<const std::byte> data;
     std::string_view label;
 };
+
+/// Runs body(index) for every index on worker threads, then rethrows the first failure once all workers have stopped.
+template<class Body> void parallelFor(size_t count, Body&& body) {
+    std::atomic_size_t next{0};
+    std::exception_ptr failure;
+    std::mutex failureLock;
+    auto worker = [&] {
+        for (size_t index = next++; index < count; index = next++) {
+            try { body(index); }
+            catch (...) { std::scoped_lock lock(failureLock); if (!failure) { failure = std::current_exception(); } next = count; }
+        }
+    };
+    {
+        std::vector<std::jthread> helpers;
+        auto workers = std::min<size_t>(count, std::max(1u, std::thread::hardware_concurrency()));
+        for (size_t i = 1; i < workers; ++i) { helpers.emplace_back(worker); }
+        worker();
+    }
+    if (failure) { std::rethrow_exception(failure); }
+}
 
 class TemporaryFile {
 public:

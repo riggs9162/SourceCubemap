@@ -23,6 +23,6 @@ private:
     };
     bool visible(glm::vec3 start, glm::vec3 end, bool sky) const;
     std::vector<Light> lights;
-    Bytes nodes, planes, leaves, brushes, brushSides, leafBrushes, texInfo;
+    std::span<const std::byte> nodes, planes, leaves, brushes, brushSides, leafBrushes, texInfo;
 };
 }

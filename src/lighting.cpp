@@ -109,10 +109,10 @@ std::vector<VertexLightingMesh> readVertexLighting(std::span<const std::byte> by
 }
 
 WorldLighting::WorldLighting(const Bsp& bsp, bool hdr)
-    : nodes(bsp.lump(5)), planes(bsp.lump(1)), leaves(bsp.lump(10)), brushes(bsp.lump(18)), brushSides(bsp.lump(19)), leafBrushes(bsp.lump(17)), texInfo(bsp.lump(6)) {
+    : nodes(bsp.view(5)), planes(bsp.view(1)), leaves(bsp.view(10)), brushes(bsp.view(18)), brushSides(bsp.view(19)), leafBrushes(bsp.view(17)), texInfo(bsp.view(6)) {
     int id = hdr ? 54 : 15;
     auto styles = initialLightStyles(bsp);
-    auto bytes = bsp.lump(id); Reader reader(bytes, "world lights");
+    auto bytes = bsp.view(id); Reader reader(bytes, "world lights");
     require(bsp.lumps[id].version == 0 && bytes.size() % 88 == 0, "Unsupported world-light record layout.");
     require(brushes.size() % 12 == 0 && brushSides.size() % 8 == 0 && leafBrushes.size() % 2 == 0, "Unsupported lighting trace brush layout.");
     for (size_t offset = 0; offset < bytes.size(); offset += 88) {
