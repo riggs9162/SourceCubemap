@@ -161,7 +161,7 @@ private:
 };
 
 /// A texture whose asset is resolved and whose VTF decoding waits for the parallel pass at the end of the build.
-struct PendingTexture { uint32_t index; std::shared_ptr<const Asset> asset; bool srgb; int frame; };
+struct PendingTexture { uint32_t index; std::shared_ptr<const Asset> asset; bool srgb; int frame; std::vector<std::string> notes; };
 class Builder {
 public:
     Builder(const Bsp& input, Assets& resolver, const SceneOptions& settings) : bsp(input), assets(resolver), options(settings) {
@@ -187,6 +187,10 @@ public:
     uint32_t texture(std::string name, bool srgb, std::string_view requester, int frame = -1) {
         if (name.empty()) { return 0; }
         name = assetPath(name);
+        if (name.starts_with("_rt_") || name.starts_with("materials/_rt_")) {
+            approximate(std::format("Render target '{}' requested by '{}' is unavailable and renders white.", name, requester));
+            return 0;
+        }
         if (!name.starts_with("materials/")) { name = "materials/" + name; }
         if (!name.ends_with(".vtf")) { name += ".vtf"; }
         std::string key = name + (srgb ? ":srgb" : ":linear") + std::format(":{}", frame);
@@ -198,22 +202,26 @@ public:
         textureIds.emplace(key, index);
         return index;
     }
-    void decodeTexture(const PendingTexture& pending) {
+    void decodeTexture(PendingTexture& pending) {
         auto& image = scene.images[pending.index];
         const auto& name = image.name;
         const auto& bytes = pending.asset->bytes;
         validateVtf(bytes, name);
         vtfpp::VTF vtf(bytes, false, options.hdr);
         require(static_cast<bool>(vtf), "Invalid texture {}.", name);
-        require(vtf.getFrameCount() == 1 || pending.frame >= 0, "Animated VTF is not supported yet: {}", name);
-        require(std::max(pending.frame, 0) < vtf.getFrameCount(), "Texture frame is out of range: {}", name);
-        require(vtf.getFaceCount() == 1 && vtf.getDepth() == 1, "Expected a 2D texture: {}", name);
+        int requestedFrame = pending.frame;
+        if (vtf.getFrameCount() != 1 && requestedFrame < 0) { pending.notes.push_back(std::format("Animated VTF '{}' uses its first frame.", name)); }
+        if (std::max(requestedFrame, 0) >= vtf.getFrameCount()) {
+            pending.notes.push_back(std::format("Texture frame {} of '{}' is out of range and wraps.", requestedFrame, name));
+            requestedFrame %= vtf.getFrameCount();
+        }
+        if (vtf.getFaceCount() != 1 || vtf.getDepth() != 1) { pending.notes.push_back(std::format("Non-2D texture '{}' uses its first face.", name)); }
         auto format = vtf.getFormat();
         bool floating = format == vtfpp::ImageFormat::RGBA16161616F || format == vtfpp::ImageFormat::RGB323232F || format == vtfpp::ImageFormat::RGBA32323232F;
         image.width = vtf.getWidth(); image.height = vtf.getHeight(); image.srgb = pending.srgb && !floating;
         image.mipCount = vtf.getMipCount();
         image.clamp = (vtf.getFlags() & (vtfpp::VTF::FLAG_V0_CLAMP_S | vtfpp::VTF::FLAG_V0_CLAMP_T)) != 0;
-        auto frame = static_cast<uint16_t>(std::max(pending.frame, 0));
+        auto frame = static_cast<uint16_t>(std::max(requestedFrame, 0));
         auto mipWidth = [&](uint32_t mip) { return std::max(1u, image.width >> mip); };
         auto mipHeight = [&](uint32_t mip) { return std::max(1u, image.height >> mip); };
         auto direct = directFormat(format);
@@ -254,6 +262,7 @@ public:
     }
     void finishImages() {
         parallelFor(pendingTextures.size(), [&](size_t i) { decodeTexture(pendingTextures[i]); });
+        for (auto& pending : pendingTextures) { for (auto& note : pending.notes) { approximate(std::move(note)); } }
         parallelFor(lightmapPages.size(), [&](size_t i) { storeFloatPixels(scene.images[lightmapPages[i].first], std::move(lightmapPages[i].second)); });
     }
     uint32_t material(std::string name) {
@@ -266,25 +275,34 @@ public:
         if (shader == "sdk_lightmappedgeneric" || shader == "sdk_unlitgeneric" || shader == "sdk_vertexlitgeneric" || shader == "sdk_worldvertextransition") {
             require(options.experimental, "SDK shader '{}' in '{}' requires --experimental; custom shader extensions are not certified.", shader, name);
             shader.erase(0, 4);
-            scene.diagnostics["warnings"].push_back(std::format("SDK shader '{}' in '{}' uses the supported '{}' parameters; custom extensions may differ.", definition.shader, name, shader));
+            warn(std::format("SDK shader '{}' in '{}' uses the supported '{}' parameters; custom extensions may differ.", definition.shader, name, shader));
         }
+        auto store = [&] {
+            uint32_t index = static_cast<uint32_t>(scene.materials.size());
+            scene.materials.push_back(std::move(material)); materialIds.emplace(name, index);
+            return index;
+        };
         if (shader == "lightmappedreflective") {
             require(options.experimental, "Planar glass reflections are not implemented for '{}'.", name);
-            scene.diagnostics["warnings"].push_back(std::format("Planar reflective glass '{}' is omitted in experimental captures.", name));
+            warn(std::format("Planar reflective glass '{}' is omitted in experimental captures.", name));
             material.flags = Omitted;
-            uint32_t index = static_cast<uint32_t>(scene.materials.size()); scene.materials.push_back(std::move(material)); materialIds.emplace(name, index); return index;
+            return store();
         }
         if (shader == "water") {
-            require(options.planarWater && options.experimental, "Water '{}' requires --water planar --experimental. Native water parity is not certified.", name);
-            material.water = waterDefinition(definition, options.time);
+            require(options.experimental, "Water '{}' requires --water planar --experimental. Native water parity is not certified.", name);
+            if (!options.planarWater) {
+                warn(std::format("Water '{}' is omitted; use --water planar to render it.", name));
+                material.flags = Omitted;
+                return store();
+            }
+            try { material.water = waterDefinition(definition, options.time); }
+            catch (const Error& error) { warn(std::format("Water '{}' uses default settings: {}", name, error.what())); material.water = WaterMaterial{}; }
             float frame = parseFloat(definition.value("$bumpframe"));
             require(frame >= 0 && frame <= 65535 && std::floor(frame) == frame, "Invalid water normal frame.");
             material.normal = texture(definition.value("$normalmap", "dev/water_normal"), false, name, static_cast<int>(frame));
             material.flags = Water | Unlit | NormalMap;
             material.noCull = true;
-            uint32_t index = static_cast<uint32_t>(scene.materials.size());
-            scene.materials.push_back(std::move(material)); materialIds.emplace(name, index);
-            return index;
+            return store();
         }
         bool painted = shader == "g_sky";
         require(shader == "lightmappedgeneric" || shader == "unlitgeneric" || shader == "unlittwotexture" || shader == "worldvertextransition" || shader == "vertexlitgeneric" || shader == "sky" || painted, "Unsupported shader '{}' in '{}'. No BSP was written.", shader, name);
@@ -293,9 +311,9 @@ public:
             auto frame = parseFloat(definition.value("$frame"));
             require(frame >= 0 && frame <= 65535 && std::floor(frame) == frame, "Invalid authored texture frame."); baseFrame = static_cast<int>(frame);
         }
-        for (size_t i = 0; i < definition.proxies.size(); ++i) {
+        auto applyProxy = [&](size_t i) {
             auto proxy = lower(definition.proxies[i]);
-            if (painted && proxy == "skypaint") { continue; }
+            if (painted && proxy == "skypaint") { return; }
             if (proxy == "texturescroll") {
                 const auto& parameters = definition.proxyParameters.at(i);
                 require(parameters.contains("texturescrollvar"), "TextureScroll proxy has no target variable.");
@@ -311,7 +329,7 @@ public:
                 auto scale = scalar("texturescale", 1), angle = glm::radians(scalar("texturescrollangle", 0));
                 double distance = options.time * scalar("texturescrollrate", 1), x = distance * std::cos(angle), y = distance * std::sin(angle);
                 definition.parameters[target] = std::format("center 0 0 scale {} {} translate {} {}", scale, scale, x - std::floor(x), y - std::floor(y));
-                continue;
+                return;
             }
             if (proxy == "sine") {
                 const auto& parameters = definition.proxyParameters.at(i);
@@ -337,17 +355,33 @@ public:
                 auto vector = component == -1 ? glm::vec3(static_cast<float>(value)) : parseVector(definition.value(target), glm::vec3(1));
                 if (component != -1) { vector[component] = static_cast<float>(value); }
                 definition.parameters[target] = target == "$alpha" ? std::format("{}", value) : std::format("[{} {} {}]", vector.x, vector.y, vector.z);
-                continue;
+                return;
             }
             if (proxy == "toggletexture") {
                 require(options.experimental && options.time == 0, "Entity texture toggles in '{}' require --experimental at capture time zero; entity inputs are not simulated.", name);
                 const auto& parameters = definition.proxyParameters.at(i);
                 require(parameters.contains("toggletexturevar") && lower(parameters.at("toggletexturevar")) == "$basetexture" && parameters.contains("toggletextureframenumvar") && lower(parameters.at("toggletextureframenumvar")) == "$frame", "Only base-texture frame toggles are implemented.");
                 baseFrame = std::max(baseFrame, 0);
-                scene.diagnostics["warnings"].push_back(std::format("ToggleTexture in '{}' uses authored frame {}; runtime entity inputs are not simulated.", name, baseFrame));
-                continue;
+                warn(std::format("ToggleTexture in '{}' uses authored frame {}; runtime entity inputs are not simulated.", name, baseFrame));
+                return;
             }
-            throw Error(std::format("Material proxy '{}' is not implemented for '{}'. No BSP was written.", definition.proxies[i], name));
+            if (proxy == "animatedtexture") {
+                require(options.experimental, "Animated textures in '{}' require --experimental; capture uses a fixed frame.", name);
+                const auto& parameters = definition.proxyParameters.at(i);
+                auto rate = parameters.find("animatedtextureframerate");
+                float framesPerSecond = rate == parameters.end() || rate->second.starts_with('$') ? 0.0f : parseFloat(rate->second);
+                baseFrame = std::max(baseFrame, 0) + static_cast<int>(options.time * framesPerSecond);
+                warn(std::format("Animated texture in '{}' is captured at frame {}.", name, baseFrame));
+                return;
+            }
+            throw Error(std::format("Material proxy '{}' is not implemented for '{}'.", definition.proxies[i], name));
+        };
+        for (size_t i = 0; i < definition.proxies.size(); ++i) {
+            try { applyProxy(i); }
+            catch (const Error& error) {
+                if (!options.experimental) { throw; }
+                warn(std::format("Ignored a material proxy in '{}': {}", name, error.what()));
+            }
         }
         if (shader == "unlitgeneric" || shader == "unlittwotexture" || shader == "sky" || painted) { material.flags |= Unlit; }
         if (shader == "unlittwotexture") { material.flags |= TwoTexture; require(!definition.flag("$cloakpassenabled"), "UnlitTwoTexture cloak passes are not implemented."); }
@@ -355,18 +389,19 @@ public:
         if (shader == "vertexlitgeneric") { material.flags |= VertexLit; }
         if (painted) { material.flags |= Painted; }
         for (auto parameter : {"$bumpmap2", "$lightwarptexture", "$selfillumfresnel", "$selfillum_envmapmask_alpha", "$seamless_scale", "$detailtexturetransform"}) {
-            require(definition.value(parameter).empty() || definition.value(parameter) == "0", "Material parameter '{}' is not implemented for '{}'.", parameter, name);
+            if (!definition.value(parameter).empty() && definition.value(parameter) != "0") { approximate(std::format("Material parameter '{}' is not implemented for '{}' and is ignored.", parameter, name)); }
         }
-        require(definition.value("$bumptransform").empty() || definition.value("$bumptransform") == definition.value("$basetexturetransform"), "Independent bump texture coordinates are not implemented for '{}'.", name);
-        auto environment = definition.value("$envmap");
-        require(environment.empty() || lower(environment) == "env_cubemap" || assetPath(environment).starts_with("maps/"), "Static environment textures are not implemented for '{}'. Only probe-driven reflection feedback can be suppressed.", name);
+        if (!definition.value("$bumptransform").empty() && definition.value("$bumptransform") != definition.value("$basetexturetransform")) { approximate(std::format("Independent bump texture coordinates are not implemented for '{}'.", name)); }
+        auto environment = lower(definition.value("$envmap"));
+        std::replace(environment.begin(), environment.end(), '\\', '/');
+        if (!environment.empty() && environment != "env_cubemap" && !environment.starts_with("maps/") && !environment.starts_with("materials/maps/")) { approximate(std::format("Static environment texture in '{}' is not rendered.", name)); }
         auto base = definition.value(options.hdr ? "$hdrbasetexture" : "$basetexture");
         if (base.empty()) { base = definition.value("$basetexture"); }
         material.base = texture(base, true, name, baseFrame);
         material.second = texture(definition.value(shader == "unlittwotexture" ? "$texture2" : "$basetexture2"), true, name);
         if (!definition.value("$blendmodulatetexture").empty()) {
-            require(shader == "worldvertextransition" && !definition.flag("$maskedblending"), "Blend modulation currently requires ordinary WorldVertexTransition blending.");
-            material.blendMask = texture(definition.value("$blendmodulatetexture"), false, name); material.flags |= BlendModulation;
+            if (shader == "worldvertextransition" && !definition.flag("$maskedblending")) { material.blendMask = texture(definition.value("$blendmodulatetexture"), false, name); material.flags |= BlendModulation; }
+            else { approximate(std::format("Blend modulation in '{}' requires ordinary WorldVertexTransition blending and is ignored.", name)); }
         }
         if (!definition.value("$bumpmap").empty()) { material.normal = texture(definition.value("$bumpmap"), false, name); material.flags |= NormalMap; }
         if (!definition.value("$detail").empty()) { material.detail = texture(definition.value("$detail"), false, name); material.flags |= Detail; }
@@ -385,13 +420,13 @@ public:
         material.selfIllumTint = parseVector(definition.value("$selfillumtint"), glm::vec3(1));
         require(glm::all(glm::greaterThanEqual(material.selfIllumTint, glm::vec3(0))), "Self-illumination tint cannot be negative.");
         if (definition.flag("$selfillum") && !definition.value("$selfillummask").empty()) {
-            require(shader == "vertexlitgeneric" && !(material.flags & NormalMap), "Separate self-illumination masks currently require an unbumped VertexLitGeneric material: {}", name);
+            if (shader != "vertexlitgeneric" || (material.flags & NormalMap)) { approximate(std::format("Separate self-illumination mask in '{}' is applied without native parity.", name)); }
             material.selfIllumMask = texture(definition.value("$selfillummask"), false, name); material.flags |= SelfIllumMask;
         }
         if (definition.flag("$phong")) {
             require(shader == "vertexlitgeneric", "Phong is supported only for VertexLitGeneric: {}", name);
             for (auto key : {"$phongwarptexture", "$rimlight", "$phongexponenttexturemask"}) {
-                require(definition.value(key).empty() || definition.value(key) == "0", "Unsupported Phong control '{}' in '{}'.", key, name);
+                if (!definition.value(key).empty() && definition.value(key) != "0") { approximate(std::format("Phong control '{}' in '{}' is not implemented and is ignored.", key, name)); }
             }
             material.flags |= Phong;
             if (!definition.flag("$phongdisablehalflambert")) { material.flags |= HalfLambert; }
@@ -745,7 +780,7 @@ Scene Builder::build() {
         const auto& mat = scene.materials[materialIndex];
         if (mat.flags & Omitted) { continue; }
         bool bumped = (info.flags & 0x800) != 0;
-        require(!(mat.flags & SSBump) || bumped, "SSBump material '{}' has no directional lightmaps.", name);
+        if ((mat.flags & SSBump) && !bumped) { approximate(std::format("SSBump material '{}' has no directional lightmaps.", name)); }
         auto placement = lightmap(face, bumped);
         polygon.clear();
         for (int i = 0; i < face.numEdges; ++i) {
