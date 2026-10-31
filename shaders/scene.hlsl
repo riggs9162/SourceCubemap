@@ -192,7 +192,7 @@ float4 WaterColor(FragmentInput input) {
     return float4(lerp(refraction, reflection, fresnel), 1);
 }
 
-float4 PSMain(FragmentInput input) : SV_Target0 {
+float4 Shade(FragmentInput input) {
     uint flags = parameters.flags.x;
     clip(dot(float4(input.worldPosition, 1), camera.clipPlane));
     if ((flags & 2048) != 0) { return float4(PaintedSkyColor(input.worldPosition), camera.waterView.z == 2 ? 1000000 : 1); }
@@ -303,4 +303,9 @@ float4 PSMain(FragmentInput input) : SV_Target0 {
     float alpha = base.a * parameters.tint.a;
     if (camera.waterView.z == 2) { alpha = camera.eye.w == 2 ? length(input.worldPosition - camera.eye.xyz) : 1000000; }
     return float4(result, alpha);
+}
+
+float4 PSMain(FragmentInput input) : SV_Target0 {
+    float4 color = Shade(input);
+    return all(isfinite(color)) ? color : float4(0, 0, 0, 0);
 }
