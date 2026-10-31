@@ -133,11 +133,21 @@ Assets::Assets(const Bsp& map, const fs::path& game, const std::vector<std::stri
         if (resolved.extension() == ".vpk" && !fs::exists(resolved)) { resolved = resolved.parent_path() / (resolved.stem().string() + "_dir.vpk"); }
         mount(resolved, false, false);
     }
+    for (const auto& source : sources) { declared.push_back(source.path.string()); }
     if (profile == "gmod" && fs::exists(game / "cfg/mount.cfg")) {
         auto text = textOf(readFile(game / "cfg/mount.cfg"));
         kvpp::KV1 config(text);
-        if (config.getChildCount()) { for (const auto& entry : config[0]) { mount(fs::path(entry.getValue()), false); } }
+        if (config.getChildCount()) {
+            for (const auto& entry : config[0]) {
+                auto path = fs::absolute(fs::path(entry.getValue())).lexically_normal();
+                if (!mounted.contains(lower(path.string()))) { declared.push_back(path.string()); deferred.push_back(std::move(path)); }
+            }
+        }
     }
+}
+bool Assets::reach(size_t index) {
+    while (index >= sources.size() && nextDeferred < deferred.size()) { mount(deferred[nextDeferred++], false); }
+    return index < sources.size();
 }
 std::shared_ptr<const Asset> Assets::remember(const std::string& name, Bytes bytes, std::string origin) {
     auto asset = std::make_shared<Asset>(Asset{std::move(bytes), std::move(origin), {}});
@@ -149,7 +159,8 @@ std::shared_ptr<const Asset> Assets::find(std::string name) {
     name = assetPath(std::move(name));
     if (auto found = cache.find(name); found != cache.end()) { return found->second; }
     if (auto value = bsp.embedded(name)) { return remember(name, std::move(*value), bsp.path.string() + "::" + name); }
-    for (const auto& source : sources) {
+    for (size_t index = 0; reach(index); ++index) {
+        const auto& source = sources[index];
         std::optional<Bytes> bytes;
         if (source.archive) { bytes = source.archive->readEntry(name); }
         else if (source.files->contains(name)) { bytes = readFile(source.path / name); }
@@ -161,6 +172,12 @@ std::shared_ptr<const Asset> Assets::find(std::string name) {
     cache.emplace(name, nullptr);
     return {};
 }
+std::shared_ptr<const Asset> Assets::findEmbedded(std::string name) {
+    name = assetPath(std::move(name));
+    if (auto found = cache.find(name); found != cache.end()) { return found->second; }
+    if (auto value = bsp.embedded(name)) { return remember(name, std::move(*value), bsp.path.string() + "::" + name); }
+    return {};
+}
 std::shared_ptr<const Asset> Assets::get(std::string name, std::string_view requestedBy) {
     auto asset = find(name);
     if (asset) { return asset; }
@@ -170,7 +187,7 @@ std::shared_ptr<const Asset> Assets::get(std::string name, std::string_view requ
 }
 Json Assets::report() const {
     Json result{{"mounts", Json::array()}, {"resolved", Json::array()}, {"unresolved_lookups", Json::array()}};
-    for (const auto& source : sources) { result["mounts"].push_back(source.path.string()); }
+    for (const auto& path : declared) { result["mounts"].push_back(path); }
     std::vector<std::string> names;
     for (const auto& [name, value] : cache) { names.push_back(name); }
     std::sort(names.begin(), names.end());
