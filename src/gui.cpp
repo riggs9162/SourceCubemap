@@ -25,10 +25,13 @@ namespace {
 namespace fs = std::filesystem;
 using Json = nlohmann::json;
 constexpr UINT logMessage = WM_APP + 1, finishedMessage = WM_APP + 2;
-enum Control : int { Map = 100, Game, Output, BrowseMap, BrowseGame, BrowseOutput, Build, Settings, Status, Progress, Preview, Faces, Result, OpenFolder, OpenLog, Hdr, Quality, Water, KeepGoing, Incremental, Mounts, AddMount, Done };
+enum Control : int { Map = 100, Game, Output, BrowseMap, BrowseGame, BrowseOutput, Build, Settings, Status, Progress, Preview, Position, Slider, Variant, Result, OpenFolder, OpenLog, Hdr, Quality, Water, KeepGoing, Incremental, Mounts, AddMount, Done };
 struct Choice { const wchar_t* label; const wchar_t* value; };
 constexpr std::array<Choice, 4> lightingChoices{{{L"Same as the map", L"auto"}, {L"LDR only", L"ldr"}, {L"HDR only", L"hdr"}, {L"LDR and HDR", L"both"}}};
 constexpr std::array<Choice, 3> qualityChoices{{{L"Standard", L"standard"}, {L"Fast", L"fast"}, {L"High (sharper, slower)", L"high"}}};
+constexpr std::array<Choice, 2> variantChoices{{{L"LDR", L""}, {L"HDR", L".hdr"}}};
+struct FaceView { const wchar_t* suffix; int column, row; Gdiplus::RotateFlipType turn; };
+const std::array<FaceView, 6> faceViews{{{L"px", 1, 1, Gdiplus::Rotate90FlipX}, {L"nx", 3, 1, Gdiplus::Rotate270FlipX}, {L"py", 0, 1, Gdiplus::RotateNoneFlipY}, {L"ny", 2, 1, Gdiplus::RotateNoneFlipX}, {L"pz", 1, 0, Gdiplus::Rotate90FlipX}, {L"nz", 1, 2, Gdiplus::Rotate90FlipX}}};
 constexpr std::array<std::pair<int, const char*>, 4> textSettings{{{Map, "map"}, {Game, "game"}, {Output, "output"}, {Mounts, "mounts"}}};
 constexpr std::array<std::pair<int, const char*>, 3> flagSettings{{{Water, "water"}, {KeepGoing, "keep_going"}, {Incremental, "incremental"}}};
 
@@ -150,8 +153,9 @@ struct App {
     bool busy = false, closeWhenDone = false, finishedOnce = false, saved = false;
     std::wstring failure;
     fs::path logPath;
-    std::vector<fs::path> previews;
-    std::unique_ptr<Gdiplus::Bitmap> preview;
+    fs::path previewFolder;
+    std::array<std::vector<std::wstring>, 2> cubes;
+    std::array<std::unique_ptr<Gdiplus::Bitmap>, 6> faces;
     UINT dpi = 96;
     int lineHeight = 19;
 
@@ -198,7 +202,8 @@ struct App {
         control(Build, L"BUTTON", L"Generate cubemaps", WS_TABSTOP | BS_DEFPUSHBUTTON); control(Settings, L"BUTTON", L"Options...", WS_TABSTOP);
         control(Status, L"STATIC", L"", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS); control(Progress, PROGRESS_CLASSW, L"", PBS_MARQUEE); show(Progress, false);
         control(Preview, L"ScmPreview", L"");
-        control(Faces, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP); show(Faces, false);
+        control(Position, L"STATIC", L"", SS_LEFTNOWORDWRAP); control(Slider, TRACKBAR_CLASSW, L"", TBS_NOTICKS | TBS_DOWNISLEFT | WS_TABSTOP); combo(Variant, variantChoices);
+        for (auto id : {Position, Slider, Variant}) { show(id, false); }
         control(Result, L"EDIT", L"", ES_MULTILINE | ES_READONLY | WS_VSCROLL); show(Result, false);
         control(OpenFolder, L"BUTTON", L"Open folder", WS_TABSTOP); control(OpenLog, L"BUTTON", L"Open log", WS_TABSTOP); show(OpenFolder, false); show(OpenLog, false);
         RECT frame{0, 0, scaled(420), scaled(340)}; AdjustWindowRectEx(&frame, WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
@@ -232,8 +237,9 @@ struct App {
         place(Build, 20, 122, 170, 32); place(Settings, 198, 122, 90, 32); place(Status, 304, 129, width - 324, 20); place(Progress, 20, 164, width - 40, 5);
         constexpr int top = 180;
         if (!finishedOnce) { place(Preview, 20, top, width - 40, height - top - 20); return; }
-        int previewWidth = previews.empty() ? 0 : (width - 56) * 3 / 5, side = previews.empty() ? 20 : 36 + previewWidth, sideWidth = width - side - 20, row = height - 50;
-        place(Preview, 20, top, previewWidth, row - top - 8); place(Faces, 20, row, previewWidth, 240);
+        int previewWidth = hasCubes() ? (width - 56) * 3 / 5 : 0, side = hasCubes() ? 36 + previewWidth : 20, sideWidth = width - side - 20, row = height - 50;
+        place(Preview, 20, top, previewWidth, row - top - 8);
+        place(Position, 20, row + 5, 124, 20); place(Slider, 146, row + 2, previewWidth - 212, 26); place(Variant, 20 + previewWidth - 60, row + 2, 60, 200);
         place(Result, side, top, sideWidth, row - top - 8); place(OpenFolder, side, row, 110, 30); place(OpenLog, saved ? side + 118 : side, row, 90, 30);
         fitResult();
     }
@@ -304,7 +310,7 @@ struct App {
         if (checked(KeepGoing)) { arguments.emplace_back(L"--experimental"); if (checked(Water)) { arguments.insert(arguments.end(),{L"--water",L"planar"}); } }
         if (checked(Incremental)) { arguments.emplace_back(L"--incremental"); }
         if (replacing) { arguments.emplace_back(L"--overwrite"); }
-        previews.clear(); preview.reset(); SendMessageW(controls.at(Faces),CB_RESETCONTENT,0,0); InvalidateRect(controls.at(Preview),nullptr,TRUE);
+        clearCubes(); InvalidateRect(controls.at(Preview),nullptr,TRUE);
         logPath=directory/"worker.log"; failure.clear(); saved=false; showResults(false);
         saveSettings(); set(Status,L"Starting..."); enable(true); marquee(true);
         worker=std::jthread(runWorker,window,std::move(arguments),report,previewDirectory);
@@ -312,7 +318,7 @@ struct App {
     void showResults(bool visible) {
         finishedOnce = visible;
         show(Result,visible); show(OpenLog,visible); show(OpenFolder,visible && saved);
-        show(Preview,!visible || !previews.empty()); show(Faces,visible && !previews.empty()); layout();
+        show(Preview,!visible || hasCubes()); layout();
     }
     std::wstring describe(const Json& report) const {
         std::wstring lighting; std::vector<std::string> warnings; std::set<std::string> seen; std::vector<bool> variants;
@@ -344,19 +350,39 @@ struct App {
             std::ifstream input(result.report); auto report=Json::parse(input);
             set(Status,std::format(L"Finished in {:.1f} seconds.",report.at("timings_seconds").at("total").get<double>()));
             set(Result,describe(report));
-            previews.clear(); preview.reset(); SendMessageW(controls.at(Faces),CB_RESETCONTENT,0,0);
-            if (fs::exists(result.previews)) { for (const auto& entry : fs::directory_iterator(result.previews)) { if (entry.path().extension()==L".png") { previews.push_back(entry.path()); } } }
-            std::sort(previews.begin(),previews.end());
-            for (const auto& path : previews) { SendMessageW(controls.at(Faces),CB_ADDSTRING,0,reinterpret_cast<LPARAM>(path.filename().c_str())); }
-            if (!previews.empty()) { SendMessageW(controls.at(Faces),CB_SETCURSEL,0,0); selectPreview(); }
-            saved=true; showResults(true);
+            loadCubes(result.previews); saved=true; showResults(true); selectVariant();
         }
         if (closeWhenDone) { DestroyWindow(window); }
     }
-    void selectPreview() {
-        auto index=SendMessageW(controls.at(Faces),CB_GETCURSEL,0,0);
-        if (index>=0 && static_cast<size_t>(index)<previews.size()) { preview=std::make_unique<Gdiplus::Bitmap>(previews[index].c_str()); }
-        InvalidateRect(controls.at(Preview),nullptr,TRUE);
+    bool hasCubes() const { return !cubes[0].empty() || !cubes[1].empty(); }
+    size_t variant() const { return cubes[0].empty() || (!cubes[1].empty() && SendMessageW(controls.at(Variant),CB_GETCURSEL,0,0)==1); }
+    void clearCubes() {
+        cubes[0].clear(); cubes[1].clear(); for (auto& face : faces) { face.reset(); }
+        SendMessageW(controls.at(Slider),TBM_SETPOS,TRUE,0);
+        for (auto id : {Position,Slider,Variant}) { show(id,false); }
+    }
+    void loadCubes(const fs::path& folder) {
+        clearCubes(); previewFolder=folder; std::error_code ignored;
+        for (const auto& entry : fs::directory_iterator(folder,ignored)) {
+            auto name=entry.path().filename().wstring();
+            if (!name.ends_with(L"_px.png") || name.starts_with(L"cubemapdefault")) { continue; }
+            name.resize(name.size()-7); cubes[name.ends_with(L".hdr")].push_back(name);
+        }
+        std::sort(cubes[0].begin(),cubes[0].end()); std::sort(cubes[1].begin(),cubes[1].end());
+    }
+    void selectVariant() {
+        if (!hasCubes()) { return; }
+        auto count=cubes[variant()].size();
+        SendMessageW(controls.at(Slider),TBM_SETRANGEMIN,FALSE,0); SendMessageW(controls.at(Slider),TBM_SETRANGEMAX,TRUE,static_cast<LPARAM>(count-1));
+        show(Position,true); show(Slider,count>1); show(Variant,!cubes[0].empty() && !cubes[1].empty()); selectCube();
+    }
+    void selectCube() {
+        const auto& names=cubes[variant()]; auto index=std::min(static_cast<size_t>(SendMessageW(controls.at(Slider),TBM_GETPOS,0,0)),names.size()-1);
+        for (size_t i=0;i<6;++i) {
+            auto file=previewFolder/std::format(L"{}_{}.png",names[index],faceViews[i].suffix);
+            faces[i]=std::make_unique<Gdiplus::Bitmap>(file.c_str()); if (faces[i]->GetLastStatus()==Gdiplus::Ok) { faces[i]->RotateFlip(faceViews[i].turn); }
+        }
+        set(Position,std::format(L"Cubemap {} of {}",index+1,names.size())); InvalidateRect(controls.at(Preview),nullptr,FALSE);
     }
     void saveSettings() {
         Json settings;
@@ -382,7 +408,7 @@ struct App {
     }
     void closeOptions() { EnableWindow(window,TRUE); ShowWindow(options,SW_HIDE); SetActiveWindow(window); }
     void command(int id, int notification) {
-        if (id==Faces && notification==CBN_SELCHANGE) { selectPreview(); return; }
+        if (id==Variant && notification==CBN_SELCHANGE) { selectVariant(); return; }
         if ((id==Map || id==Game || id==Output) && notification==EN_CHANGE) { refresh(); return; }
         if (notification!=BN_CLICKED) { return; }
         if (id==BrowseMap) {
@@ -407,13 +433,19 @@ LRESULT CALLBACK previewProcedure(HWND window, UINT message, WPARAM wparam, LPAR
     if (message==WM_ERASEBKGND) { return 1; }
     if (message==WM_PAINT) {
         PAINTSTRUCT paint{}; auto context=BeginPaint(window,&paint); auto* app=reinterpret_cast<App*>(GetWindowLongPtrW(GetParent(window),GWLP_USERDATA));
-        Gdiplus::Graphics graphics(context); graphics.Clear(Gdiplus::Color(255,243,243,243)); RECT area{}; GetClientRect(window,&area);
-        if (app && app->preview && app->preview->GetLastStatus()==Gdiplus::Ok) {
-            auto& image=*app->preview; float scale=std::min(float(area.right)/image.GetWidth(),float(area.bottom)/image.GetHeight());
-            float width=image.GetWidth()*scale,height=image.GetHeight()*scale;
-            graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
-            graphics.DrawImage(&image,Gdiplus::RectF((area.right-width)*0.5f,(area.bottom-height)*0.5f,width,height));
-        } else if (app) { auto previous=SelectObject(context,app->font); SetTextColor(context,RGB(110,110,110)); SetBkMode(context,TRANSPARENT); DrawTextW(context,L"Your cubemaps will appear here.",-1,&area,DT_CENTER|DT_VCENTER|DT_SINGLELINE); SelectObject(context,previous); }
+        RECT area{}; GetClientRect(window,&area);
+        Gdiplus::Bitmap canvas(area.right,area.bottom); Gdiplus::Graphics graphics(&canvas); graphics.Clear(Gdiplus::Color(255,243,243,243));
+        if (app && app->faces[0]) {
+            int size=std::min(area.right/4,area.bottom/3), left=(area.right-size*4)/2, top=(area.bottom-size*3)/2;
+            Gdiplus::ImageAttributes edges; edges.SetWrapMode(Gdiplus::WrapModeTileFlipXY);
+            graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear); graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+            for (size_t i=0;i<6;++i) {
+                auto& image=*app->faces[i]; if (image.GetLastStatus()!=Gdiplus::Ok) { continue; }
+                graphics.DrawImage(&image,Gdiplus::Rect(left+faceViews[i].column*size,top+faceViews[i].row*size,size,size),0,0,image.GetWidth(),image.GetHeight(),Gdiplus::UnitPixel,&edges);
+            }
+        }
+        Gdiplus::Graphics(context).DrawImage(&canvas,0,0);
+        if (app && !app->faces[0]) { auto previous=SelectObject(context,app->font); SetTextColor(context,RGB(110,110,110)); SetBkMode(context,TRANSPARENT); DrawTextW(context,L"Your cubemaps will appear here.",-1,&area,DT_CENTER|DT_VCENTER|DT_SINGLELINE); SelectObject(context,previous); }
         EndPaint(window,&paint); return 0;
     }
     return DefWindowProcW(window,message,wparam,lparam);
@@ -428,6 +460,7 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
         if (message==WM_SIZE && main && !app->labels.empty()) { app->layout(); return 0; }
         if (message==WM_GETMINMAXINFO && main) { auto* limits=reinterpret_cast<MINMAXINFO*>(lparam); limits->ptMinTrackSize={app->scaled(640),app->scaled(500)}; return 0; }
         if (message==WM_COMMAND) { app->command(LOWORD(wparam),HIWORD(wparam)); return 0; }
+        if (message==WM_HSCROLL && reinterpret_cast<HWND>(lparam)==app->controls.at(Slider)) { app->selectCube(); return 0; }
         if (message==WM_CTLCOLORSTATIC || message==WM_CTLCOLORBTN) {
             SetBkColor(reinterpret_cast<HDC>(wparam),GetSysColor(COLOR_WINDOW)); SetBkMode(reinterpret_cast<HDC>(wparam),TRANSPARENT);
             return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
