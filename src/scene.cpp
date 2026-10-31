@@ -1160,7 +1160,7 @@ void Builder::addSky() {
     if (!hasSky && !options.defaultSky) { return; }
     std::string name;
     for (const auto& entity : bsp.entities) { if (entity["classname"].getValue() == "worldspawn") { name = entity["skyname"].getValue(); } }
-    require(!name.empty(), "Sky surfaces exist but worldspawn has no skyname.");
+    if (name.empty()) { approximate("Sky surfaces exist but worldspawn has no skyname, so no sky is drawn."); return; }
     if (name == "painted") {
         auto& sky = scene.paintedSky;
         for (const auto& entity : bsp.entities) {
@@ -1177,18 +1177,18 @@ void Builder::addSky() {
             require(sky.sunSize >= 0 && sky.duskIntensity >= 0 && sky.duskScale >= 0, "Invalid painted sky sun or dusk parameters.");
             if (sky.sunSize > 0 || sky.duskIntensity > 0) {
                 require(options.experimental, "Painted sky sun and dusk shading requires --experimental until native parity is certified.");
-                scene.diagnostics["warnings"].push_back("Painted sky sun and dusk shading is experimental; the dusk angular response is approximate.");
+                warn("Painted sky sun and dusk shading is experimental; the dusk angular response is approximate.");
             }
             for (const auto& sun : bsp.entities) {
                 if (sun["classname"].getValue() != "env_sun") { continue; }
-                require(parseFloat(sun["use_angles"].getValue()) != 0, "Position-based env_sun directions are not implemented.");
+                if (parseFloat(sun["use_angles"].getValue()) == 0) { approximate("Position-based env_sun directions use the entity angles."); }
                 auto angles = parseVector(sun["angles"].getValue()); angles.x = parseFloat(sun["pitch"].getValue(), angles.x);
                 sky.sunDirection = glm::vec3(transform(glm::vec3(0), angles) * glm::vec4(1,0,0,0));
-                scene.diagnostics["warnings"].push_back("The env_sun sprite overlay is not drawn during experimental sky captures.");
+                warn("The env_sun sprite overlay is not drawn during experimental sky captures.");
                 break;
             }
             float layers = number("drawstars", 1) != 0 ? number("starlayers", 1) : 0;
-            require(layers == 0 || layers == 1, "Painted skies currently support one star/cloud layer.");
+            if (layers > 1) { approximate("Painted skies render one star/cloud layer."); layers = 1; }
             sky.starLayers = static_cast<uint32_t>(layers);
             sky.starScale = number("starscale", sky.starScale); sky.starFade = number("starfade", sky.starFade);
             sky.starPosition = number("starspeed", 0.01f) * static_cast<float>(options.time);
@@ -1197,10 +1197,10 @@ void Builder::addSky() {
                 auto star = std::string(entity["startexture"].getValue());
                 sky.stars = texture(star.empty() ? "skybox/starfield" : star, false, "env_skypaint");
                 require(options.experimental, "Painted sky clouds require --experimental until native sampling comparison passes.");
-                scene.diagnostics["warnings"].push_back("Painted sky cloud sampling is experimental; full-face native parity is not certified.");
+                warn("Painted sky cloud sampling is experimental; full-face native parity is not certified.");
             }
         }
-        require(sky.enabled, "The painted sky requires an env_skypaint entity.");
+        if (!sky.enabled) { approximate("The painted sky has no env_skypaint entity and uses default colors."); sky.enabled = true; sky.starLayers = 0; }
         scene.diagnostics["painted_sky"] = {{"capture_time", options.time}, {"star_layers", sky.starLayers}, {"hdr_scale", options.hdr ? sky.hdrScale : 1.0f}};
     }
     const std::array<std::string, 6> suffix{"rt", "lf", "bk", "ft", "up", "dn"};
