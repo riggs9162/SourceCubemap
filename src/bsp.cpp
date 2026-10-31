@@ -139,14 +139,14 @@ Bsp::Bsp(const fs::path& filename) : path(fs::absolute(filename)), bytes(readFil
     auto samples = lump(42);
     require(lumps[42].version == 0 && samples.size() % 16 == 0, "Unsupported cubemap sample layout.");
     Reader sampleReader(samples, "cubemap samples");
-    std::map<std::string, uint32_t> names;
+    std::map<std::string, size_t> names;
     for (size_t offset = 0; offset < samples.size(); offset += 16) {
         uint8_t size = sampleReader.at<uint8_t>(offset + 12);
         require(size <= 12, "Cubemap resolution exceeds 2048 pixels.");
         Probe probe{sampleReader.at<glm::ivec3>(offset), size ? (1u << (size - 1)) : 32u};
-        if (names.contains(probe.name())) { require(names.at(probe.name()) == probe.resolution, "Duplicate probe origins request different resolutions."); continue; }
-        names.emplace(probe.name(), probe.resolution);
-        probes.push_back(probe);
+        auto [existing, added] = names.try_emplace(probe.name(), probes.size());
+        if (added) { probes.push_back(probe); }
+        else { probes[existing->second].resolution = std::max(probes[existing->second].resolution, probe.resolution); }
     }
     entities = source->getLumpData<bsppp::BSPLump::ENTITIES>();
     auto zip = view(40);

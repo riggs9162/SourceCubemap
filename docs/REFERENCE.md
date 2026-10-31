@@ -46,7 +46,7 @@ Capture produces VTF 7.4 DXT1 for LDR or RGBA16161616F for HDR, complete mip cha
 | `standard` | Native | Up to 4x anisotropy |
 | `high` | Twice native | Up to 16x anisotropy |
 
-References to map cubemaps must match a probe or the generated default sky cubemap. Existing material patches and internal map names are preserved.
+References to map cubemaps must match a probe or the generated default sky cubemap. Existing material patches and internal map names are preserved. Cubemaps at the same position share one texture, so samples that request different sizes use the largest.
 
 ## Geometry and entities
 
