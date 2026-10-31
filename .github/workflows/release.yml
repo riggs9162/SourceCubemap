@@ -1,0 +1,46 @@
+# Builds Windows packages and publishes a tag and release for every commit pushed to master.
+# Each pushed commit gets its own tag and release; the newest one in a push carries the download.
+# Commits whose subject starts with [skip] are agent housekeeping and are not released.
+name: Release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: ${{ !startsWith(github.event.head_commit.message, '[skip]') }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      VCPKG_ROOT: C:\vcpkg
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Build
+        shell: pwsh
+        run: ./tools/build.ps1
+
+      - name: Package
+        shell: pwsh
+        run: |
+          ./tools/package.ps1 -Destination dist/SourceCubemap
+          Compress-Archive -Path dist/SourceCubemap -DestinationPath dist/SourceCubemap-windows-x64.zip
+          ./build/release/sourcecubemap.exe --version
+
+      - name: Publish tags and releases
+        shell: pwsh
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: ./tools/release.ps1 -Before "$env:BEFORE" -Head "$env:GITHUB_SHA" -Package dist/SourceCubemap-windows-x64.zip
