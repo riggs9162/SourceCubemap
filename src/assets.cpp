@@ -122,11 +122,8 @@ std::string MaterialDefinition::value(std::string_view key, std::string fallback
     return found == parameters.end() ? fallback : found->second;
 }
 bool MaterialDefinition::flag(std::string_view key) const { return parseFloat(value(key), 0) != 0; }
-MaterialDefinition readMaterial(Assets& assets, std::string name, bool hdr, unsigned depth) {
-    require(depth < 32, "VMT include cycle or excessive nesting: {}", name);
-    name = assetPath(name);
-    if (!name.starts_with("materials/")) { name = "materials/" + name; }
-    if (!name.ends_with(".vmt")) { name += ".vmt"; }
+namespace {
+MaterialDefinition parseMaterial(Assets& assets, const std::string& name, bool hdr, unsigned depth) {
     auto bytes = assets.get(name, "material");
     auto text = textOf(bytes->bytes);
     kvpp::KV1 document(text);
@@ -179,5 +176,16 @@ MaterialDefinition readMaterial(Assets& assets, std::string name, bool hdr, unsi
         else { throw Error(std::format("Unsupported material fallback block '{}' in {}.", key, name)); }
     }
     return result;
+}
+}
+const MaterialDefinition& readMaterial(Assets& assets, std::string name, bool hdr, unsigned depth) {
+    require(depth < 32, "VMT include cycle or excessive nesting: {}", name);
+    name = assetPath(name);
+    if (!name.starts_with("materials/")) { name = "materials/" + name; }
+    if (!name.ends_with(".vmt")) { name += ".vmt"; }
+    auto& known = assets.materials[hdr ? 1 : 0];
+    if (auto found = known.find(name); found != known.end()) { return found->second; }
+    auto parsed = parseMaterial(assets, name, hdr, depth);
+    return known.emplace(std::move(name), std::move(parsed)).first->second;
 }
 }
