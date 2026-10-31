@@ -10,6 +10,6 @@ After pushing commits to `master`, and only once they have built and passed the 
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/release.ps1
 ```
 
-The script rebuilds, packages, and creates a tag and GitHub release for each unreleased commit. The newest commit carries the Windows download. Commits starting with `[skip]` are not released. Report the release tag and link at the end of the session, or say plainly why no release was made.
+The script builds each unreleased commit on its own in `build/publish`, then creates a tag and a GitHub release with that commit's Windows download attached. Every release must carry its own build. Commits starting with `[skip]` are not released. Report the release number and link at the end of the session, or say plainly why no release was made.
 
-Raise the version in `CMakeLists.txt` and `vcpkg.json` when a change is large enough to deserve a new number. Tags are `v<version>-build.<commit count>`.
+Release numbers are always `AA.BB.CC`, two digits in each part with no prefix, and the tag, release title, download, and program version all use the same number. `AA.BB` comes from the version in `CMakeLists.txt` and `vcpkg.json`; raise it there when a change deserves a new number. `CC` counts releases and is set by the script. After 99 it wraps to 00 and `BB` moves up.
