@@ -8,7 +8,6 @@ SourceCubemap reads a compiled `.bsp` and your installed game content, renders e
 | --- | ---: | ---: |
 | `gm_flatgrass` | 8 | 0.9 s |
 | `gm_construct` | 28 | 0.9 s |
-| `gm_city17_ravenholm` | 795 | 4.6 s |
 
 Measured on a Ryzen 9 7900 and RTX 3050.
 
