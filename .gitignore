@@ -6,3 +6,4 @@
 /CMakeUserPresets.json
 *.user
 *.pdb
+/.claude/
