@@ -12,6 +12,7 @@ SourceCubemap liest eine kompilierte `.bsp` und deine installierten Spielinhalte
 | --- | ---: | ---: |
 | `gm_flatgrass` | 8 | 0.9 s |
 | `gm_construct` | 28 | 0.9 s |
+| Half-Life 2, 76 Maps | 6167 | 77 s insgesamt |
 
 Gemessen mit einem Ryzen 9 7900 und einer RTX 3050.
 

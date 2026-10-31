@@ -12,6 +12,7 @@ SourceCubemap 会读取编译好的 `.bsp` 和你已安装的游戏内容，用�
 | --- | ---: | ---: |
 | `gm_flatgrass` | 8 | 0.9 s |
 | `gm_construct` | 28 | 0.9 s |
+| Half-Life 2，76 张地图 | 6167 | 共 77 s |
 
 测试配置：Ryzen 9 7900 和 RTX 3050。
 
