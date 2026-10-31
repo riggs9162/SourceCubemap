@@ -247,12 +247,23 @@ float4 PSMain(FragmentInput input) : SV_Target0 {
         if ((flags & 4096) == 0) { specular = 0; }
     }
     if ((flags & 1) != 0) { light = 1; }
+    float3 detailEmission = 0;
     if ((flags & 64) != 0) {
-        float3 detail = detailTexture.Sample(materialSampler, input.uv * parameters.controls.z).rgb;
-        base.rgb *= lerp(1, detail * 2, parameters.controls.y);
+        float4 detail = detailTexture.Sample(materialSampler, input.uv * parameters.controls.z);
+        float detailFactor = parameters.controls.y;
+        uint detailMode = uint(parameters.selfIllumTint.w);
+        if (detailMode == 0) { base.rgb *= lerp(1, detail.rgb * 2, detailFactor); }
+        else if (detailMode == 1) { base.rgb += detail.rgb * detailFactor; }
+        else if (detailMode == 2) { base.rgb = lerp(base.rgb, detail.rgb, detailFactor * detail.a); }
+        else if (detailMode == 3) { base.rgb = lerp(base.rgb, detail.rgb, detailFactor); }
+        else if (detailMode == 4) { base.rgb = lerp(base.rgb, detail.rgb, detailFactor * (1 - base.a)); base.a = detail.a; }
+        else if (detailMode == 5) { detailEmission = detail.rgb * detailFactor; }
+        else if (detailMode == 8) { base.rgb *= lerp(1, detail.rgb, detailFactor); }
+        else if (detailMode == 9) { base.a *= lerp(1, detail.a, detailFactor); }
+        else if (detailMode == 11) { base.rgb *= dot(detail.rgb, 2.0 / 3.0); }
     }
     if ((flags & 262144) != 0) { base.rgb = lerp(base.rgb, lerp(base.rgb * parameters.tint.rgb, parameters.tint.rgb, parameters.phongTint.w), base.a); }
-    float3 result = base.rgb * light + specular;
+    float3 result = base.rgb * light + specular + detailEmission;
     if ((flags & 32) != 0) {
         float3 mask = (flags & 2097152) != 0 ? selfIllumMaskTexture.Sample(materialSampler, input.uv).rgb : base.aaa;
         result = lerp(base.rgb * light, base.rgb * parameters.selfIllumTint.rgb, mask) + specular;

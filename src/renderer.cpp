@@ -466,7 +466,7 @@ struct Renderer::Impl {
             bool fogEnabled = !draw.skyBox && !material.noFog && fogEnd > fogStart;
             DrawUniform uniform{};
             uniform.tint = material.tint;
-            uniform.selfIllumTint = {material.selfIllumTint, 0};
+            uniform.selfIllumTint = {material.selfIllumTint, float(material.detailMode)};
             uniform.controls = {material.alphaReference, material.detailFactor, material.detailScale, fogEnd};
             uniform.flags = {material.flags | (draw.lightmaps[0] ? BumpLight : 0u), draw.lighting, std::bit_cast<uint32_t>(fogStart), fogEnabled ? 1u : 0u};
             uniform.fog = {linear(fogColor.r), linear(fogColor.g), linear(fogColor.b), 1};

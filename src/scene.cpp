@@ -414,9 +414,14 @@ public:
         material.detailScale = parseFloat(definition.value("$detailscale"), 4);
         material.detailFactor = parseFloat(definition.value("$detailblendfactor"), 1);
         material.detailMode = static_cast<int>(parseFloat(definition.value("$detailblendmode"), 0));
-        require(!(material.flags & Detail) || material.detailMode == 0, "Detail blend mode {} is not implemented for {}.", material.detailMode, name);
-        material.tint = glm::vec4(parseVector(definition.value("$color", definition.value("$color2")), glm::vec3(1)), parseFloat(definition.value("$alpha"), 1));
-        if (definition.flag("$ssbump")) { require(material.flags & NormalMap, "SSBump requires a bump texture."); material.flags |= SSBump; }
+        if (material.flags & Detail) {
+            auto mode = material.detailMode;
+            if (mode == 12) { material.flags &= ~Detail; }
+            else if (mode == 6 || mode == 10) { approximate(std::format("Detail blend mode {} in '{}' uses the closest implemented mode.", mode, name)); material.detailMode = mode == 6 ? 5 : 11; }
+            else if (mode < 0 || mode == 7 || mode > 12) { approximate(std::format("Detail blend mode {} in '{}' is not implemented and is ignored.", mode, name)); material.flags &= ~Detail; }
+        }
+        material.tint = glm::vec4(materialColor(definition.value("$color", definition.value("$color2"))), parseFloat(definition.value("$alpha"), 1));
+        if (definition.flag("$ssbump") && (material.flags & NormalMap)) { material.flags |= SSBump; }
         material.selfIllumTint = parseVector(definition.value("$selfillumtint"), glm::vec3(1));
         require(glm::all(glm::greaterThanEqual(material.selfIllumTint, glm::vec3(0))), "Self-illumination tint cannot be negative.");
         if (definition.flag("$selfillum") && !definition.value("$selfillummask").empty()) {
