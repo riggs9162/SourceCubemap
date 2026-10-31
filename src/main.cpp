@@ -170,11 +170,12 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
     auto metadata = scm::Json{{"schema", 1}, {"map_namespace", mapNamespace}, {"runtime_map_namespace", scm::lower(output.stem().string())}, {"texture_namespaces", names}}.dump(2);
     auto metadataBytes = std::as_bytes(std::span(metadata.data(), metadata.size()));
     textures.emplace("sourcecubemap/build.json", scm::Bytes(metadataBytes.begin(), metadataBytes.end()));
-    bsp.writeCubemaps(textures, output, options.overwrite, options.inPlace);
+    scm::TextureMap views(textures.begin(), textures.end());
+    auto validated = bsp.writeCubemaps(views, output, options.overwrite, options.inPlace);
     times["bsp_writing_including_transaction_validation"] = writing.seconds();
     scm::Stopwatch validation;
     progress(options, "validating_output");
-    scm::Bsp reopened(output); reopened.validateTextures(); reopened.verifyPreserved(bsp, textures);
+    scm::require(scm::digest(scm::readFile(output)) == validated, "The published BSP differs from the validated file.");
     times["validation"] = validation.seconds();
     times["scene_and_asset_loading"] = assetsSeconds; times["gpu_preparation"] = prepareSeconds;
     times["rendering"] = renderSeconds; times["encoding"] = encodeSeconds; times["total"] = total.seconds();

@@ -31,6 +31,21 @@ void writeFile(const fs::path& path, std::span<const std::byte> bytes) {
     require(file.good(), "Incomplete write of {}.", path.string());
 }
 
+void writeFileParts(const fs::path& path, std::initializer_list<std::span<const std::byte>> parts) {
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    require(handle != INVALID_HANDLE_VALUE, "Cannot create {}.", path.string());
+    bool written = true;
+    for (auto part : parts) {
+        while (written && !part.empty()) {
+            DWORD count = 0;
+            written = WriteFile(handle, part.data(), static_cast<DWORD>(std::min<size_t>(part.size(), 1u << 30)), &count, nullptr) != 0;
+            part = part.subspan(count);
+        }
+    }
+    CloseHandle(handle);
+    require(written, "Incomplete write of {}.", path.string());
+}
+
 std::string textOf(std::span<const std::byte> bytes) { return {reinterpret_cast<const char*>(bytes.data()), bytes.size()}; }
 std::string lower(std::string value) {
     for (char& c : value) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }

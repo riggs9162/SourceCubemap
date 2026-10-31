@@ -37,6 +37,8 @@ template<class... Args> inline void require(bool condition, std::format_string<A
 }
 Bytes readFile(const fs::path& path);
 void writeFile(const fs::path& path, std::span<const std::byte> bytes);
+/// Writes several byte ranges to one file in order, without joining them in memory first.
+void writeFileParts(const fs::path& path, std::initializer_list<std::span<const std::byte>> parts);
 std::string textOf(std::span<const std::byte> bytes);
 std::string lower(std::string value);
 std::string assetPath(std::string value);

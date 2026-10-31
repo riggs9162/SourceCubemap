@@ -1,11 +1,13 @@
 #include <scm/bsp.hpp>
 #include <Windows.h>
+#include <future>
 #include <set>
 #include <bit>
 #include <vtfpp/VTF.h>
 #include <sourcepp/compression/LZMA.h>
 #include <mz.h>
 #include <mz_strm.h>
+#include <mz_strm_mem.h>
 #include <mz_zip.h>
 #include <mz_zip_rw.h>
 
@@ -138,10 +140,13 @@ Bsp::Bsp(const fs::path& filename) : path(fs::absolute(filename)), bytes(readFil
 
 Bytes Bsp::lump(int index) const {
     require(index >= 0 && index < 64, "Invalid BSP lump index.");
-    if (!lumps[index].length) { return {}; }
-    auto result = source->getLumpData(static_cast<bsppp::BSPLump>(index));
+    const auto& item = lumps[index];
+    if (!item.length) { return {}; }
+    auto stored = std::span<const std::byte>(bytes).subspan(item.offset, item.length);
+    if (!item.uncompressed) { return Bytes(stored.begin(), stored.end()); }
+    auto result = sourcepp::compression::decompressValveLZMA(stored);
     require(result.has_value(), "Cannot decode lump {}.", index);
-    require(!lumps[index].uncompressed || result->size() == lumps[index].uncompressed, "Decompressed lump size mismatch.");
+    require(result->size() == item.uncompressed, "Decompressed lump size mismatch.");
     return std::move(*result);
 }
 
@@ -193,13 +198,14 @@ Json Bsp::inspect() const {
 }
 
 void Bsp::validateTextures() const {
-    for (const auto& [name, original] : pakNames) {
-        if (!name.ends_with(".vtf")) { continue; }
-        auto data = embedded(name);
-        validateVtf(*data, name);
-        vtfpp::VTF texture(*data);
+    std::vector<const std::pair<const std::string, Bytes>*> textures;
+    for (const auto& entry : pakData) { if (entry.first.ends_with(".vtf")) { textures.push_back(&entry); } }
+    parallelFor(textures.size(), [&](size_t index) {
+        const auto& [name, data] = *textures[index];
+        validateVtf(data, name);
+        vtfpp::VTF texture(data);
         require(static_cast<bool>(texture), "Invalid VTF: {}", name);
-        if (!(texture.getFlags() & vtfpp::VTF::FLAG_V0_ENVMAP)) { continue; }
+        if (!(texture.getFlags() & vtfpp::VTF::FLAG_V0_ENVMAP)) { return; }
         require(texture.getWidth() == texture.getHeight(), "Cubemap is not square: {}", name);
         require(texture.getFaceCount() == 6 || texture.getFaceCount() == 7, "Invalid cubemap face count: {}", name);
         require(texture.getWidth() > 0 && texture.getMipCount() > 0 && texture.getMipCount() <= std::bit_width(texture.getWidth()), "Invalid cubemap dimensions or mip count: {}", name);
@@ -207,10 +213,10 @@ void Bsp::validateTextures() const {
             auto expected = vtfpp::ImageFormatDetails::getDataLength(texture.getFormat(), texture.getWidth(mip), texture.getHeight(mip));
             for (uint16_t frame = 0; frame < texture.getFrameCount(); ++frame) { for (uint8_t face = 0; face < texture.getFaceCount(); ++face) { require(texture.getImageDataRaw(mip, frame, face).size() == expected, "Missing or truncated VTF image data: {}", name); } }
         }
-    }
+    });
 }
 
-void Bsp::verifyPreserved(const Bsp& original, const std::map<std::string, Bytes>& replacements) const {
+void Bsp::verifyPreserved(const Bsp& original, const TextureMap& replacements) const {
     require(source->getMapRevision() == original.source->getMapRevision(), "Map revision changed unexpectedly.");
     for (size_t i = 0; i < 64; ++i) {
         if (i == 40) { continue; }
@@ -219,10 +225,15 @@ void Bsp::verifyPreserved(const Bsp& original, const std::map<std::string, Bytes
         if (l.length == 0) { continue; }
         require(std::equal(bytes.begin() + l.offset, bytes.begin() + l.offset + l.length, original.bytes.begin() + l.offset), "Lump {} payload changed.", i);
     }
-    for (const auto& [name, unused] : original.pakNames) {
-        if (!replacements.contains(name)) { require(embedded(name) == original.embedded(name), "Unrelated embedded asset changed: {}", name); }
+    for (const auto& [name, payload] : original.pakData) {
+        if (replacements.contains(name)) { continue; }
+        auto found = pakData.find(name);
+        require(found != pakData.end() && found->second == payload, "Unrelated embedded asset changed: {}", name);
     }
-    for (const auto& [name, expected] : replacements) { auto value = embedded(name); require(value && *value == expected, "Written cubemap differs: {}", name); }
+    for (const auto& [name, expected] : replacements) {
+        auto found = pakData.find(assetPath(name));
+        require(found != pakData.end() && std::ranges::equal(found->second, expected), "Written cubemap differs: {}", name);
+    }
 }
 
 void Bsp::validateDestination(const fs::path& destination, bool overwrite, bool inPlace) const {
@@ -233,15 +244,21 @@ void Bsp::validateDestination(const fs::path& destination, bool overwrite, bool 
     require(fs::is_directory(output.parent_path()), "The output directory does not exist.");
 }
 
-void Bsp::writeCubemaps(const std::map<std::string, Bytes>& textures, const fs::path& destination, bool overwrite, bool inPlace) const {
+std::string Bsp::writeCubemaps(const TextureMap& textures, const fs::path& destination, bool overwrite, bool inPlace) const {
     validateDestination(destination, overwrite, inPlace);
     auto output = fs::absolute(destination);
     bool same = fs::exists(output) && fs::equivalent(path, output);
     require(!textures.empty(), "No cubemaps were generated; output was not written.");
-    TemporaryFile archive(".zip");
+    size_t estimate = 1u << 20;
+    for (const auto& [name, data] : pakData) { estimate += data.size() + name.size() * 2 + 128; }
+    for (const auto& [name, data] : textures) { estimate += data.size() + name.size() * 2 + 128; }
+    require(estimate <= INT32_MAX, "Output exceeds the BSP signed offset limit.");
+    struct MemoryStream { void* handle = mz_stream_mem_create(); ~MemoryStream() { mz_stream_mem_delete(&handle); } } memory;
+    require(memory.handle != nullptr, "Cannot create the output PAK archive.");
+    mz_stream_mem_set_grow_size(memory.handle, static_cast<int32_t>(estimate));
+    require(mz_stream_mem_open(memory.handle, nullptr, MZ_OPEN_MODE_CREATE) == MZ_OK, "Cannot create the output PAK archive.");
     struct ZipWriter { void* handle = mz_zip_writer_create(); ~ZipWriter() { mz_zip_writer_delete(&handle); } } zip;
-    auto archivePath = archive.path.u8string();
-    require(zip.handle && mz_zip_writer_open_file(zip.handle, reinterpret_cast<const char*>(archivePath.c_str()), 0, 0) == MZ_OK, "Cannot create the output PAK archive.");
+    require(zip.handle && mz_zip_writer_open(zip.handle, memory.handle, 0) == MZ_OK, "Cannot create the output PAK archive.");
     mz_zip_writer_set_compress_method(zip.handle, MZ_COMPRESS_METHOD_STORE);
     auto add = [&](const std::string& name, std::span<const std::byte> data) {
         require(name.size() <= UINT16_MAX && data.size() <= INT32_MAX, "An output ZIP entry exceeds its size limit.");
@@ -257,28 +274,34 @@ void Bsp::writeCubemaps(const std::map<std::string, Bytes>& textures, const fs::
     }
     for (const auto& [name, data] : textures) { add(assetPath(name), data); }
     require(mz_zip_writer_close(zip.handle) == MZ_OK, "Failed to serialize the output PAK archive.");
-    auto packed = readFile(archive.path);
-    auto outputBytes = bytes;
+    const void* packedData = nullptr; int32_t packedLength = 0;
+    require(mz_stream_mem_get_buffer(memory.handle, &packedData) == MZ_OK, "Failed to serialize the output PAK archive.");
+    mz_stream_mem_get_buffer_length(memory.handle, &packedLength);
+    std::span<const std::byte> packed(static_cast<const std::byte*>(packedData), static_cast<size_t>(packedLength));
     const auto& oldPak = lumps[40];
     size_t oldEnd = size_t(oldPak.offset) + oldPak.length;
     bool terminal = oldPak.length && oldEnd <= bytes.size() && bytes.size() - oldEnd < 4;
     if (terminal) { for (size_t i = oldEnd; i < bytes.size(); ++i) { terminal &= bytes[i] == std::byte{0}; } }
     size_t offset = terminal ? oldPak.offset : ((bytes.size() + 3) & ~size_t(3));
     require(offset + packed.size() <= INT32_MAX, "Output exceeds the BSP signed offset limit.");
-    outputBytes.resize(offset + packed.size());
-    std::copy(packed.begin(), packed.end(), outputBytes.begin() + offset);
     Lump updated{static_cast<uint32_t>(offset), static_cast<uint32_t>(packed.size()), oldPak.version, 0};
-    std::memcpy(outputBytes.data() + 8 + 40 * 16, &updated, sizeof(updated));
+    constexpr size_t pakRecord = 8 + 40 * 16;
+    auto retained = std::span<const std::byte>(bytes).first(std::min(offset, bytes.size()));
+    Bytes padding(offset - retained.size());
     TemporaryFile temporary(".bsp", output.parent_path());
-    writeFile(temporary.path, outputBytes);
+    writeFileParts(temporary.path, {retained.first(pakRecord), std::as_bytes(std::span(&updated, 1)), retained.subspan(pakRecord + sizeof(updated)), padding, packed});
+    auto flushing = std::async(std::launch::async, [&] {
+        HANDLE handle = CreateFileW(temporary.path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        require(handle != INVALID_HANDLE_VALUE, "Cannot open output for flushing.");
+        bool flushed = FlushFileBuffers(handle) != 0;
+        CloseHandle(handle);
+        require(flushed, "Failed to flush the output BSP.");
+    });
     Bsp reopened(temporary.path);
     reopened.validateTextures();
     reopened.verifyPreserved(*this, textures);
-    HANDLE handle = CreateFileW(temporary.path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    require(handle != INVALID_HANDLE_VALUE, "Cannot open output for flushing.");
-    bool flushed = FlushFileBuffers(handle) != 0;
-    CloseHandle(handle);
-    require(flushed, "Failed to flush the output BSP.");
+    auto validated = digest(reopened.bytes);
+    flushing.get();
     if (same) {
         auto backup = output;
         backup += std::format(".{}.bak", GetTickCount64());
@@ -286,5 +309,6 @@ void Bsp::writeCubemaps(const std::map<std::string, Bytes>& textures, const fs::
     }
     DWORD flags = MOVEFILE_WRITE_THROUGH | ((overwrite || same) ? MOVEFILE_REPLACE_EXISTING : 0);
     require(MoveFileExW(temporary.path.c_str(), output.c_str(), flags) != 0, "Cannot publish the output BSP (Windows error {}).", GetLastError());
+    return validated;
 }
 }
