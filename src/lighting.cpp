@@ -3,15 +3,32 @@
 
 namespace scm {
 namespace {
+const auto legacyLightLevels = [] {
+    std::array<float, 4096> levels{};
+    for (size_t i = 0; i < levels.size(); ++i) { levels[i] = std::pow(float(i) / 1024.0f, 1.0f / 2.2f) * 0.5f; }
+    return levels;
+}();
+const auto decodedLightLevels = [] {
+    std::array<float, 256> levels{};
+    for (size_t i = 0; i < levels.size(); ++i) {
+        float value = float(i) / 255.0f;
+        levels[i] = (value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f)) * std::pow(2.0f, 2.2f);
+    }
+    return levels;
+}();
+const auto vertexLightLevels = [] {
+    std::array<float, 256> levels{};
+    for (size_t i = 0; i < levels.size(); ++i) { levels[i] = std::pow(float(i) * (2.0f / 255.0f), 2.2f); }
+    return levels;
+}();
 float legacyLightEncoding(float value) {
-    value = std::round(std::clamp(value, 0.0f, 4095.0f / 1024.0f) * 1024.0f) / 1024.0f;
-    return std::pow(value, 1.0f / 2.2f) * 0.5f;
+    float level = std::round(std::clamp(value, 0.0f, 4095.0f / 1024.0f) * 1024.0f);
+    return std::isnan(level) ? level : legacyLightLevels[size_t(level)];
 }
 glm::vec3 decodeLightmap(glm::vec3 encoded) {
-    encoded = glm::round(glm::clamp(encoded, glm::vec3(0), glm::vec3(1)) * 255.0f) / 255.0f;
+    encoded = glm::round(glm::clamp(encoded, glm::vec3(0), glm::vec3(1)) * 255.0f);
     for (unsigned channel = 0; channel < 3; ++channel) {
-        auto value = encoded[channel];
-        encoded[channel] = (value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f)) * std::pow(2.0f, 2.2f);
+        if (!std::isnan(encoded[channel])) { encoded[channel] = decodedLightLevels[size_t(encoded[channel])]; }
     }
     return encoded;
 }
@@ -49,7 +66,8 @@ std::array<glm::vec3, 4> lightmapRadiance(std::array<glm::vec3, 4> samples, bool
         }
         for (unsigned plane = 1; plane < 4; ++plane) { samples[plane] = decodeLightmap(samples[plane] / std::max(largest(samples[plane]), 1.0f)); }
     } else {
-        for (unsigned plane = 1; plane < 4; ++plane) { samples[plane] = decodeLightmap(target); }
+        samples.fill(decodeLightmap(target));
+        return samples;
     }
     samples[0] = decodeLightmap(target);
     return samples;

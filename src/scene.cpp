@@ -7,11 +7,8 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/packing.hpp>
 #include <spdlog/spdlog.h>
-#include <atomic>
-#include <exception>
 #include <bit>
 #include <sstream>
-#include <thread>
 #include <tuple>
 #include <unordered_map>
 
@@ -25,18 +22,6 @@ template<class T> std::vector<T> records(std::span<const std::byte> bytes, std::
 }
 template<class V> glm::vec3 vec3(const V& value) { return {value[0], value[1], value[2]}; }
 template<class V> glm::vec4 vec4(const V& value) { return {value[0], value[1], value[2], value[3]}; }
-/// Runs work for every index across the hardware threads and rethrows the failure with the lowest index.
-template<class Work> void parallelFor(size_t count, const Work& work) {
-    std::vector<std::exception_ptr> failures(count);
-    std::atomic_size_t next = 0;
-    auto run = [&] { for (size_t i = next++; i < count; i = next++) { try { work(i); } catch (...) { failures[i] = std::current_exception(); } } };
-    {
-        std::vector<std::jthread> workers;
-        for (size_t i = 1; i < std::min<size_t>(count, std::max(1u, std::thread::hardware_concurrency())); ++i) { workers.emplace_back(run); }
-        run();
-    }
-    for (const auto& failure : failures) { if (failure) { std::rethrow_exception(failure); } }
-}
 float linearColor(float value) { return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f); }
 /// Linearizes sRGB pixels, rejects nonfinite values, and stores half floats unless a value needs full precision.
 void storeFloatPixels(Image& image, std::vector<glm::vec4> pixels) {
@@ -71,10 +56,15 @@ std::optional<PixelFormat> directFormat(vtfpp::ImageFormat format) {
         default: return {};
     }
 }
-glm::vec3 rgbExp(const Reader& reader, size_t offset) {
-    float scale = std::ldexp(1.0f / 255.0f, reader.at<int8_t>(offset + 3));
-    return glm::vec3(reader.at<uint8_t>(offset), reader.at<uint8_t>(offset + 1), reader.at<uint8_t>(offset + 2)) * scale;
+const auto lightExponentScales = [] {
+    std::array<float, 256> scales{};
+    for (int i = 0; i < 256; ++i) { scales[i] = std::ldexp(1.0f / 255.0f, int(int8_t(uint8_t(i)))); }
+    return scales;
+}();
+glm::vec3 rgbExp(const std::byte* sample) {
+    return glm::vec3(uint8_t(sample[0]), uint8_t(sample[1]), uint8_t(sample[2])) * lightExponentScales[uint8_t(sample[3])];
 }
+glm::vec3 rgbExp(const Reader& reader, size_t offset) { return rgbExp(reader.slice(offset, 4).data()); }
 glm::mat4 transform(glm::vec3 origin, glm::vec3 angles) {
     auto matrix = glm::translate(glm::mat4(1), origin);
     matrix = glm::rotate(matrix, glm::radians(angles.y), glm::vec3(0, 0, 1));
@@ -492,24 +482,36 @@ public:
             }
         }
         LightPlacement result{pageIds, glm::vec2(pageX + 1, pageY + 1), glm::vec2(width, height)};
-        Reader lighting(lightData, "lightmaps");
-        for (int y = -1; y <= int(height); ++y) {
-            for (int x = -1; x <= int(width); ++x) {
-                auto pixel = uint32_t(std::clamp(y, 0, int(height) - 1)) * width + uint32_t(std::clamp(x, 0, int(width) - 1));
-                std::array<glm::vec3, 4> samples{};
-                for (unsigned plane = 0; plane < 4; ++plane) {
-                    unsigned sourcePlane = bumped ? plane : 0;
-                    for (size_t style = 0; style < styleCount; ++style) {
-                        auto sample = ((style * (bumped ? 4 : 1) + sourcePlane) * width * height + pixel) * 4;
-                        samples[plane] += rgbExp(lighting, face.lightOffset + sample) * lightStyles[face.styles[style]];
-                    }
-                }
-                auto radiance = lightmapRadiance(samples, bumped, options.hdr);
-                for (unsigned plane = 0; plane < 4; ++plane) { pagePixels[plane][(pageY + 1 + y) * 1024 + pageX + 1 + x] = glm::vec4(radiance[plane], 1); }
-            }
-        }
+        lightmapTasks.push_back({&face, pagePixels, width, height, pageX, pageY, styleCount, bumped});
         pageX += width + 2; pageRow = std::max(pageRow, height + 2);
         return result;
+    }
+    struct LightmapTask {
+        const bsppp::BSPFace_v1* face;
+        std::array<glm::vec4*, 4> pages;
+        uint32_t width, height, pageX, pageY;
+        size_t styleCount;
+        bool bumped;
+    };
+    void fillLightmap(const LightmapTask& task) {
+        const auto& [face, pages, width, height, pageX, pageY, styleCount, bumped] = task;
+        size_t planes = bumped ? 4 : 1, luxels = size_t(width) * height;
+        auto source = Reader(lightData, "lightmaps").slice(size_t(face->lightOffset), styleCount * planes * luxels * 4).data();
+        std::vector<std::array<glm::vec3, 4>> luxelRadiance(luxels);
+        for (size_t pixel = 0; pixel < luxels; ++pixel) {
+            std::array<glm::vec3, 4> samples{};
+            for (size_t plane = 0; plane < planes; ++plane) {
+                for (size_t style = 0; style < styleCount; ++style) { samples[plane] += rgbExp(source + ((style * planes + plane) * luxels + pixel) * 4) * lightStyles[face->styles[style]]; }
+            }
+            if (!bumped) { samples[1] = samples[2] = samples[3] = samples[0]; }
+            luxelRadiance[pixel] = lightmapRadiance(samples, bumped, options.hdr);
+        }
+        for (int y = -1; y <= int(height); ++y) {
+            for (int x = -1; x <= int(width); ++x) {
+                const auto& radiance = luxelRadiance[uint32_t(std::clamp(y, 0, int(height) - 1)) * width + uint32_t(std::clamp(x, 0, int(width) - 1))];
+                for (unsigned plane = 0; plane < 4; ++plane) { pages[plane][(pageY + 1 + y) * 1024 + pageX + 1 + x] = glm::vec4(radiance[plane], 1); }
+            }
+        }
     }
     Scene build();
     void addProps();
@@ -531,6 +533,7 @@ public:
     std::span<const std::byte> nodesData, planeData, leafData, leafFaceData, visData, lightData;
     std::vector<std::vector<LeafFaces>> clusterLeaves;
     std::vector<LeafFaces> unclusteredLeaves;
+    std::vector<LightmapTask> lightmapTasks;
     std::vector<std::unique_ptr<MaterialUv>> uvTransforms;
     FaceSet skyFaces;
     int skyArea = -1;
@@ -815,6 +818,7 @@ Scene Builder::build() {
         for (auto index : indices) { batch.push_back(base + index); }
         scene.vertices.insert(scene.vertices.end(), vertices.begin(), vertices.end());
     }
+    parallelFor(lightmapTasks.size(), [&](size_t task) { fillLightmap(lightmapTasks[task]); });
     for (auto& [key, indices] : batches) {
         auto [materialIndex, page, sky, visibilityId] = key;
         Draw draw{static_cast<uint32_t>(scene.indices.size()), static_cast<uint32_t>(indices.size()), materialIndex, {page, page ? page + 1 : 0, page ? page + 2 : 0, page ? page + 3 : 0}, sky};
