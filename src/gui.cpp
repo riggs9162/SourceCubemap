@@ -151,7 +151,7 @@ struct App {
     std::jthread worker;
     Handle cancellation;
     bool busy = false, closeWhenDone = false, finishedOnce = false, saved = false;
-    std::wstring failure;
+    std::wstring failure, derivedOutput;
     fs::path logPath;
     fs::path previewFolder;
     std::array<std::vector<std::wstring>, 2> cubes;
@@ -197,7 +197,7 @@ struct App {
         host = window;
         for (auto value : {L"Map", L"Game", L"Save as"}) { label(value); }
         for (auto id : {Map, Game, Output}) { control(id, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP); }
-        hint(Map, L"Choose a .bsp file"); hint(Game, L"Your game's folder, such as GarrysMod\\garrysmod"); hint(Output, L"Where to save the new map");
+        hint(Map, L"Choose a .bsp file, or drop one here"); hint(Game, L"Your game's folder, such as GarrysMod\\garrysmod"); hint(Output, L"Where to save the new map");
         for (auto id : {BrowseMap, BrowseGame, BrowseOutput}) { control(id, L"BUTTON", L"Browse...", WS_TABSTOP); }
         control(Build, L"BUTTON", L"Generate cubemaps", WS_TABSTOP | BS_DEFPUSHBUTTON); control(Settings, L"BUTTON", L"Options...", WS_TABSTOP);
         control(Status, L"STATIC", L"", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS); control(Progress, PROGRESS_CLASSW, L"", PBS_MARQUEE); show(Progress, false);
@@ -223,10 +223,10 @@ struct App {
         check(Water, true); check(KeepGoing, true);
         auto gmod = fs::path(L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\GarrysMod\\garrysmod");
         if (isFile(gmod / "gameinfo.txt")) { set(Game, gmod.wstring()); }
-        loadSettings();
+        loadSettings(); DragAcceptFiles(window,TRUE);
         int count=0; auto arguments=CommandLineToArgvW(GetCommandLineW(),&count);
         if (arguments && count==2 && fs::path(arguments[1]).extension()==L".bsp") {
-            fs::path input(arguments[1]); set(Map,input.wstring()); set(Output,(input.parent_path()/(input.stem().wstring()+L"_cubemaps.bsp")).wstring());
+            set(Map,arguments[1]);
         }
         if (arguments) { LocalFree(arguments); }
         layout(); enable(false); refresh();
@@ -260,6 +260,23 @@ struct App {
         std::error_code ignored;
         if (fs::equivalent(map, output, ignored)) { return L"Save under a different name, so your original map stays as it is."; }
         return {};
+    }
+    void mapChanged() {
+        auto map = fs::path(text(Map));
+        if (text(Output).empty() || text(Output) == derivedOutput) {
+            derivedOutput = map.has_filename() ? (map.parent_path() / (map.stem().wstring() + L"_cubemaps.bsp")).wstring() : std::wstring{};
+            set(Output, derivedOutput);
+        }
+        if (isFile(map)) {
+            for (auto folder = map.parent_path(); folder != folder.parent_path(); folder = folder.parent_path()) {
+                if (isFile(folder / "gameinfo.txt")) { set(Game, folder.wstring()); break; }
+            }
+        }
+        refresh();
+    }
+    void dropped(HDROP drop) {
+        std::wstring path(32768, 0); path.resize(DragQueryFileW(drop, 0, path.data(), static_cast<UINT>(path.size()))); DragFinish(drop);
+        if (!busy && !_wcsicmp(fs::path(path).extension().c_str(), L".bsp")) { set(Map, path); }
     }
     void refresh() {
         if (busy) { return; }
@@ -409,11 +426,11 @@ struct App {
     void closeOptions() { EnableWindow(window,TRUE); ShowWindow(options,SW_HIDE); SetActiveWindow(window); }
     void command(int id, int notification) {
         if (id==Variant && notification==CBN_SELCHANGE) { selectVariant(); return; }
-        if ((id==Map || id==Game || id==Output) && notification==EN_CHANGE) { refresh(); return; }
+        if (id==Map && notification==EN_CHANGE) { mapChanged(); return; }
+        if ((id==Game || id==Output) && notification==EN_CHANGE) { refresh(); return; }
         if (notification!=BN_CLICKED) { return; }
-        if (id==BrowseMap) {
-            auto path=::choose(window,false,false); if (path.empty()) { return; } set(Map,path); auto output=fs::path(path); output.replace_filename(output.stem().wstring()+L"_cubemaps.bsp"); set(Output,output.wstring());
-        } else if (id==BrowseGame) { auto path=::choose(window,true,false); if (!path.empty()) { set(Game,path); } }
+        if (id==BrowseMap) { auto path=::choose(window,false,false); if (!path.empty()) { set(Map,path); } }
+        else if (id==BrowseGame) { auto path=::choose(window,true,false); if (!path.empty()) { set(Game,path); } }
         else if (id==BrowseOutput) { auto path=::choose(window,false,true,text(Output)); if (!path.empty()) { set(Output,path); } }
         else if (id==Build && busy) { if (cancellation.value) { SetEvent(cancellation.value); set(Status,L"Cancelling..."); EnableWindow(controls.at(Build),FALSE); } }
         else if (id==Build) { start(); }
@@ -472,6 +489,7 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
             if (app->busy) { app->closeWhenDone=true; if (app->cancellation.value) { SetEvent(app->cancellation.value); } app->set(Status,L"Closing..."); return 0; }
             app->saveSettings(); DestroyWindow(window); return 0;
         }
+        if (message==WM_DROPFILES) { app->dropped(reinterpret_cast<HDROP>(wparam)); return 0; }
         if (message==WM_DESTROY) { if (main) { PostQuitMessage(0); } return 0; }
     } catch (const std::exception& error) { MessageBoxW(window,wide(error.what()).c_str(),L"SourceCubemap",MB_OK|MB_ICONERROR); if (app && message==finishedMessage) { app->enable(false); } }
     return DefWindowProcW(window,message,wparam,lparam);
