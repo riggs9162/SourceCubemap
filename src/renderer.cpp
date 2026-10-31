@@ -620,6 +620,7 @@ struct Renderer::Impl {
         const auto* pixels = static_cast<const glm::vec4*>(readback.mapping);
         for (unsigned face = 0; face < 6; ++face) {
             auto& output = cube.faces[face]; output.resize(size_t(cube.resolution) * cube.resolution);
+            if (factor == 1) { std::memcpy(output.data(), pixels + size_t(face) * size * size, output.size() * sizeof(glm::vec4)); continue; }
             for (uint32_t y = 0; y < cube.resolution; ++y) { for (uint32_t x = 0; x < cube.resolution; ++x) {
                 glm::vec4 value(0);
                 for (uint32_t dy = 0; dy < factor; ++dy) { for (uint32_t dx = 0; dx < factor; ++dx) { value += pixels[(size_t(face) * size + y * factor + dy) * size + x * factor + dx]; } }
