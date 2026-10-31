@@ -8,6 +8,13 @@
 #include <iostream>
 #include <set>
 #include <cmath>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <thread>
 
 namespace {
 struct Options {
@@ -83,10 +90,120 @@ bool needsDefaultSky(const scm::Bsp& bsp, scm::Assets& assets, bool hdr, std::st
     }
     return needed;
 }
+scm::SceneOptions sceneSettings(const Options& options, bool hdr, bool defaultSky) {
+    scm::SceneOptions settings{hdr, options.captureTime, options.cache, !options.noCache, options.experimental, defaultSky};
+    settings.planarWater = options.water == "planar";
+    return settings;
+}
+/// Encodes captures on background threads. Submission waits while too many pixels are queued, and the first failure surfaces on the next submission or in finish.
+class EncoderPool {
+public:
+    EncoderPool() {
+        for (unsigned i = 0, count = std::max(2u, std::thread::hardware_concurrency() / 2); i < count; ++i) { workers.emplace_back([this] { run(); }); }
+    }
+    ~EncoderPool() {
+        { std::scoped_lock lock(guard); stopping = true; }
+        changed.notify_all();
+        for (auto& worker : workers) { worker.join(); }
+    }
+    void submit(size_t bytes, std::move_only_function<void()> job) {
+        std::unique_lock lock(guard);
+        changed.wait(lock, [&] { return failure || pendingBytes == 0 || pendingBytes + bytes <= maximumPendingBytes; });
+        if (failure) { std::rethrow_exception(failure); }
+        pendingBytes += bytes;
+        queue.emplace_back(bytes, std::move(job));
+        changed.notify_all();
+    }
+    void finish() {
+        std::unique_lock lock(guard);
+        changed.wait(lock, [&] { return failure || pendingBytes == 0; });
+        if (failure) { std::rethrow_exception(failure); }
+    }
+private:
+    static constexpr size_t maximumPendingBytes = 4ull << 30;
+    void run() {
+        std::unique_lock lock(guard);
+        while (true) {
+            changed.wait(lock, [&] { return stopping || !queue.empty(); });
+            if (stopping) { return; }
+            auto [bytes, job] = std::move(queue.front()); queue.pop_front();
+            bool abandoned = failure != nullptr;
+            lock.unlock();
+            std::exception_ptr error;
+            if (!abandoned) {
+                try { job(); }
+                catch (...) { error = std::current_exception(); }
+            }
+            job = nullptr;
+            lock.lock();
+            pendingBytes -= bytes;
+            if (error && !failure) { failure = error; }
+            changed.notify_all();
+        }
+    }
+    std::mutex guard;
+    std::condition_variable changed;
+    std::deque<std::pair<size_t, std::move_only_function<void()>>> queue;
+    std::vector<std::thread> workers;
+    std::exception_ptr failure;
+    size_t pendingBytes = 0;
+    bool stopping = false;
+};
+/// Keeps each encoded texture once and lists it under every output namespace.
+class TextureStore {
+public:
+    explicit TextureStore(const std::set<std::string>& namespaces) : names(namespaces) {}
+    void add(const std::string& name, scm::Bytes bytes) {
+        std::scoped_lock lock(guard);
+        const auto& stored = storage.emplace_back(std::move(bytes));
+        for (const auto& map : names) { textures.emplace("materials/maps/" + map + "/" + name + ".vtf", stored); }
+    }
+    void clear() { textures.clear(); storage.clear(); }
+    scm::TextureMap textures;
+private:
+    const std::set<std::string>& names;
+    std::mutex guard;
+    std::deque<scm::Bytes> storage;
+};
+struct CaptureRequest { scm::Probe probe; bool skyOnly; std::string name; };
+std::vector<CaptureRequest> captureRequests(const scm::Bsp& bsp, bool hdr, bool defaultSky) {
+    std::vector<CaptureRequest> requests;
+    std::string suffix = hdr ? ".hdr" : "";
+    for (const auto& probe : bsp.probes) { requests.push_back({probe, false, probe.name() + suffix}); }
+    if (defaultSky) { requests.push_back({scm::Probe{glm::ivec3(0), 32}, true, "cubemapdefault" + suffix}); }
+    return requests;
+}
+scm::fs::path captureFile(const Options& options, std::string_view cacheKey, std::string_view name) { return scm::fs::path(options.cache) / "captures" / cacheKey / (std::string(name) + ".bin"); }
+std::optional<scm::Bytes> readCapture(const scm::fs::path& file, const scm::Probe& probe) {
+    if (!scm::fs::exists(file)) { return {}; }
+    try {
+        auto cached = scm::readFile(file);
+        scm::require(cached.size() >= 16, "Truncated capture cache.");
+        auto payload = std::span<const std::byte>(cached).subspan(16);
+        scm::require(scm::digest(payload) == scm::textOf(std::span<const std::byte>(cached).first(16)), "Capture cache checksum mismatch.");
+        scm::validateVtf(payload, file.string());
+        scm::Bytes bytes(payload.begin(), payload.end()); vtfpp::VTF vtf(bytes);
+        scm::require(static_cast<bool>(vtf) && vtf.getFaceCount() == 7 && vtf.getWidth() == probe.resolution && vtf.getHeight() == probe.resolution, "Invalid cached cubemap.");
+        return bytes;
+    } catch (const std::exception& error) { spdlog::warn("Ignoring capture cache: {}", error.what()); return {}; }
+}
+struct LoadedScene { bool defaultSky = false; scm::Scene scene; std::string sceneKey; scm::Json assets; double seconds = 0; };
 scm::Json build(const Options& options, const scm::fs::path& output) {
     scm::require(std::isfinite(options.captureTime) && options.captureTime >= 0, "Capture time must be a finite nonnegative number.");
     Cancellation cancellation(options.cancelEvent); cancellation.check(); progress(options, "parsing");
     scm::Stopwatch total, parsing;
+    struct CacheFlush { ~CacheFlush() { scm::flushCacheWrites(); } } cacheFlush;
+    double startupSeconds = 0;
+    auto startRenderer = [&] {
+        return std::async(std::launch::async, [&] {
+            scm::Stopwatch startup;
+            auto renderer = std::make_unique<scm::Renderer>(scm::RenderOptions{options.device, options.quality, shaderDirectory(), options.noCache ? scm::fs::path{} : scm::fs::path(options.cache)});
+            startupSeconds = startup.seconds();
+            return renderer;
+        });
+    };
+    std::unique_ptr<scm::Renderer> renderer;
+    auto starting = startRenderer();
     scm::Bsp bsp(options.input);
     bsp.validateDestination(output, options.overwrite, options.inPlace);
     scm::require(!bsp.probes.empty(), "The map contains no cubemap samples.");
@@ -98,88 +215,100 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
     if ((options.hdr == "auto" || options.hdr == "ldr" || options.hdr == "both") && bsp.lumps[8].length) { variants.push_back(false); }
     if ((options.hdr == "auto" || options.hdr == "hdr" || options.hdr == "both") && bsp.lumps[53].length) { variants.push_back(true); }
     scm::require(!variants.empty() && (options.hdr != "both" || variants.size() == 2), "The requested lighting variant is absent from the BSP.");
-    scm::Stopwatch startup;
     cancellation.check(); progress(options, "starting_renderer");
-    scm::Renderer renderer({options.device, options.quality, shaderDirectory(), options.noCache ? scm::fs::path{} : scm::fs::path(options.cache)});
-    times["startup"] = startup.seconds();
-    std::map<std::string, scm::Bytes> textures;
-    scm::Json scenes = scm::Json::array();
-    double assetsSeconds = 0, prepareSeconds = 0, renderSeconds = 0, encodeSeconds = 0;
+    TextureStore store(names);
+    scm::Json scenes = scm::Json::array(), rendererStatistics;
+    double assetsSeconds = 0, prepareSeconds = 0, renderSeconds = 0, encodeWaitSeconds = 0;
+    std::atomic<double> encodeSeconds = 0;
     size_t reusedCaptures = 0;
     scm::Stopwatch mounting;
     scm::Assets assets(bsp, options.game, options.mounts, options.profile);
     assetsSeconds += mounting.seconds();
-    for (bool hdr : variants) {
-        cancellation.check(); progress(options, hdr ? "loading_hdr_assets" : "loading_ldr_assets");
-        spdlog::info("Resolving {} scene and required assets", hdr ? "HDR" : "LDR");
-        scm::Stopwatch loading;
-        bool defaultSky = needsDefaultSky(bsp, assets, hdr, mapNamespace);
-        scm::SceneOptions sceneOptions{hdr, options.captureTime, options.cache, !options.noCache, options.experimental, defaultSky};
-        sceneOptions.planarWater = options.water == "planar";
-        auto scene = scm::loadScene(bsp, assets, sceneOptions);
-        cancellation.check();
-        assetsSeconds += loading.seconds();
-        auto cacheDescription = "renderer-v2:" + scm::sceneCacheKey(bsp, assets, sceneOptions) + assets.report().dump() + options.quality + renderer.statistics().at("device").get<std::string>() + renderer.statistics().at("driver_version").dump() + scm::digest(scm::readFile(shaderDirectory() / "scene.vert.spv")) + scm::digest(scm::readFile(shaderDirectory() / "scene.frag.spv"));
-        auto cacheKey = scm::digest(std::as_bytes(std::span(cacheDescription.data(), cacheDescription.size())));
-        bool prepared = false;
-        for (size_t i = 0; i < bsp.probes.size() + size_t(defaultSky); ++i) {
+    auto shaders = scm::digest(scm::readFile(shaderDirectory() / "scene.vert.spv")) + scm::digest(scm::readFile(shaderDirectory() / "scene.frag.spv"));
+    {
+        auto load = [&](bool hdr) {
             cancellation.check();
-            progress(options, hdr ? "capturing_hdr" : "capturing_ldr", static_cast<unsigned>(i), static_cast<unsigned>(bsp.probes.size() + size_t(defaultSky)));
-            bool skyOnly = i == bsp.probes.size();
-            scm::Probe probe = skyOnly ? scm::Probe{glm::ivec3(0), 32} : bsp.probes[i];
-            auto name = (skyOnly ? std::string("cubemapdefault") : probe.name()) + (hdr ? ".hdr" : "");
-            auto cacheFile = scm::fs::path(options.cache) / "captures" / cacheKey / (name + ".bin");
-            scm::Bytes bytes;
-            if (options.incremental && !options.noCache && scm::fs::exists(cacheFile)) {
-                try {
-                    auto cached = scm::readFile(cacheFile);
-                    scm::require(cached.size() >= 16, "Truncated capture cache.");
-                    auto payload = std::span<const std::byte>(cached).subspan(16);
-                    scm::require(scm::digest(payload) == scm::textOf(std::span<const std::byte>(cached).first(16)), "Capture cache checksum mismatch.");
-                    scm::validateVtf(payload, cacheFile.string());
-                    bytes.assign(payload.begin(), payload.end()); vtfpp::VTF vtf(bytes);
-                    scm::require(static_cast<bool>(vtf) && vtf.getFaceCount() == 7 && vtf.getWidth() == probe.resolution && vtf.getHeight() == probe.resolution, "Invalid cached cubemap.");
-                    ++reusedCaptures;
-                } catch (const std::exception& error) { spdlog::warn("Ignoring capture cache: {}", error.what()); bytes.clear(); }
+            scm::Stopwatch loading;
+            LoadedScene result;
+            result.defaultSky = needsDefaultSky(bsp, assets, hdr, mapNamespace);
+            auto settings = sceneSettings(options, hdr, result.defaultSky);
+            result.scene = scm::loadScene(bsp, assets, settings);
+            result.sceneKey = scm::sceneCacheKey(bsp, assets, settings);
+            result.assets = assets.report();
+            result.seconds = loading.seconds();
+            return result;
+        };
+        EncoderPool encoders;
+        auto loading = std::async(std::launch::async, load, bool(variants.front()));
+        for (size_t variant = 0; variant < variants.size(); ++variant) {
+            bool hdr = variants[variant];
+            cancellation.check(); progress(options, hdr ? "loading_hdr_assets" : "loading_ldr_assets");
+            spdlog::info("Resolving {} scene and required assets", hdr ? "HDR" : "LDR");
+            auto loaded = loading.get();
+            cancellation.check();
+            assetsSeconds += loaded.seconds;
+            if (variant + 1 < variants.size()) { loading = std::async(std::launch::async, load, bool(variants[variant + 1])); }
+            if (!renderer) { renderer = starting.get(); }
+            auto statistics = renderer->statistics();
+            auto cacheDescription = "renderer-v2:" + loaded.sceneKey + loaded.assets.dump() + options.quality + statistics.at("device").get<std::string>() + statistics.at("driver_version").dump() + shaders;
+            auto cacheKey = scm::digest(std::as_bytes(std::span(cacheDescription.data(), cacheDescription.size())));
+            auto requests = captureRequests(bsp, hdr, loaded.defaultSky);
+            bool prepared = false;
+            for (size_t i = 0; i < requests.size(); ++i) {
+                const auto& request = requests[i];
+                cancellation.check();
+                progress(options, hdr ? "capturing_hdr" : "capturing_ldr", static_cast<unsigned>(i), static_cast<unsigned>(requests.size()));
+                auto cacheFile = captureFile(options, cacheKey, request.name);
+                if (options.incremental && !options.noCache) {
+                    if (auto cached = readCapture(cacheFile, request.probe)) {
+                        ++reusedCaptures;
+                        if (!options.previews.empty()) { scm::writePreview(scm::decodeCube(*cached, hdr), options.previews, request.name); }
+                        store.add(request.name, std::move(*cached));
+                        continue;
+                    }
+                }
+                if (!prepared) { progress(options, "preparing_gpu"); scm::Stopwatch preparation; renderer->prepare(loaded.scene); prepareSeconds += preparation.seconds(); prepared = true; cancellation.check(); }
+                spdlog::info("Capturing {} {}/{}: {} ({} pixels)", hdr ? "HDR" : "LDR", i + 1, requests.size(), request.name, request.probe.resolution);
+                scm::Stopwatch rendering;
+                auto cube = renderer->capture(loaded.scene, request.probe, request.skyOnly);
+                renderSeconds += rendering.seconds();
+                auto cubeBytes = size_t(cube.resolution) * cube.resolution * 6 * sizeof(glm::vec4);
+                encoders.submit(cubeBytes, [&options, &store, &encodeSeconds, hdr, name = request.name, cacheFile = std::move(cacheFile), cube = std::move(cube)]() mutable {
+                    if (!options.previews.empty()) { scm::writePreview(cube, options.previews, name); }
+                    scm::Stopwatch encoding;
+                    auto bytes = scm::encodeCube(std::move(cube), hdr);
+                    encodeSeconds += encoding.seconds();
+                    if (!options.noCache) {
+                        auto hash = scm::digest(bytes); scm::Bytes cached; cached.reserve(hash.size() + bytes.size());
+                        auto prefix = std::as_bytes(std::span(hash.data(), hash.size()));
+                        cached.insert(cached.end(), prefix.begin(), prefix.end()); cached.insert(cached.end(), bytes.begin(), bytes.end());
+                        scm::queueCacheFile(cacheFile, std::move(cached));
+                    }
+                    store.add(name, std::move(bytes));
+                });
             }
-            if (!bytes.empty()) {
-                for (const auto& map : names) { textures.emplace("materials/maps/" + map + "/" + name + ".vtf", bytes); }
-                if (!options.previews.empty()) { scm::writePreview(scm::decodeCube(bytes, hdr), options.previews, name); }
-                continue;
-            }
-            if (!prepared) { progress(options, "preparing_gpu"); scm::Stopwatch preparation; renderer.prepare(scene); prepareSeconds += preparation.seconds(); prepared = true; cancellation.check(); }
-            spdlog::info("Capturing {} {}/{}: {} ({} pixels)", hdr ? "HDR" : "LDR", i + 1, bsp.probes.size() + size_t(defaultSky), name, probe.resolution);
-            scm::Stopwatch rendering;
-            auto cube = renderer.capture(scene, probe, skyOnly);
-            renderSeconds += rendering.seconds();
-            scm::Stopwatch encoding;
-            bytes = scm::encodeCube(cube, hdr);
-            for (const auto& map : names) { textures.emplace("materials/maps/" + map + "/" + name + ".vtf", bytes); }
-            encodeSeconds += encoding.seconds();
-            if (!options.noCache) {
-                try { auto hash = scm::digest(bytes); scm::Bytes cached; auto prefix = std::as_bytes(std::span(hash.data(), hash.size())); cached.insert(cached.end(), prefix.begin(), prefix.end()); cached.insert(cached.end(), bytes.begin(), bytes.end()); scm::writeCacheFile(cacheFile, cached); }
-                catch (const std::exception& error) { spdlog::warn("Capture cache write failed: {}", error.what()); }
-            }
-            if (!options.previews.empty()) { scm::writePreview(cube, options.previews, name); }
+            scenes.push_back({{"hdr", hdr}, {"geometry", loaded.scene.diagnostics}, {"assets", loaded.assets}});
         }
-        scenes.push_back({{"hdr", hdr}, {"geometry", scene.diagnostics}, {"assets", assets.report()}});
+        scm::Stopwatch waiting;
+        encoders.finish();
+        encodeWaitSeconds = waiting.seconds();
+        rendererStatistics = renderer->statistics();
     }
     scm::Stopwatch writing;
     cancellation.check(); progress(options, "writing_bsp");
-    auto textureCount = textures.size();
+    auto textureCount = store.textures.size();
     auto metadata = scm::Json{{"schema", 1}, {"map_namespace", mapNamespace}, {"runtime_map_namespace", scm::lower(output.stem().string())}, {"texture_namespaces", names}}.dump(2);
-    auto metadataBytes = std::as_bytes(std::span(metadata.data(), metadata.size()));
-    textures.emplace("sourcecubemap/build.json", scm::Bytes(metadataBytes.begin(), metadataBytes.end()));
-    scm::TextureMap views(textures.begin(), textures.end());
-    auto validated = bsp.writeCubemaps(views, output, options.overwrite, options.inPlace);
+    store.textures.emplace("sourcecubemap/build.json", std::as_bytes(std::span(metadata.data(), metadata.size())));
+    auto validated = bsp.writeCubemaps(store.textures, output, options.overwrite, options.inPlace);
     times["bsp_writing_including_transaction_validation"] = writing.seconds();
     scm::Stopwatch validation;
     progress(options, "validating_output");
     scm::require(scm::digest(scm::readFile(output)) == validated, "The published BSP differs from the validated file.");
     times["validation"] = validation.seconds();
+    times["startup"] = startupSeconds;
     times["scene_and_asset_loading"] = assetsSeconds; times["gpu_preparation"] = prepareSeconds;
-    times["rendering"] = renderSeconds; times["encoding"] = encodeSeconds; times["total"] = total.seconds();
-    return {{"output", scm::fs::absolute(output).string()}, {"map_namespace", mapNamespace}, {"texture_namespaces", names}, {"probes", bsp.probes.size()}, {"textures_written", textureCount}, {"timings_seconds", times}, {"renderer", renderer.statistics()}, {"scenes", scenes}, {"quality", options.quality}, {"capture_time", options.captureTime}, {"experimental", options.experimental}, {"rendering_fidelity", options.experimental ? "experimental_approximations" : "supported_subset_not_certified"}, {"structural_validation", "pass"}, {"native_game_acceptance", "not_performed"}, {"reused_captures", reusedCaptures}, {"cache_mode", options.incremental ? "incremental" : "full_regeneration"}};
+    times["rendering"] = renderSeconds; times["encoding"] = encodeSeconds.load(); times["encoding_wait"] = encodeWaitSeconds; times["total"] = total.seconds();
+    return {{"output", scm::fs::absolute(output).string()}, {"map_namespace", mapNamespace}, {"texture_namespaces", names}, {"probes", bsp.probes.size()}, {"textures_written", textureCount}, {"timings_seconds", times}, {"renderer", rendererStatistics}, {"scenes", scenes}, {"quality", options.quality}, {"capture_time", options.captureTime}, {"experimental", options.experimental}, {"rendering_fidelity", options.experimental ? "experimental_approximations" : "supported_subset_not_certified"}, {"structural_validation", "pass"}, {"native_game_acceptance", "not_performed"}, {"reused_captures", reusedCaptures}, {"cache_mode", options.incremental ? "incremental" : "full_regeneration"}};
 }
 }
 
