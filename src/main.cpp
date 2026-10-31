@@ -95,10 +95,10 @@ bool needsDefaultSky(const scm::Bsp& bsp, scm::Assets& assets, bool hdr, const s
     auto names = bsp.lump(43); scm::Reader strings(names, "compiled material names");
     for (size_t offset = 0; offset < names.size();) {
         auto name = strings.string(offset, names.size() - offset); offset += name.size() + 1;
-        scm::MaterialDefinition material;
-        try { material = scm::readMaterial(assets, name, hdr); }
+        const scm::MaterialDefinition* material = nullptr;
+        try { material = &scm::readMaterial(assets, name, hdr); }
         catch (const scm::Error&) { continue; }
-        auto binding = material.value("$envmap");
+        auto binding = material->value("$envmap");
         if (binding.empty()) { continue; }
         binding = scm::assetPath(binding);
         if (binding.starts_with("materials/")) { binding.erase(0, 10); }
