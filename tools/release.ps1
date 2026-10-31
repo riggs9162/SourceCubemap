@@ -3,10 +3,10 @@
 Builds and publishes one GitHub release, with its own Windows download, for each unreleased commit.
 
 .DESCRIPTION
-Run this from a working session after pushing master. Versions are always AA.BB.CC with two digits in
-each part. AA and BB come from the project version, and CC counts releases within them. After 99, CC
-wraps to 00 and BB moves up. The tag, the release title, the download, and the version the program
-reports all use the same number.
+Run this from a working session after pushing master. Versions are always A.B.cc, such as 0.4.07. A and
+B come from the project version, and cc is a two-digit count of releases within them. After 99, cc wraps
+to 00 and B moves up. After 9, B wraps to 0 and A moves up. The tag, the release title, the download, and
+the version the program reports all use the same number.
 
 Each commit is built on its own in build/publish, a separate checkout of this repository, so a release
 cannot pick up later changes and an open copy of the program cannot block the build. The first run takes
@@ -34,8 +34,8 @@ function Get-NextVersion([string]$Previous) {
         }
     }
     if ($taskPatch -gt 99) { $taskPatch = 0; $taskMinor += 1 }
-    if ($taskMinor -gt 99) { $taskMinor = 0; $taskMajor += 1 }
-    '{0:00}.{1:00}.{2:00}' -f $taskMajor, $taskMinor, $taskPatch
+    if ($taskMinor -gt 9) { $taskMinor = 0; $taskMajor += 1 }
+    '{0}.{1}.{2:00}' -f $taskMajor, $taskMinor, $taskPatch
 }
 
 if ((git rev-parse --abbrev-ref HEAD) -ne 'master') { throw 'Releases are published from master.' }
@@ -44,7 +44,7 @@ git fetch --quiet --tags origin master
 Assert-Success 'Fetching origin'
 if ((git rev-parse HEAD) -ne (git rev-parse origin/master)) { throw 'Push master before releasing.' }
 
-$taskLast = git tag --list '[0-9][0-9].[0-9][0-9].[0-9][0-9]' --merged HEAD | Sort-Object | Select-Object -Last 1
+$taskLast = git tag --list '[0-9]*.[0-9]*.[0-9][0-9]' --merged HEAD | Sort-Object { [version]$_ } | Select-Object -Last 1
 $taskCommits = if ($taskLast) { @(git rev-list --reverse --first-parent "$taskLast..HEAD") } else { @(git rev-parse HEAD) }
 $taskReleases = @($taskCommits | Where-Object { !(git log -1 --format=%s $_).StartsWith('[skip]') })
 if ($taskReleases.Count -eq 0) { Write-Output 'Nothing to release.'; return }
