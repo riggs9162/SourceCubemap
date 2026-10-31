@@ -74,6 +74,9 @@ struct Renderer::Impl {
     std::vector<GpuImage> images;
     std::unordered_map<std::string, GpuImage> imageCache;
     std::vector<VkDescriptorSet> descriptors;
+    std::vector<VkPipeline> drawPipelines;
+    std::array<std::array<std::vector<uint32_t>, 2>, 3> passDraws, viewDraws;
+    std::vector<std::pair<float, uint32_t>> viewOrder;
     Buffer vertices, indices, readback, uniforms, staging;
     std::vector<ImageCopy> imageCopies;
     VkDeviceSize stagingUsed = 0;
@@ -124,7 +127,8 @@ struct Renderer::Impl {
     }
     void releaseScene() {
         if (descriptorPool) { vkDestroyDescriptorPool(device, descriptorPool, nullptr); descriptorPool = {}; }
-        images.clear(); descriptors.clear(); destroy(vertices); destroy(indices); destroy(uniforms);
+        images.clear(); descriptors.clear(); drawPipelines.clear(); destroy(vertices); destroy(indices); destroy(uniforms);
+        for (auto& pass : passDraws) { for (auto& draws : pass) { draws.clear(); } }
     }
     void releaseImages() {
         for (auto& [key, image] : imageCache) { destroy(image); }
@@ -445,6 +449,7 @@ struct Renderer::Impl {
         std::vector<VkDescriptorImageInfo> imageInfos; imageInfos.reserve(size_t(count) * 12);
         std::vector<VkDescriptorBufferInfo> bufferInfos; bufferInfos.reserve(count);
         std::vector<VkWriteDescriptorSet> writes; writes.reserve(size_t(count) * 13);
+        drawPipelines.resize(count);
         auto writeImage = [&](uint32_t drawIndex, uint32_t binding, VkDescriptorType type, VkDescriptorImageInfo info) {
             imageInfos.push_back(info);
             writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[drawIndex], binding, 0, 1, type, &imageInfos.back(), nullptr, nullptr});
@@ -489,7 +494,8 @@ struct Renderer::Impl {
             writeTexture(drawIndex, 13, material.blendMask);
             writeTexture(drawIndex, 14, material.selfIllumMask);
             unsigned key = (material.translucent ? 1u : 0u) | (material.additive ? 2u : 0u) | (material.noCull ? 4u : 0u) | (draw.skyBox ? 8u : 0u);
-            pipeline(key);
+            drawPipelines[drawIndex] = pipeline(key);
+            passDraws[draw.skyBox ? 0 : draw.skyWorld ? 1 : 2][material.translucent || material.additive ? 1 : 0].push_back(drawIndex);
         }
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         uploadBuffer(uniforms.buffer, uniformData);
@@ -510,6 +516,23 @@ struct Renderer::Impl {
         uploadTotalSeconds += uploadTimer.seconds();
         if (targetSize) { writeWaterDescriptors(); }
     }
+    /// Back-to-front draw order for one camera origin; every face of a view shares it, so it is sorted once per pass.
+    void orderDraws(const Scene& scene, unsigned pass, glm::vec3 origin, size_t probeIndex, unsigned mode) {
+        for (unsigned transparent = 0; transparent < 2; ++transparent) {
+            viewOrder.clear();
+            for (uint32_t i : passDraws[pass][transparent]) {
+                const auto& draw = scene.draws[i]; const auto& material = scene.materials[draw.material];
+                if (mode && ((material.flags & Water) || material.translucent || material.additive)) { continue; }
+                if (mode == 1 && draw.lighting && !scene.materials.at(scene.waterMaterial).water.reflectEntities) { continue; }
+                if (!mode && !draw.visibility.empty() && probeIndex < scene.probes.size() && !(draw.visibility.at(probeIndex / 64) & (uint64_t(1) << (probeIndex % 64)))) { culledDraws += 6; continue; }
+                auto delta = draw.center - origin;
+                viewOrder.emplace_back(glm::dot(delta, delta), i);
+            }
+            std::stable_sort(viewOrder.begin(), viewOrder.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            auto& ordered = viewDraws[pass][transparent]; ordered.resize(viewOrder.size());
+            for (size_t i = 0; i < viewOrder.size(); ++i) { ordered[i] = viewOrder[i].second; }
+        }
+    }
     void renderViews(const Scene& scene, glm::vec3 cameraOrigin, size_t probeIndex, bool skyOnly, unsigned mode, bool submerged, glm::vec4 clipPlane) {
         uint32_t size = targetSize;
         barrier(color.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 6);
@@ -517,6 +540,12 @@ struct Renderer::Impl {
         const std::array<glm::vec3, 6> forward{{{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}};
         const std::array<glm::vec3, 6> up{{{0,1,0},{0,1,0},{0,0,-1},{0,0,1},{0,1,0},{0,1,0}}};
         auto projection = glm::perspectiveLH_ZO(glm::radians(90.f), 1.f, 1.f, 1000000.f); projection[1][1] *= -1;
+        std::array<glm::vec3, 3> origins;
+        for (unsigned pass = 0; pass < 3; ++pass) {
+            origins[pass] = pass == 0 ? glm::vec3(0) : pass == 1 && scene.skyScale > 0 ? cameraOrigin / scene.skyScale + scene.skyOrigin : cameraOrigin;
+            if (!skyOnly || pass == 0) { orderDraws(scene, pass, origins[pass], probeIndex, mode); }
+        }
+        VkPipeline bound{};
         for (uint32_t face = 0; face < 6; ++face) {
             VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; colorAttachment.imageView = colorViews[face]; colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE; colorAttachment.clearValue.color = {{0,0,0,1000000}};
             VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; depthAttachment.imageView = depthViews[face]; depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; depthAttachment.clearValue.depthStencil.depth = 1;
@@ -525,31 +554,25 @@ struct Renderer::Impl {
             VkViewport viewport{0,0,float(size),float(size),0,1}; VkRect2D scissor{{0,0},{size,size}};
             vkCmdSetViewport(command, 0, 1, &viewport); vkCmdSetScissor(command, 0, 1, &scissor);
             VkDeviceSize offset = 0; vkCmdBindVertexBuffers(command, 0, 1, &vertices.buffer, &offset); vkCmdBindIndexBuffer(command, indices.buffer, 0, VK_INDEX_TYPE_UINT32);
+            auto right = glm::cross(up[face], forward[face]);
             for (unsigned pass = 0; pass < 3; ++pass) {
                 if (skyOnly && pass != 0) { continue; }
                 if (pass == 2) {
                     VkClearAttachment clear{}; clear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT; clear.clearValue.depthStencil.depth = 1;
                     VkClearRect rectangle{{{0,0},{size,size}},0,1}; vkCmdClearAttachments(command, 1, &clear, 1, &rectangle);
                 }
-                glm::vec3 origin = pass == 0 ? glm::vec3(0) : pass == 1 && scene.skyScale > 0 ? cameraOrigin / scene.skyScale + scene.skyOrigin : cameraOrigin;
+                auto origin = origins[pass];
                 auto viewProjection = projection * glm::lookAtLH(origin, origin + forward[face], up[face]);
-                std::vector<uint32_t> order(scene.draws.size()); std::iota(order.begin(), order.end(), 0u);
-                std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { auto da = scene.draws[a].center - origin, db = scene.draws[b].center - origin; return glm::dot(da, da) > glm::dot(db, db); });
+                Push push{viewProjection, {origin, float(pass)}, pass == 2 ? clipPlane : glm::vec4(0), {scene.waterHeight, submerged ? 1.0f : 0.0f, float(mode), 0}};
+                vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
                 for (unsigned transparent = 0; transparent < 2; ++transparent) {
-                    for (uint32_t i : order) {
-                        const auto& draw = scene.draws[i]; const auto& material = scene.materials[draw.material];
-                        if (mode && ((material.flags & Water) || material.translucent || material.additive)) { continue; }
-                        if (mode == 1 && draw.lighting && !scene.materials.at(scene.waterMaterial).water.reflectEntities) { continue; }
-                        if ((draw.skyBox ? 0u : draw.skyWorld ? 1u : 2u) != pass || bool(transparent) != (material.translucent || material.additive)) { continue; }
-                        if (!mode && !draw.visibility.empty() && probeIndex < scene.probes.size() && !(draw.visibility.at(probeIndex / 64) & (uint64_t(1) << (probeIndex % 64)))) { ++culledDraws; continue; }
+                    for (uint32_t i : viewDraws[pass][transparent]) {
+                        const auto& draw = scene.draws[i];
                         auto relative = draw.center - origin;
-                        float z = glm::dot(relative, forward[face]), x = glm::dot(relative, glm::cross(up[face], forward[face])), y = glm::dot(relative, up[face]);
+                        float z = glm::dot(relative, forward[face]), x = glm::dot(relative, right), y = glm::dot(relative, up[face]);
                         if (!draw.skyBox && (z + draw.radius < 1 || std::abs(x) - z > draw.radius * 1.414214f || std::abs(y) - z > draw.radius * 1.414214f)) { ++culledDraws; continue; }
-                        unsigned key = (material.translucent ? 1u : 0u) | (material.additive ? 2u : 0u) | (material.noCull ? 4u : 0u) | (draw.skyBox ? 8u : 0u);
-                        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline(key));
+                        if (drawPipelines[i] != bound) { bound = drawPipelines[i]; vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, bound); }
                         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptors[i], 0, nullptr);
-                        Push push{viewProjection, {origin, float(pass)}, pass == 2 ? clipPlane : glm::vec4(0), {scene.waterHeight, submerged ? 1.0f : 0.0f, float(mode), 0}};
-                        vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
                         vkCmdDrawIndexed(command, draw.indexCount, 1, draw.firstIndex, 0, 0);
                         ++drawCalls;
                     }
