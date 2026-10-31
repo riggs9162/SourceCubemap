@@ -340,6 +340,15 @@ struct Renderer::Impl {
             barrier(image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1, 6);
         }
         submit();
+        writeWaterDescriptors();
+    }
+    void writeWaterDescriptors() {
+        std::array<VkDescriptorImageInfo, 2> targets{{{VK_NULL_HANDLE,waterReflection.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},{VK_NULL_HANDLE,waterRefraction.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}}};
+        std::vector<VkWriteDescriptorSet> writes; writes.reserve(descriptors.size() * 2);
+        for (auto descriptor : descriptors) {
+            for (uint32_t i = 0; i < 2; ++i) { writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,descriptor,11+i,0,1,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,&targets[i],nullptr,nullptr}); }
+        }
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
     /// Submits queued transfers, moving every queued image from undefined contents to shader-readable data.
     void flushTransfers() {
@@ -499,6 +508,7 @@ struct Renderer::Impl {
             flushTransfers();
         } catch (...) { vkDeviceWaitIdle(device); imageCopies.clear(); stagingUsed = 0; transferOpen = false; releaseImages(); throw; }
         uploadTotalSeconds += uploadTimer.seconds();
+        if (targetSize) { writeWaterDescriptors(); }
     }
     void renderViews(const Scene& scene, glm::vec3 cameraOrigin, size_t probeIndex, bool skyOnly, unsigned mode, bool submerged, glm::vec4 clipPlane) {
         uint32_t size = targetSize;
@@ -558,12 +568,6 @@ struct Renderer::Impl {
     Cube capture(const Scene& scene, const Probe& probe, bool skyOnly) {
         uint32_t factor = options.quality == "high" ? 2 : 1;
         uint32_t size = probe.resolution * factor; targets(size, scene.hasWater);
-        for (auto descriptor : descriptors) {
-            std::array<VkDescriptorImageInfo, 2> images{{{VK_NULL_HANDLE,waterReflection.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},{VK_NULL_HANDLE,waterRefraction.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}}};
-            std::array<VkWriteDescriptorSet, 2> writes{};
-            for (uint32_t i = 0; i < 2; ++i) { writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,descriptor,11+i,0,1,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,&images[i],nullptr,nullptr}; }
-            vkUpdateDescriptorSets(device, 2, writes.data(), 0, nullptr);
-        }
         auto found = std::find_if(scene.probes.begin(), scene.probes.end(), [&](const auto& value) { return value.origin == probe.origin; });
         size_t probeIndex = static_cast<size_t>(found - scene.probes.begin());
         bool submerged = scene.hasWater && probeIndex < scene.submergedProbes.size() && scene.submergedProbes[probeIndex];
