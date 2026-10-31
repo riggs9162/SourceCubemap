@@ -601,7 +601,7 @@ public:
 };
 
 Scene Builder::build() {
-    auto unsupported = [&](std::string message) { require(options.experimental, message + " Use --experimental to explicitly omit this feature."); scene.diagnostics["warnings"].push_back(std::move(message)); };
+    auto unsupported = [&](std::string message) { require(options.experimental, message + " Use --experimental to explicitly omit this feature."); warn(std::move(message)); };
     if (bsp.lumps[45].length) { unsupported("Compiled overlays are not rendered."); }
     for (const auto& entity : bsp.entities) {
         auto type = std::string(entity["classname"].getValue()), model = std::string(entity["model"].getValue());
@@ -635,8 +635,11 @@ Scene Builder::build() {
         if (model.starts_with('*')) { brushEntities.emplace(model, &entity); }
     }
     for (size_t m = 1; m < brushModels.size(); ++m) {
+        const auto& model = brushModels[m];
+        require(model.firstFace >= 0 && model.numFaces >= 0 && size_t(model.firstFace) + model.numFaces <= faces.size(), "Brush model face range is invalid.");
+        for (int i = 0; i < model.numFaces; ++i) { faceModels[model.firstFace + i] = static_cast<uint32_t>(m); }
         auto located = brushEntities.find(std::format("*{}", m));
-        require(located != brushEntities.end(), "A brush model has no corresponding entity.");
+        if (located == brushEntities.end()) { brushStates[m].hidden = true; continue; }
         const auto* found = located->second;
         auto type = std::string((*found)["classname"].getValue());
         auto& state = brushStates[m];
@@ -647,29 +650,36 @@ Scene Builder::build() {
         if (type == "func_monitor") { unsupported("Live monitor brush surfaces are not rendered."); state.hidden = true; }
         if (type == "func_lod" && !state.hidden) {
             require(options.experimental, "Distance-dependent func_lod fading is not implemented. Use --experimental to render these brushes without fading.");
-            scene.diagnostics["warnings"].push_back("func_lod brushes render without distance fading in experimental captures.");
+            warn("func_lod brushes render without distance fading in experimental captures.");
         }
-        require(state.hidden || door || type == "func_tracktrain" || type == "func_train" || type == "func_physbox" || type == "func_rotating" || type == "func_lod" || type == "func_brush" || type == "func_illusionary" || type == "func_wall" || type == "func_button" || type == "func_reflective_glass" || type == "func_breakable", "Unsupported initial brush-entity behavior: {}", type);
-        if ((type == "func_physbox" || type == "func_rotating") && !state.hidden) {
-            require(options.time == 0 && (*found)["parentname"].getValue().empty(), "'{}' supports only the unparented authored pose at capture time zero.", type);
+        static const std::set<std::string, std::less<>> staticBrushes{"func_tracktrain", "func_train", "func_physbox", "func_rotating", "func_lod", "func_brush", "func_illusionary", "func_wall", "func_button", "func_reflective_glass", "func_breakable", "func_breakable_surf", "func_movelinear", "func_rot_button", "func_conveyor", "func_plat", "func_platrot", "func_pushable", "func_wall_toggle", "momentary_rot_button"};
+        if (!state.hidden && !door && !staticBrushes.contains(type)) { approximate(std::format("Brush entity '{}' renders at its authored pose; its runtime behavior is not simulated.", type)); }
+        if ((type == "func_physbox" || type == "func_rotating") && !state.hidden && !(options.time == 0 && (*found)["parentname"].getValue().empty())) {
+            approximate(std::format("'{}' renders at its unparented authored pose.", type));
         }
-        require(state.hidden || ((state.renderMode == 0 || state.renderMode == 2 || state.renderMode == 4 || state.renderMode == 5) && parseFloat((*found)["renderfx"].getValue()) == 0), "Brush-entity render effects are not implemented: {} '{}' (mode {}, effect {}).", type, (*found)["targetname"].getValue(), (*found)["rendermode"].getValue(), (*found)["renderfx"].getValue());
+        if (!state.hidden && (!(state.renderMode == 0 || state.renderMode == 2 || state.renderMode == 4 || state.renderMode == 5) || parseFloat((*found)["renderfx"].getValue()) != 0)) {
+            approximate(std::format("Brush-entity render effects are approximated: {} '{}' (mode {}, effect {}).", type, (*found)["targetname"].getValue(), (*found)["rendermode"].getValue(), (*found)["renderfx"].getValue()));
+            state.renderMode = state.renderMode == 1 ? 2 : state.renderMode == 6 ? 0 : state.renderMode == 3 || state.renderMode == 7 || state.renderMode == 8 || state.renderMode == 9 ? 5 : state.renderMode;
+        }
         auto origin = parseVector((*found)["origin"].getValue()), angles = parseVector((*found)["angles"].getValue());
         if (type == "func_tracktrain" && !state.hidden) {
-            auto pose = initialTrackTrainPose(bsp, *found, options.time); origin = pose.origin; angles = pose.angles;
-            scene.diagnostics["tracktrains"].push_back({{"name", std::string((*found)["targetname"].getValue())}, {"origin", {origin.x, origin.y, origin.z}}, {"angles", {angles.x, angles.y, angles.z}}, {"state", "initial_path_pose"}});
+            try {
+                auto pose = initialTrackTrainPose(bsp, *found, options.time); origin = pose.origin; angles = pose.angles;
+                scene.diagnostics["tracktrains"].push_back({{"name", std::string((*found)["targetname"].getValue())}, {"origin", {origin.x, origin.y, origin.z}}, {"angles", {angles.x, angles.y, angles.z}}, {"state", "initial_path_pose"}});
+            } catch (const Error& error) { approximate(std::format("func_tracktrain '{}' keeps its authored pose: {}", (*found)["targetname"].getValue(), error.what())); }
         }
-        const auto& model = brushModels[m];
         if (type == "func_train" && !state.hidden) {
-            auto pose = initialPathTrainPose(bsp, *found, (vec3(model.min) + vec3(model.max)) * 0.5f, options.time); origin = pose.origin; angles = pose.angles;
-            scene.diagnostics["path_trains"].push_back({{"name", std::string((*found)["targetname"].getValue())}, {"origin", {origin.x, origin.y, origin.z}}, {"angles", {angles.x, angles.y, angles.z}}, {"state", "initial_path_pose"}});
+            try {
+                auto pose = initialPathTrainPose(bsp, *found, (vec3(model.min) + vec3(model.max)) * 0.5f, options.time); origin = pose.origin; angles = pose.angles;
+                scene.diagnostics["path_trains"].push_back({{"name", std::string((*found)["targetname"].getValue())}, {"origin", {origin.x, origin.y, origin.z}}, {"angles", {angles.x, angles.y, angles.z}}, {"state", "initial_path_pose"}});
+            } catch (const Error& error) { approximate(std::format("func_train '{}' keeps its authored pose: {}", (*found)["targetname"].getValue(), error.what())); }
         }
         if (door) {
             float flagsValue = parseFloat((*found)["spawnflags"].getValue()), spawn = parseFloat((*found)["spawnpos"].getValue());
-            require(flagsValue >= 0 && flagsValue <= 131071 && std::floor(flagsValue) == flagsValue && (spawn == 0 || spawn == 1), "Invalid initial door state.");
+            require(flagsValue >= 0 && flagsValue <= 16777215 && std::floor(flagsValue) == flagsValue && (spawn == 0 || spawn == 1), "Invalid initial door state.");
             auto flags = static_cast<uint32_t>(flagsValue);
             if ((flags & 1) || spawn == 1) {
-                require((*found)["parentname"].getValue().empty(), "A parented door starting open requires runtime parent transforms.");
+                if (!(*found)["parentname"].getValue().empty()) { approximate("A parented door starting open uses its unparented transform."); }
                 if (type == "func_door_rotating") {
                     unsigned axis = (flags & 64) ? 2 : (flags & 128) ? 0 : 1;
                     angles[axis] += parseFloat((*found)["distance"].getValue()) * ((flags & 2) ? -1.0f : 1.0f);
@@ -682,17 +692,17 @@ Scene Builder::build() {
         }
         state.matrix = transform(origin, angles);
         state.color = glm::vec4(parseVector((*found)["rendercolor"].getValue(), glm::vec3(255)) / 255.0f, parseFloat((*found)["renderamt"].getValue(), 255) / 255.0f);
-        require(model.firstFace >= 0 && model.numFaces >= 0 && size_t(model.firstFace) + model.numFaces <= faces.size(), "Brush model face range is invalid.");
-        for (int i = 0; i < model.numFaces; ++i) { faceModels[model.firstFace + i] = static_cast<uint32_t>(m); }
     }
     nodesData = bsp.view(5); planeData = bsp.view(1); leafData = bsp.view(10); leafFaceData = bsp.view(16); visData = bsp.view(4);
     indexLeaves();
     if (options.planarWater && bsp.lumps[36].length) {
         auto waterData = bsp.view(36); Reader water(waterData, "water volumes");
         require(bsp.lumps[36].version == 0 && waterData.size() % 12 == 0, "Unsupported water volume layout.");
-        scene.hasWater = true; scene.waterHeight = water.at<float>(0);
-        require(std::isfinite(scene.waterHeight), "Invalid water surface height.");
-        for (size_t i = 0; i < waterData.size(); i += 12) { require(water.at<float>(i) == scene.waterHeight, "Multiple water surface heights are not implemented."); }
+        std::map<float, uint32_t> heights;
+        for (size_t i = 0; i < waterData.size(); i += 12) { require(std::isfinite(water.at<float>(i)), "Invalid water surface height."); ++heights[water.at<float>(i)]; }
+        scene.hasWater = true;
+        scene.waterHeight = std::max_element(heights.begin(), heights.end(), [](const auto& a, const auto& b) { return a.second < b.second; })->first;
+        if (heights.size() > 1) { approximate(std::format("{} water surface heights share the plane at {}.", heights.size(), scene.waterHeight)); }
         for (const auto& probe : bsp.probes) { scene.submergedProbes.push_back((Reader(leafData).at<uint32_t>(size_t(leafAt(glm::vec3(probe.origin))) * 32) & 32) != 0); }
         scene.diagnostics["warnings"].push_back("Planar water uses one reflection level and depth refraction; distortion and fog are experimental.");
         scene.diagnostics["warnings"].push_back("Water secondary views omit translucent and additive surfaces. Underwater fog uses the above-water material settings.");
@@ -707,7 +717,7 @@ Scene Builder::build() {
     Reader strings(stringsData, "material names"), offsets(stringOffsets, "material string offsets"), planes(planeData, "planes"), disp(displacements, "displacements"), dispVerts(dispVertices, "displacement vertices");
     for (const auto& entity : bsp.entities) {
         if (entity["classname"].getValue() == "sky_camera") {
-            require(scene.skyScale == 0, "Multiple 3D sky cameras are not supported.");
+            if (scene.skyScale != 0) { approximate("Multiple 3D sky cameras exist; the first one is used."); continue; }
             require(!visData.empty(), "A 3D skybox requires compiled visibility data for scene classification.");
             scene.skyOrigin = parseVector(entity["origin"].getValue());
             scene.skyScale = parseFloat(entity["scale"].getValue(), 16);
@@ -720,7 +730,7 @@ Scene Builder::build() {
                 scene.skyFogEnd = parseFloat(entity["fogend"].getValue()) / scene.skyScale;
             }
         } else if (entity["classname"].getValue() == "env_fog_controller" && parseFloat(entity["fogenable"].getValue()) != 0) {
-            require(scene.fogEnd == 0, "Multiple enabled fog controllers need runtime state selection.");
+            if (scene.fogEnd != 0) { approximate("Multiple enabled fog controllers exist; the first one is used."); continue; }
             scene.fogColor = parseVector(entity["fogcolor"].getValue()) / 255.0f;
             scene.fogStart = parseFloat(entity["fogstart"].getValue()); scene.fogEnd = parseFloat(entity["fogend"].getValue());
         }
@@ -796,9 +806,9 @@ Scene Builder::build() {
         require(polygon.size() >= 3, "Face has fewer than three vertices.");
         auto normal = planes.at<glm::vec3>(size_t(face.planeNum) * 20) * (face.side ? -1.0f : 1.0f);
         if (mat.flags & Water) {
-            require(scene.hasWater, "Water faces have no compiled water volume.");
+            if (!scene.hasWater) { approximate(std::format("Water face using '{}' has no compiled water volume and is omitted.", name)); continue; }
             if (std::abs(normal.z) < 0.999f) { continue; }
-            require(faceModels[faceIndex] == 0 && !inSkyWorld && std::abs(polygon.front().z - scene.waterHeight) < 0.1f, "Moving, sloped, and skybox water are not implemented.");
+            if (faceModels[faceIndex] != 0 || inSkyWorld || std::abs(polygon.front().z - scene.waterHeight) >= 0.1f) { approximate("Moving, skybox, or offset water shares the main water plane's reflection."); }
             if (mat.water.above) { scene.waterMaterial = materialIndex; }
         }
         const auto& uvTransform = materialUv(materialIndex);
@@ -881,7 +891,12 @@ Scene Builder::build() {
         scene.indices.insert(scene.indices.end(), indices.begin(), indices.end());
     }
     addProps();
-    require(!scene.hasWater || (scene.waterMaterial < scene.materials.size() && (scene.materials[scene.waterMaterial].flags & Water)), "Water volumes require a supported above-water surface material.");
+    if (scene.hasWater && !(scene.waterMaterial < scene.materials.size() && (scene.materials[scene.waterMaterial].flags & Water))) {
+        approximate("Water volumes have no above-water surface material.");
+        auto found = std::find_if(scene.materials.begin(), scene.materials.end(), [](const auto& item) { return (item.flags & Water) != 0; });
+        scene.waterMaterial = static_cast<uint32_t>(found - scene.materials.begin());
+        if (found == scene.materials.end()) { scene.hasWater = false; scene.waterMaterial = 0; scene.submergedProbes.clear(); }
+    }
     addSky();
     finishImages();
     parallelFor(scene.draws.size(), [&](size_t index) {
