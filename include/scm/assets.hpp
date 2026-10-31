@@ -5,7 +5,7 @@
 #include <set>
 
 namespace scm {
-struct Asset { Bytes bytes; std::string origin; };
+struct Asset { Bytes bytes; std::string origin; std::string hash; };
 struct MaterialDefinition {
     std::string shader;
     std::map<std::string, std::string> parameters;
@@ -24,6 +24,7 @@ public:
 private:
     class DirectoryIndex;
     struct Mount { fs::path path; std::unique_ptr<vpkpp::PackFile> archive; std::shared_ptr<DirectoryIndex> files; };
+    std::shared_ptr<const Asset> remember(const std::string& name, Bytes bytes, std::string origin);
     friend const MaterialDefinition& readMaterial(Assets& assets, std::string name, bool hdr, unsigned depth);
     const Bsp& bsp;
     std::vector<Mount> sources;

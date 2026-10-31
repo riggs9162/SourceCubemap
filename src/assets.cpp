@@ -139,21 +139,22 @@ Assets::Assets(const Bsp& map, const fs::path& game, const std::vector<std::stri
         if (config.getChildCount()) { for (const auto& entry : config[0]) { mount(fs::path(entry.getValue()), false); } }
     }
 }
+std::shared_ptr<const Asset> Assets::remember(const std::string& name, Bytes bytes, std::string origin) {
+    auto asset = std::make_shared<Asset>(Asset{std::move(bytes), std::move(origin), {}});
+    asset->hash = digest(asset->bytes);
+    cache.emplace(name, asset);
+    return asset;
+}
 std::shared_ptr<const Asset> Assets::find(std::string name) {
     name = assetPath(std::move(name));
     if (auto found = cache.find(name); found != cache.end()) { return found->second; }
-    if (auto value = bsp.embedded(name)) {
-        auto asset = std::make_shared<Asset>(Asset{std::move(*value), bsp.path.string() + "::" + name});
-        cache.emplace(name, asset);
-        return asset;
-    }
+    if (auto value = bsp.embedded(name)) { return remember(name, std::move(*value), bsp.path.string() + "::" + name); }
     for (const auto& source : sources) {
         std::optional<Bytes> bytes;
         if (source.archive) { bytes = source.archive->readEntry(name); }
         else if (source.files->contains(name)) { bytes = readFile(source.path / name); }
         if (!bytes) { continue; }
-        auto asset = std::make_shared<Asset>(Asset{std::move(*bytes), source.path.string() + "::" + name});
-        cache.emplace(name, asset);
+        auto asset = remember(name, std::move(*bytes), source.path.string() + "::" + name);
         spdlog::debug("Resolved {} from {}", name, asset->origin);
         return asset;
     }
@@ -173,7 +174,7 @@ Json Assets::report() const {
     std::vector<std::string> names;
     for (const auto& [name, value] : cache) { names.push_back(name); }
     std::sort(names.begin(), names.end());
-    for (const auto& name : names) { const auto& value = cache.at(name); if (value) { result["resolved"].push_back({{"path", name}, {"source", value->origin}, {"hash", digest(value->bytes)}}); } else { result["unresolved_lookups"].push_back(name); } }
+    for (const auto& name : names) { const auto& value = cache.at(name); if (value) { result["resolved"].push_back({{"path", name}, {"source", value->origin}, {"hash", value->hash}}); } else { result["unresolved_lookups"].push_back(name); } }
     return result;
 }
 std::string MaterialDefinition::value(std::string_view key, std::string fallback) const {
