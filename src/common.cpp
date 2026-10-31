@@ -48,14 +48,30 @@ void writeFileParts(const fs::path& path, std::initializer_list<std::span<const 
 
 std::string textOf(std::span<const std::byte> bytes) { return {reinterpret_cast<const char*>(bytes.data()), bytes.size()}; }
 std::string lower(std::string value) {
-    for (char& c : value) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
+    for (char& c : value) { if (c >= 'A' && c <= 'Z') { c = static_cast<char>(c + ('a' - 'A')); } }
     return value;
+}
+namespace {
+bool normalized(std::string_view path) {
+    size_t segment = 0;
+    for (size_t i = 0; i <= path.size(); ++i) {
+        if (i < path.size() && path[i] != '/') {
+            if (static_cast<unsigned char>(path[i]) >= 128) { return false; }
+            continue;
+        }
+        auto part = path.substr(segment, i - segment);
+        if (part.empty() || part == "." || part == "..") { return false; }
+        segment = i + 1;
+    }
+    return true;
+}
 }
 std::string assetPath(std::string value) {
     value = lower(std::move(value));
     std::replace(value.begin(), value.end(), '\\', '/');
     while (value.starts_with("./")) { value.erase(0, 2); }
     require(!value.empty() && value.front() != '/' && value.find(':') == std::string::npos, "Asset paths must be relative.");
+    if (normalized(value)) { return value; }
     fs::path path(value);
     for (const auto& segment : path) { require(segment != "..", "Asset paths cannot escape a mount."); }
     return path.lexically_normal().generic_string();
