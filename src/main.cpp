@@ -5,6 +5,8 @@
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <Windows.h>
+#include <dxgi.h>
+#include <wrl/client.h>
 #include <iostream>
 #include <set>
 #include <cmath>
@@ -187,6 +189,64 @@ std::optional<scm::Bytes> readCapture(const scm::fs::path& file, const scm::Prob
         return bytes;
     } catch (const std::exception& error) { spdlog::warn("Ignoring capture cache: {}", error.what()); return {}; }
 }
+/// Identifies the installed graphics adapters and drivers without starting Vulkan, so unchanged builds can be recognized cheaply.
+std::string adapterIdentity() {
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) { return {}; }
+    std::string identity;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    for (UINT index = 0; factory->EnumAdapters1(index, &adapter) != DXGI_ERROR_NOT_FOUND; ++index) {
+        DXGI_ADAPTER_DESC1 description{}; LARGE_INTEGER driver{};
+        if (FAILED(adapter->GetDesc1(&description))) { return {}; }
+        adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver);
+        identity += std::format("{:x}:{:x}:{:x}:{:x};", description.VendorId, description.DeviceId, description.Revision, driver.QuadPart);
+    }
+    return identity;
+}
+scm::fs::path buildManifest(const Options& options, const scm::Bsp& bsp, const scm::Assets& assets, std::string_view shaders) {
+    scm::Json key{{"schema", 1}, {"version", SCM_VERSION}, {"bsp", scm::digest(bsp.bytes)}, {"mounts", assets.report().at("mounts")}, {"shaders", shaders}, {"quality", options.quality}, {"hdr", options.hdr}, {"time", options.captureTime}, {"experimental", options.experimental}, {"water", options.water}, {"device", options.device}, {"profile", options.profile}};
+    auto text = key.dump();
+    return scm::fs::path(options.cache) / "captures" / ("build-" + scm::digest(std::as_bytes(std::span(text.data(), text.size())))) / "manifest.json";
+}
+struct ReusedBuild { scm::Json scenes = scm::Json::array(), renderer; size_t captures = 0; };
+/// Restores a previous build without Vulkan or scene loading when its manifest, adapters, dependencies, and every capture still match.
+std::optional<ReusedBuild> reuseBuild(const Options& options, const scm::Bsp& bsp, scm::Assets& assets, const std::vector<bool>& variants, const scm::fs::path& file, std::string_view adapters, TextureStore& store) {
+    if (adapters.empty() || !scm::fs::exists(file)) { return {}; }
+    try {
+        auto manifest = scm::Json::parse(scm::textOf(scm::readFile(file)));
+        const auto& recorded = manifest.at("variants");
+        if (manifest.at("adapters").get<std::string>() != adapters || recorded.size() != variants.size()) { return {}; }
+        for (size_t i = 0; i < variants.size(); ++i) {
+            if (recorded[i].at("hdr").get<bool>() != variants[i] || recorded[i].at("scene_key").get<std::string>() != scm::sceneCacheKey(bsp, assets, sceneSettings(options, variants[i], recorded[i].at("default_sky")))) { return {}; }
+        }
+        const auto& dependencies = recorded.back().at("assets");
+        for (const auto& name : dependencies.at("unresolved_lookups")) { if (assets.find(name.get<std::string>())) { return {}; } }
+        for (const auto& dependency : dependencies.at("resolved")) {
+            auto current = assets.find(dependency.at("path").get<std::string>());
+            if (!current || current->origin != dependency.at("source").get<std::string>() || scm::digest(current->bytes) != dependency.at("hash").get<std::string>()) { return {}; }
+        }
+        ReusedBuild result; result.renderer = manifest.at("renderer");
+        for (auto& [key, value] : result.renderer.items()) { if (value.is_number() && key != "driver_version") { value = 0; } }
+        std::atomic_bool complete = true;
+        for (const auto& variant : recorded) {
+            bool hdr = variant.at("hdr");
+            auto requests = captureRequests(bsp, hdr, variant.at("default_sky"));
+            auto cacheKey = variant.at("cache_key").get<std::string>();
+            scm::parallelFor(requests.size(), [&](size_t index) {
+                const auto& request = requests[index];
+                auto bytes = readCapture(captureFile(options, cacheKey, request.name), request.probe);
+                if (!bytes) { complete = false; return; }
+                if (!options.previews.empty()) { scm::writePreview(scm::decodeCube(*bytes, hdr), options.previews, request.name); }
+                store.add(request.name, std::move(*bytes));
+            });
+            if (!complete) { store.clear(); return {}; }
+            result.captures += requests.size();
+            auto geometry = variant.at("geometry"); geometry["scene_cache_hit"] = true;
+            result.scenes.push_back({{"hdr", hdr}, {"geometry", std::move(geometry)}, {"assets", variant.at("assets")}});
+        }
+        return result;
+    } catch (const std::exception& error) { spdlog::warn("Ignoring build manifest: {}", error.what()); store.clear(); return {}; }
+}
 struct LoadedScene { bool defaultSky = false; scm::Scene scene; std::string sceneKey; scm::Json assets; double seconds = 0; };
 scm::Json build(const Options& options, const scm::fs::path& output) {
     scm::require(std::isfinite(options.captureTime) && options.captureTime >= 0, "Capture time must be a finite nonnegative number.");
@@ -202,8 +262,11 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
             return renderer;
         });
     };
+    bool reuseAllowed = options.incremental && !options.noCache;
     std::unique_ptr<scm::Renderer> renderer;
-    auto starting = startRenderer();
+    std::future<std::unique_ptr<scm::Renderer>> starting;
+    if (!reuseAllowed) { starting = startRenderer(); }
+    auto identifying = std::async(std::launch::async, [&] { return options.noCache ? std::string{} : adapterIdentity(); });
     scm::Bsp bsp(options.input);
     bsp.validateDestination(output, options.overwrite, options.inPlace);
     scm::require(!bsp.probes.empty(), "The map contains no cubemap samples.");
@@ -225,7 +288,20 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
     scm::Assets assets(bsp, options.game, options.mounts, options.profile);
     assetsSeconds += mounting.seconds();
     auto shaders = scm::digest(scm::readFile(shaderDirectory() / "scene.vert.spv")) + scm::digest(scm::readFile(shaderDirectory() / "scene.frag.spv"));
-    {
+    scm::fs::path manifestFile;
+    if (!options.noCache) { manifestFile = buildManifest(options, bsp, assets, shaders); }
+    auto adapters = identifying.get();
+    std::optional<ReusedBuild> reused;
+    if (reuseAllowed) {
+        scm::Stopwatch checking;
+        reused = reuseBuild(options, bsp, assets, variants, manifestFile, adapters, store);
+        assetsSeconds += checking.seconds();
+        if (!reused) { starting = startRenderer(); }
+    }
+    if (reused) {
+        spdlog::info("All {} captures are unchanged; reusing them without rendering", reused->captures);
+        scenes = std::move(reused->scenes); rendererStatistics = std::move(reused->renderer); reusedCaptures = reused->captures;
+    } else {
         auto load = [&](bool hdr) {
             cancellation.check();
             scm::Stopwatch loading;
@@ -238,6 +314,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
             result.seconds = loading.seconds();
             return result;
         };
+        scm::Json manifestVariants = scm::Json::array();
         EncoderPool encoders;
         auto loading = std::async(std::launch::async, load, bool(variants.front()));
         for (size_t variant = 0; variant < variants.size(); ++variant) {
@@ -288,11 +365,17 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
                 });
             }
             scenes.push_back({{"hdr", hdr}, {"geometry", loaded.scene.diagnostics}, {"assets", loaded.assets}});
+            manifestVariants.push_back({{"hdr", hdr}, {"default_sky", loaded.defaultSky}, {"scene_key", loaded.sceneKey}, {"cache_key", cacheKey}, {"geometry", loaded.scene.diagnostics}, {"assets", std::move(loaded.assets)}});
         }
         scm::Stopwatch waiting;
         encoders.finish();
         encodeWaitSeconds = waiting.seconds();
         rendererStatistics = renderer->statistics();
+        if (!options.noCache && !adapters.empty()) {
+            auto text = scm::Json{{"adapters", adapters}, {"renderer", rendererStatistics}, {"variants", std::move(manifestVariants)}}.dump();
+            auto bytes = std::as_bytes(std::span(text.data(), text.size()));
+            scm::queueCacheFile(manifestFile, scm::Bytes(bytes.begin(), bytes.end()));
+        }
     }
     scm::Stopwatch writing;
     cancellation.check(); progress(options, "writing_bsp");
