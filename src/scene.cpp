@@ -13,6 +13,7 @@
 #include <sstream>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 
 namespace scm {
 namespace {
@@ -571,9 +572,15 @@ Scene Builder::build() {
     struct BrushState { glm::mat4 matrix{1}; glm::vec4 color{1}; bool hidden = false; int renderMode = 0; };
     std::vector<BrushState> brushStates(brushModels.size());
     std::vector<uint32_t> faceModels(faces.size(), 0);
+    std::unordered_map<std::string_view, const bsppp::BSPEntityKeyValues*> brushEntities;
+    for (const auto& entity : bsp.entities) {
+        auto model = entity["model"].getValue();
+        if (model.starts_with('*')) { brushEntities.emplace(model, &entity); }
+    }
     for (size_t m = 1; m < brushModels.size(); ++m) {
-        auto found = std::find_if(bsp.entities.begin(), bsp.entities.end(), [&](const auto& entity) { return entity["model"].getValue() == "*" + std::to_string(m); });
-        require(found != bsp.entities.end(), "A brush model has no corresponding entity.");
+        auto located = brushEntities.find(std::format("*{}", m));
+        require(located != brushEntities.end(), "A brush model has no corresponding entity.");
+        const auto* found = located->second;
         auto type = std::string((*found)["classname"].getValue());
         auto& state = brushStates[m];
         state.renderMode = static_cast<int>(parseFloat((*found)["rendermode"].getValue()));
