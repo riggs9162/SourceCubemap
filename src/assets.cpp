@@ -232,7 +232,12 @@ std::string MaterialDefinition::value(std::string_view key, std::string fallback
     auto found = parameters.find(std::string(key));
     return found == parameters.end() ? fallback : found->second;
 }
-bool MaterialDefinition::flag(std::string_view key) const { return parseFloat(value(key), 0) != 0; }
+bool MaterialDefinition::flag(std::string_view key) const {
+    auto text = value(key);
+    char* end = nullptr;
+    double number = std::strtod(text.c_str(), &end);
+    return end != text.c_str() && number != 0;
+}
 namespace {
 MaterialDefinition parseMaterial(Assets& assets, const std::string& name, bool hdr, unsigned depth) {
     auto bytes = assets.get(name, "material");

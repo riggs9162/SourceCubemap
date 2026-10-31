@@ -12,6 +12,7 @@ struct MaterialDefinition {
     std::vector<std::string> proxies;
     std::vector<std::map<std::string, std::string>> proxyParameters;
     std::string value(std::string_view key, std::string fallback = {}) const;
+    /// Reads an on/off parameter the way the engine does: text that is not a number counts as off.
     bool flag(std::string_view key) const;
 };
 class Assets {
