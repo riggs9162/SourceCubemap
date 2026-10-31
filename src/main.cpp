@@ -331,6 +331,7 @@ scm::Json build(const Options& options, const scm::fs::path& output) {
             result.defaultSky = needsDefaultSky(bsp, assets, hdr, boundNamespaces, options.experimental);
             auto settings = sceneSettings(options, hdr, result.defaultSky);
             result.scene = scm::loadScene(bsp, assets, settings);
+            if (auto missing = result.scene.diagnostics.value("missing_assets", size_t(0))) { spdlog::warn("{} missing assets were replaced or left out, so reflections will differ. The report lists each one.", missing); }
             result.sceneKey = scm::sceneCacheKey(bsp, assets, settings);
             result.assets = assets.report();
             result.seconds = loading.seconds();

@@ -5,6 +5,12 @@
 #include <set>
 
 namespace scm {
+/// Raised when a required asset cannot be resolved from any mount. Names the asset so experimental builds can substitute it.
+class MissingAsset : public Error {
+public:
+    MissingAsset(std::string message, std::string name) : Error(std::move(message)), asset(std::move(name)) {}
+    std::string asset;
+};
 struct Asset { Bytes bytes; std::string origin; std::string hash; };
 struct MaterialDefinition {
     std::string shader;

@@ -217,7 +217,7 @@ std::shared_ptr<const Asset> Assets::get(std::string name, std::string_view requ
     if (asset) { return asset; }
     std::string searched = bsp.path.string() + " (embedded)";
     for (const auto& mount : sources) { searched += "\n  " + mount.path.string(); }
-    throw Error(std::format("Missing asset '{}' requested by '{}'. Searched:\n  {}", name, requestedBy, searched));
+    throw MissingAsset(std::format("Missing asset '{}' requested by '{}'. Searched:\n  {}", name, requestedBy, searched), name);
 }
 Json Assets::report() const {
     Json result{{"mounts", Json::array()}, {"resolved", Json::array()}, {"unresolved_lookups", Json::array()}};

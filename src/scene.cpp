@@ -182,6 +182,19 @@ public:
     void warn(std::string message) {
         if (warned.insert(message).second) { scene.diagnostics["warnings"].push_back(std::move(message)); }
     }
+    /// Records an asset that an experimental capture substitutes or omits.
+    void reportMissing(const std::string& asset, std::string_view requester, std::string_view outcome) {
+        missingAssets.insert(asset);
+        warn(std::format("Missing asset '{}' requested by '{}' {}.", asset, requester, outcome));
+    }
+    /// Returns the neutral gray that stands in for a missing color texture, so surfaces stay visible and keep their lighting.
+    uint32_t missingColor() {
+        if (!missingImage) {
+            missingImage = static_cast<uint32_t>(scene.images.size());
+            scene.images.push_back(solidImage("missing texture", glm::vec4(0.5f, 0.5f, 0.5f, 1)));
+        }
+        return missingImage;
+    }
     /// Refuses an approximation in strict mode; experimental captures continue and report it.
     void approximate(std::string message) {
         require(options.experimental, "{} Use --experimental to accept this approximation.", message);
@@ -198,7 +211,13 @@ public:
         if (!name.ends_with(".vtf")) { name += ".vtf"; }
         std::string key = name + (srgb ? ":srgb" : ":linear") + std::format(":{}", frame);
         if (textureIds.contains(key)) { return textureIds.at(key); }
-        auto asset = assets.get(name, requester);
+        auto asset = options.experimental ? assets.find(name) : assets.get(name, requester);
+        if (!asset) {
+            reportMissing(name, requester, srgb ? "renders gray" : "is ignored");
+            auto fallback = srgb ? missingColor() : 0u;
+            textureIds.emplace(key, fallback);
+            return fallback;
+        }
         uint32_t index = static_cast<uint32_t>(scene.images.size());
         scene.images.push_back({name});
         pendingTextures.push_back({index, std::move(asset), srgb, frame});
@@ -280,7 +299,16 @@ public:
         if (materialIds.contains(name)) { return materialIds.at(name); }
         Material material;
         material.name = name;
-        auto& definition = material.definition = readMaterial(assets, name, options.hdr);
+        try { material.definition = readMaterial(assets, name, options.hdr); }
+        catch (const MissingAsset& error) {
+            if (!options.experimental) { throw; }
+            reportMissing(error.asset, name, "renders gray");
+            material.base = missingColor();
+            uint32_t index = static_cast<uint32_t>(scene.materials.size());
+            scene.materials.push_back(std::move(material)); materialIds.emplace(name, index);
+            return index;
+        }
+        auto& definition = material.definition;
         auto shader = definition.shader;
         if (shader == "sdk_lightmappedgeneric" || shader == "sdk_unlitgeneric" || shader == "sdk_vertexlitgeneric" || shader == "sdk_worldvertextransition") {
             require(options.experimental, "SDK shader '{}' in '{}' requires --experimental; custom shader extensions are not certified.", shader, name);
@@ -309,7 +337,7 @@ public:
             catch (const Error& error) { warn(std::format("Water '{}' uses default settings: {}", name, error.what())); material.water = WaterMaterial{}; }
             float frame = parseFloat(definition.value("$bumpframe"));
             require(frame >= 0 && frame <= 65535 && std::floor(frame) == frame, "Invalid water normal frame.");
-            material.normal = texture(definition.value("$normalmap", "dev/water_normal"), false, name, static_cast<int>(frame));
+            if (auto normal = texture(definition.value("$normalmap", "dev/water_normal"), false, name, static_cast<int>(frame))) { material.normal = normal; }
             material.flags = Water | Unlit | NormalMap;
             material.noCull = true;
             return store();
@@ -421,11 +449,11 @@ public:
         material.base = texture(base, true, name, baseFrame);
         material.second = texture(definition.value(shader == "unlittwotexture" ? "$texture2" : "$basetexture2"), true, name);
         if (!definition.value("$blendmodulatetexture").empty()) {
-            if (shader == "worldvertextransition" && !definition.flag("$maskedblending")) { material.blendMask = texture(definition.value("$blendmodulatetexture"), false, name); material.flags |= BlendModulation; }
+            if (shader == "worldvertextransition" && !definition.flag("$maskedblending")) { if (auto mask = texture(definition.value("$blendmodulatetexture"), false, name)) { material.blendMask = mask; material.flags |= BlendModulation; } }
             else { approximate(std::format("Blend modulation in '{}' requires ordinary WorldVertexTransition blending and is ignored.", name)); }
         }
-        if (!definition.value("$bumpmap").empty()) { material.normal = texture(definition.value("$bumpmap"), false, name); material.flags |= NormalMap; }
-        if (!definition.value("$detail").empty()) { material.detail = texture(definition.value("$detail"), false, name); material.flags |= Detail; }
+        if (auto normal = texture(definition.value("$bumpmap"), false, name)) { material.normal = normal; material.flags |= NormalMap; }
+        if (auto detail = texture(definition.value("$detail"), false, name)) { material.detail = detail; material.flags |= Detail; }
         if (definition.flag("$alphatest")) { material.flags |= AlphaTest; }
         if (definition.flag("$selfillum")) { material.flags |= SelfIllum; }
         material.translucent = definition.flag("$translucent"); material.additive = definition.flag("$additive"); material.noCull = definition.flag("$nocull");
@@ -447,7 +475,7 @@ public:
         require(glm::all(glm::greaterThanEqual(material.selfIllumTint, glm::vec3(0))), "Self-illumination tint cannot be negative.");
         if (definition.flag("$selfillum") && !definition.value("$selfillummask").empty()) {
             if (shader != "vertexlitgeneric" || (material.flags & NormalMap)) { approximate(std::format("Separate self-illumination mask in '{}' is applied without native parity.", name)); }
-            material.selfIllumMask = texture(definition.value("$selfillummask"), false, name); material.flags |= SelfIllumMask;
+            if (auto mask = texture(definition.value("$selfillummask"), false, name)) { material.selfIllumMask = mask; material.flags |= SelfIllumMask; }
         }
         bool lightmappedPhong = options.profile == "gmod" && (shader == "lightmappedgeneric" || shader == "worldvertextransition");
         if (definition.flag("$phong") && (shader == "vertexlitgeneric" || lightmappedPhong)) {
@@ -463,7 +491,7 @@ public:
             material.phongTint = parseVector(definition.value("$phongtint"), glm::vec3(1));
             require(material.phongExponent > 0 && material.phongBoost >= 0 && material.phongExponentFactor >= 0, "Invalid Phong parameters in '{}'.", name);
             if (!definition.value("$phongexponenttexture").empty() && definition.value("$phongexponent").empty()) {
-                material.phongTexture = texture(definition.value("$phongexponenttexture"), false, name); material.flags |= PhongExponentTexture;
+                if (auto exponent = texture(definition.value("$phongexponenttexture"), false, name)) { material.phongTexture = exponent; material.flags |= PhongExponentTexture; }
             }
             if (definition.flag("$basemapalphaphongmask")) { material.flags |= PhongBaseAlpha; }
             if (definition.flag("$invertphongmask")) { material.flags |= PhongInvertMask; }
@@ -638,7 +666,8 @@ public:
     std::vector<PendingTexture> pendingTextures;
     std::vector<std::pair<uint32_t, std::vector<glm::vec4>>> lightmapPages;
     std::array<glm::vec4*, 4> pagePixels{};
-    std::set<std::string> warned;
+    std::set<std::string> warned, missingAssets;
+    uint32_t missingImage = 0;
     std::optional<WorldLighting> worldLighting;
     std::map<std::tuple<int, int, int, unsigned>, uint32_t> brushCells;
     std::array<uint32_t, 4> pageIds{};
@@ -959,6 +988,7 @@ Scene Builder::build() {
     });
     addSprites();
     finishImages();
+    if (!missingAssets.empty()) { scene.diagnostics["missing_assets"] = missingAssets.size(); }
     scene.diagnostics["vertices"] = scene.vertices.size();
     scene.diagnostics["triangles"] = scene.indices.size() / 3;
     scene.diagnostics["draws"] = scene.draws.size();
@@ -1046,9 +1076,14 @@ void Builder::addProps() {
         const auto& name = modelNames[modelIndex];
         auto stem = name.substr(0, name.size() - 4);
         result.name = &name;
-        result.mdl = assets.get(name, "static prop"); result.vtx = assets.get(stem + ".dx90.vtx", name); result.vvd = assets.get(stem + ".vvd", name);
-        result.checksum = Reader(result.mdl->bytes, name).at<uint32_t>(8);
         result.omitted = true;
+        try { result.mdl = assets.get(name, "static prop"); result.vtx = assets.get(stem + ".dx90.vtx", name); result.vvd = assets.get(stem + ".vvd", name); }
+        catch (const MissingAsset& error) {
+            if (!options.experimental) { throw; }
+            reportMissing(error.asset, "static prop", "leaves the prop out");
+            return result;
+        }
+        result.checksum = Reader(result.mdl->bytes, name).at<uint32_t>(8);
         if (result.checksum != Reader(result.vtx->bytes, name).at<uint32_t>(16) || result.checksum != Reader(result.vvd->bytes, name).at<uint32_t>(8)) { approximate(std::format("Model companion checksums differ, so '{}' is omitted.", name)); return result; }
         if (!result.model.open(result.mdl->bytes, result.vtx->bytes, result.vvd->bytes)) { approximate(std::format("Cannot load MDL/VTX/VVD model '{}', so it is omitted.", name)); return result; }
         for (const auto& part : result.model.mdl.bodyParts) { if (part.models.size() > 1) { approximate(std::format("Static-prop bodygroups in '{}' use the default body.", name)); break; } }
@@ -1172,7 +1207,8 @@ void Builder::addProps() {
                     auto candidate = assetPath(directory + "/" + materialName);
                     if (assets.find("materials/" + candidate + ".vmt")) { resolved = std::move(candidate); break; }
                 }
-                require(!resolved.empty(), "Missing model material '{}' requested by '{}'. Check mounted content and model material directories.", materialName, name);
+                require(!resolved.empty() || options.experimental, "Missing model material '{}' requested by '{}'. Check mounted content and model material directories.", materialName, name);
+                if (resolved.empty()) { resolved = assetPath(model.mdl.materialDirectories.empty() ? materialName : model.mdl.materialDirectories.front() + "/" + materialName); }
                 auto resolvedId = material(resolved); scene.materials[resolvedId].flags |= VertexLit;
                 known = prop.source->materials.emplace(slot, resolvedId).first;
             }
@@ -1250,6 +1286,7 @@ void Builder::addSky() {
             if (sky.starLayers) {
                 auto star = std::string(entity["startexture"].getValue());
                 sky.stars = texture(star.empty() ? "skybox/starfield" : star, false, "env_skypaint");
+                if (!sky.stars) { sky.starLayers = 0; }
                 require(options.experimental, "Painted sky clouds require --experimental until native sampling comparison passes.");
                 warn("Painted sky cloud sampling is experimental; full-face native parity is not certified.");
             }
