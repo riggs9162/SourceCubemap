@@ -38,7 +38,7 @@ Per-draw uniform buffers hold material, painted-sky, ambient, and world-light co
 - Visibility is conservative. Unreferenced displacement faces remain visible; 3D sky displacements use BSP area classification. Props are expanded into geometry rather than instanced. Transparency is ordered by draw bounds, not per triangle.
 - Asset file reads stay sequential, which keeps pressure off slow drives. Mounts open only when a lookup reaches them, so mount.cfg entries are not touched while earlier sources satisfy every lookup. Timeline synchronization, batched multi-probe readback, and persistent workers remain future work. A native Windows GUI now invokes the CLI worker, tracks progress, supports cancellation, and previews captured faces.
 - Steam discovery is linked but not exposed as automatic game selection. Steam depot toggles, Workshop activation state, language packs, runtime addon mounting, and arbitrary gameinfo directives are not fully reproduced. Use ordered explicit mounts and dependency tracing for these cases.
-- Static-prop VHV files are read from the embedded PAK only. Missing dependencies stop output with their requester and searched locations. The current failure reports the first blocking dependency rather than a complete missing-asset inventory.
+- Static-prop VHV files are read from the embedded PAK only. In strict mode a missing dependency stops output with its requester and searched locations, reporting only the first one. Experimental mode substitutes neutral gray for missing materials and color textures, ignores other missing textures, omits props with missing models, and lists every case in the report. Scene caches record these failed lookups, so they rebuild when the content appears.
 
 ## Acceptance
 
