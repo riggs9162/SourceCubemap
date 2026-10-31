@@ -372,6 +372,15 @@ struct Renderer::Impl {
         auto offset = stagingUsed; stagingUsed = std::min(staging.size, (offset + size + alignment - 1) / alignment * alignment);
         return offset;
     }
+    void uploadBuffer(VkBuffer target, std::span<const std::byte> data) {
+        for (VkDeviceSize written = 0; written < data.size();) {
+            auto length = std::min(VkDeviceSize(data.size()) - written, VkDeviceSize(64) << 20);
+            auto offset = reserveTransfer(length);
+            std::memcpy(static_cast<std::byte*>(staging.mapping) + offset, data.data() + written, static_cast<size_t>(length));
+            VkBufferCopy copy{offset, written, length}; vkCmdCopyBuffer(command, staging.buffer, target, 1, &copy);
+            written += length;
+        }
+    }
     GpuImage uploadImage(const Image& source) {
         uint32_t mipCount = source.mipCount;
         require(mipCount > 0 && mipCount <= std::bit_width(std::max(source.width, source.height)), "Invalid scene texture mip count.");
@@ -416,13 +425,14 @@ struct Renderer::Impl {
         uint32_t count = static_cast<uint32_t>(scene.draws.size());
         auto alignment = properties.limits.minUniformBufferOffsetAlignment;
         auto uniformStride = (sizeof(DrawUniform) + alignment - 1) / alignment * alignment;
-        uniforms = makeBuffer(std::max(VkDeviceSize(1), count * uniformStride), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, Memory::Readback);
+        uniforms = makeBuffer(std::max(VkDeviceSize(1), count * uniformStride), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, Memory::Device);
         std::array<VkDescriptorPoolSize, 3> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, count * 12}, {VK_DESCRIPTOR_TYPE_SAMPLER, count * 2}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, count}}};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; poolInfo.maxSets = count; poolInfo.poolSizeCount = static_cast<uint32_t>(sizes.size()); poolInfo.pPoolSizes = sizes.data();
         checked(vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool), "Create descriptor pool");
         std::vector<VkDescriptorSetLayout> layouts(count, descriptorLayout); descriptors.resize(count);
         VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocation.descriptorPool = descriptorPool; allocation.descriptorSetCount = count; allocation.pSetLayouts = layouts.data();
         checked(vkAllocateDescriptorSets(device, &allocation, descriptors.data()), "Allocate material descriptors");
+        Bytes uniformData(count * uniformStride);
         std::vector<VkDescriptorImageInfo> imageInfos; imageInfos.reserve(size_t(count) * 12);
         std::vector<VkDescriptorBufferInfo> bufferInfos; bufferInfos.reserve(count);
         std::vector<VkWriteDescriptorSet> writes; writes.reserve(size_t(count) * 13);
@@ -464,7 +474,7 @@ struct Renderer::Impl {
             uniform.waterScroll = {water.scroll.x, water.scroll.y, water.scale.x, water.scale.y};
             uniform.waterLayers = {water.scroll1.x, water.scroll1.y, water.scroll2.x, water.scroll2.y};
             uniform.waterTime = {water.scroll1.z, water.scroll2.z, static_cast<float>(scene.captureTime), 0};
-            std::memcpy(static_cast<std::byte*>(uniforms.mapping) + drawIndex * uniformStride, &uniform, sizeof(uniform));
+            std::memcpy(uniformData.data() + drawIndex * uniformStride, &uniform, sizeof(uniform));
             bufferInfos.push_back({uniforms.buffer, drawIndex * uniformStride, sizeof(DrawUniform)});
             writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[drawIndex], 10, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &bufferInfos.back(), nullptr});
             writeTexture(drawIndex, 13, material.blendMask);
@@ -473,17 +483,17 @@ struct Renderer::Impl {
             pipeline(key);
         }
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-        checked(vmaFlushAllocation(allocator, uniforms.allocation, 0, VK_WHOLE_SIZE), "Flush draw uniforms");
+        uploadBuffer(uniforms.buffer, uniformData);
     }
     void prepare(const Scene& scene) {
         checked(vkDeviceWaitIdle(device), "Wait before replacing scene"); releaseScene();
         require(!scene.vertices.empty() && !scene.indices.empty(), "The scene contains no renderable geometry.");
-        vertices = makeBuffer(scene.vertices.size() * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, Memory::Readback);
-        indices = makeBuffer(scene.indices.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, Memory::Readback);
-        std::memcpy(vertices.mapping, scene.vertices.data(), static_cast<size_t>(vertices.size)); std::memcpy(indices.mapping, scene.indices.data(), static_cast<size_t>(indices.size));
-        checked(vmaFlushAllocation(allocator, vertices.allocation, 0, VK_WHOLE_SIZE), "Flush vertices"); checked(vmaFlushAllocation(allocator, indices.allocation, 0, VK_WHOLE_SIZE), "Flush indices");
+        vertices = makeBuffer(scene.vertices.size() * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, Memory::Device);
+        indices = makeBuffer(scene.indices.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, Memory::Device);
         Stopwatch uploadTimer;
         try {
+            uploadBuffer(vertices.buffer, std::as_bytes(std::span(scene.vertices)));
+            uploadBuffer(indices.buffer, std::as_bytes(std::span(scene.indices)));
             uploadImages(scene);
             writeDraws(scene);
             flushTransfers();
