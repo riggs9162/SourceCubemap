@@ -9,6 +9,7 @@
 #include <spdlog/spdlog.h>
 #include <atomic>
 #include <exception>
+#include <bit>
 #include <sstream>
 #include <thread>
 #include <tuple>
@@ -154,6 +155,19 @@ private:
     float cosine = 1, sine = 0;
 };
 struct MaterialUv { UvTransform secondary, blend, base; };
+/// The set of map faces reachable from one point, addressed by the 16-bit indices of the leaf-face lump.
+class FaceSet {
+public:
+    void insert(uint32_t face) { words[face >> 6] |= uint64_t(1) << (face & 63); }
+    bool contains(size_t face) const { return face < 65536 && ((words[face >> 6] >> (face & 63)) & 1) != 0; }
+    size_t size() const {
+        size_t count = 0;
+        for (auto word : words) { count += static_cast<size_t>(std::popcount(word)); }
+        return count;
+    }
+private:
+    std::array<uint64_t, 1024> words{};
+};
 
 /// A texture whose asset is resolved and whose VTF decoding waits for the parallel pass at the end of the build.
 struct PendingTexture { uint32_t index; std::shared_ptr<const Asset> asset; bool srgb; int frame; };
@@ -415,9 +429,22 @@ public:
         }
         throw Error("Cycle in BSP nodes.");
     }
-    std::set<uint32_t> visibleFaces(glm::vec3 point) const {
+    struct LeafFaces { uint16_t first, count; };
+    void indexLeaves() {
+        Reader leaves(leafData, "leaves");
+        clusterLeaves.clear(); unclusteredLeaves.clear();
+        for (size_t i = 0; i < leafData.size() / 32; ++i) {
+            int cluster = leaves.at<int16_t>(i * 32 + 4);
+            LeafFaces range{leaves.at<uint16_t>(i * 32 + 20), leaves.at<uint16_t>(i * 32 + 22)};
+            if (!range.count) { continue; }
+            if (cluster < 0) { unclusteredLeaves.push_back(range); continue; }
+            if (size_t(cluster) >= clusterLeaves.size()) { clusterLeaves.resize(size_t(cluster) + 1); }
+            clusterLeaves[cluster].push_back(range);
+        }
+    }
+    FaceSet visibleFaces(glm::vec3 point) const {
         Reader leaves(leafData, "leaves"), vis(visData, "PVS"), faceRefs(leafFaceData, "leaf faces");
-        std::set<uint32_t> result;
+        FaceSet result;
         int leaf = leafAt(point);
         int cluster = leaves.at<int16_t>(size_t(leaf) * 32 + 4);
         std::vector<uint8_t> visible;
@@ -436,12 +463,12 @@ public:
                 }
             }
         }
-        for (size_t i = 0; i < leafData.size() / 32; ++i) {
-            int candidate = leaves.at<int16_t>(i * 32 + 4);
-            if (!visible.empty() && (candidate < 0 || size_t(candidate / 8) >= visible.size() || !(visible[candidate / 8] & (1 << (candidate % 8))))) { continue; }
-            auto first = leaves.at<uint16_t>(i * 32 + 20), count = leaves.at<uint16_t>(i * 32 + 22);
-            for (size_t j = 0; j < count; ++j) { result.insert(faceRefs.at<uint16_t>((first + j) * 2)); }
+        auto addFaces = [&](const LeafFaces& range) { for (size_t j = 0; j < range.count; ++j) { result.insert(faceRefs.at<uint16_t>((range.first + j) * 2)); } };
+        for (size_t candidate = 0; candidate < clusterLeaves.size(); ++candidate) {
+            if (!visible.empty() && (candidate / 8 >= visible.size() || !(visible[candidate / 8] & (1 << (candidate % 8))))) { continue; }
+            for (const auto& range : clusterLeaves[candidate]) { addFaces(range); }
         }
+        if (visible.empty()) { for (const auto& range : unclusteredLeaves) { addFaces(range); } }
         return result;
     }
     struct LightPlacement { std::array<uint32_t, 4> images{}; glm::vec2 offset{}, size{1}; };
@@ -501,8 +528,10 @@ public:
         return *transforms;
     }
     std::span<const std::byte> nodesData, planeData, leafData, leafFaceData, visData, lightData;
+    std::vector<std::vector<LeafFaces>> clusterLeaves;
+    std::vector<LeafFaces> unclusteredLeaves;
     std::vector<std::unique_ptr<MaterialUv>> uvTransforms;
-    std::set<uint32_t> skyFaces;
+    FaceSet skyFaces;
     int skyArea = -1;
     std::map<std::string, uint32_t> textureIds, materialIds;
     std::vector<PendingTexture> pendingTextures;
@@ -593,6 +622,7 @@ Scene Builder::build() {
         for (int i = 0; i < model.numFaces; ++i) { faceModels[model.firstFace + i] = static_cast<uint32_t>(m); }
     }
     nodesData = bsp.view(5); planeData = bsp.view(1); leafData = bsp.view(10); leafFaceData = bsp.view(16); visData = bsp.view(4);
+    indexLeaves();
     if (options.planarWater && bsp.lumps[36].length) {
         auto waterData = bsp.view(36); Reader water(waterData, "water volumes");
         require(bsp.lumps[36].version == 0 && waterData.size() % 12 == 0, "Unsupported water volume layout.");
@@ -631,9 +661,10 @@ Scene Builder::build() {
             scene.fogStart = parseFloat(entity["fogstart"].getValue()); scene.fogEnd = parseFloat(entity["fogend"].getValue());
         }
     }
-    std::vector<std::set<uint32_t>> probeFaces;
+    std::vector<FaceSet> probeFaces;
+    probeFaces.reserve(bsp.probes.size());
     for (const auto& probe : bsp.probes) { probeFaces.push_back(visibleFaces(glm::vec3(probe.origin))); }
-    std::set<uint32_t> referencedFaces;
+    FaceSet referencedFaces;
     Reader referenced(leafFaceData, "leaf face references");
     for (size_t i = 0; i < leafFaceData.size(); i += 2) { referencedFaces.insert(referenced.at<uint16_t>(i)); }
     std::map<std::vector<uint64_t>, uint32_t> visibilityIds;
