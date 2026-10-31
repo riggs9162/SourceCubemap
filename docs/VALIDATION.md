@@ -66,7 +66,7 @@ Real builds completed for vault_example (12 HDR probes plus default sky), gm_con
 
 Directional lightmap normalization reduced the near-prop HDR six-face RGB mean absolute errors from 11.79/10.94/10.36/9.39/7.16/16.59 to 4.23/5.69/3.50/3.77/4.88/5.29 on a 0-255 scale in the local matched comparison. Flatgrass full visual parity remains incomplete, particularly cloud projection and prop shading. Construct water and HL2 runtime appearance are not native-certified.
 
-The GUI was exercised through inspection, actual fixture generation, face previews, validation, and refusal to overwrite an existing output. Its final layout was visually inspected.
+The 0.6 window was driven through its empty, running, finished, failed, cancelled, and Options states with real `gm_construct` builds using the `hl2` profile. That covered the unfolded preview, the slider, the LDR and HDR switch, the replace question, closing during a run, automatic game and save paths, and saved options reaching the worker. The cube layout was checked against the asymmetric orientation fixture. A real file drag has not been performed, so dropping a map remains untested. Each layout was visually inspected.
 
 Version 0.3 measurements before the storage-limit change include a Flatgrass regeneration median of 5.295 seconds and p95 of 8.482 seconds over three runs. A user-started GMod session overlapped these measurements; they are shared-GPU observations, not isolated performance acceptance. Other reports include cold-cache writes and rejected oversized cache loads, so they must not be described as uniformly warm-cache results. Those reports are retained separately. The final storage limits were not re-benchmarked.
 

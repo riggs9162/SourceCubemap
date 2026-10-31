@@ -112,7 +112,7 @@ Strict mode stops on the first missing asset. Corrupt data stops generation in b
 
 ## Windows interface
 
-`sourcecubemap-gui.exe` invokes the same standalone pipeline as the command line, so keep it beside `sourcecubemap.exe` and the shaders. Cancellation waits for a safe boundary, and publication already in progress completes atomically. Job logs and reports are saved under `%LOCALAPPDATA%\SourceCubemap\jobs`. Settings persist between sessions.
+`sourcecubemap-gui.exe` invokes the same standalone pipeline as the command line, so keep it beside `sourcecubemap.exe` and the shaders. It builds with `--experimental --water planar` unless `Options...` turns those off, uses the `gmod` profile when the game folder is named `garrysmod` and `hl2` otherwise, and asks before replacing an existing output. Capture time, GPU selection, and cache settings are command-line only. Cancellation waits for a safe boundary, and publication already in progress completes atomically. Each job's report, previews, and log are saved under `%LOCALAPPDATA%\SourceCubemap\jobs`, and the log ends with every approximation the build made. Settings persist between sessions.
 
 ## Caches
 

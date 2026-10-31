@@ -24,9 +24,9 @@ Necesitas Windows 10 u 11 de 64 bits, un controlador gráfico con Vulkan 1.3 y u
 
 1. Descarga el zip más reciente desde la [página de versiones](https://github.com/riggs9162/SourceCubemap/releases) y descomprímelo donde quieras. Deja todos los archivos juntos.
 2. Ejecuta `sourcecubemap-gui.exe`.
-3. Elige tu `.bsp` y la carpeta de contenido de tu juego, por ejemplo `GarrysMod\garrysmod`.
-4. Activa `Allow experimental rendering`, que es necesario para la mayoría de los mapas personalizados.
-5. Pulsa `Generate cubemaps`, revisa las vistas previas de las caras y las advertencias, y luego valida el resultado con `Validate output`.
+3. Elige tu `.bsp` o arrástrala a la ventana. La carpeta del juego se rellena sola si el mapa está dentro de ella. Si no, elígela tú, por ejemplo `GarrysMod\garrysmod`.
+4. Pulsa `Generate cubemaps`.
+5. Revisa la vista previa y el resultado que aparece al lado. En `Options...` tienes la iluminación, la calidad, el agua y las carpetas de contenido adicionales.
 6. Copia el `.bsp` nuevo a la carpeta `maps` de tu juego. **No cambies el nombre de archivo generado**, porque los cubemaps están guardados justo bajo ese nombre.
 
 ## Línea de comandos
@@ -56,7 +56,7 @@ Ejecuta `sourcecubemap build --help` para ver la lista completa. `sourcecubemap 
 
 ## Cuando una compilación se detiene
 
-Por defecto, SourceCubemap se detiene si un mapa usa algo que no puede reproducir, y te dice qué es. Añade `--experimental` para continuar con lo más parecido que encuentre.
+Por defecto, SourceCubemap se detiene si un mapa usa algo que no puede reproducir, y te dice qué es. Añade `--experimental` para continuar con lo más parecido que encuentre. El programa de Windows ya lo hace por defecto, y `Options...` permite desactivarlo.
 
 Con `--experimental`, los materiales o texturas de color que falten se renderizan en gris plano, y los props cuyo modelo falte se omiten. Cada sustitución aparece en el informe, así que revísalo antes de fiarte del resultado. Si ves que faltan muchos assets, monta con `--mount` el contenido que necesita el mapa.
 

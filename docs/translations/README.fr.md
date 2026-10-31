@@ -24,9 +24,9 @@ Il vous faut Windows 10 ou 11 en 64 bits, un pilote graphique compatible Vulkan 
 
 1. Téléchargez le dernier zip depuis la [page des versions](https://github.com/riggs9162/SourceCubemap/releases) et décompressez-le où vous voulez. Gardez tous les fichiers ensemble.
 2. Lancez `sourcecubemap-gui.exe`.
-3. Choisissez votre `.bsp` et le dossier de contenu de votre jeu, par exemple `GarrysMod\garrysmod`.
-4. Cochez `Allow experimental rendering`, indispensable pour la plupart des maps custom.
-5. Cliquez sur `Generate cubemaps`, vérifiez les aperçus des faces et les avertissements, puis validez le résultat avec `Validate output`.
+3. Choisissez votre `.bsp` ou déposez-le sur la fenêtre. Le dossier du jeu se remplit tout seul si la map s'y trouve. Sinon, choisissez-le vous-même, par exemple `GarrysMod\garrysmod`.
+4. Cliquez sur `Generate cubemaps`.
+5. Vérifiez l'aperçu et le résultat affiché à côté. `Options...` regroupe l'éclairage, la qualité, l'eau et les dossiers de contenu supplémentaires.
 6. Copiez le nouveau `.bsp` dans le dossier `maps` de votre jeu. **Ne modifiez pas le nom de fichier généré**, car les cubemaps sont enregistrées précisément sous ce nom.
 
 ## Ligne de commande
@@ -56,7 +56,7 @@ Lancez `sourcecubemap build --help` pour afficher la liste complète. `sourcecub
 
 ## Quand une génération s'arrête
 
-Par défaut, SourceCubemap s'arrête si une map utilise quelque chose qu'il ne sait pas reproduire, et vous indique de quoi il s'agit. Ajoutez `--experimental` pour continuer plutôt avec l'équivalent le plus proche.
+Par défaut, SourceCubemap s'arrête si une map utilise quelque chose qu'il ne sait pas reproduire, et vous indique de quoi il s'agit. Ajoutez `--experimental` pour continuer plutôt avec l'équivalent le plus proche. Le programme Windows le fait par défaut, et `Options...` permet de le désactiver.
 
 Avec `--experimental`, un matériau ou une texture de couleur manquants apparaissent en gris uni, et un prop dont le modèle manque est ignoré. Chaque remplacement figure dans le rapport : vérifiez-le avant de vous fier au résultat. S'il manque beaucoup d'assets, montez le contenu dont la map a besoin avec `--mount`.
 

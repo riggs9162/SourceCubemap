@@ -24,9 +24,9 @@ Você precisa do Windows 10 ou 11 de 64 bits, de um driver de vídeo com Vulkan 
 
 1. Baixe o zip mais recente na [página de releases](https://github.com/riggs9162/SourceCubemap/releases) e extraia onde quiser. Mantenha os arquivos juntos.
 2. Execute `sourcecubemap-gui.exe`.
-3. Escolha seu `.bsp` e a pasta de conteúdo do seu jogo, como `GarrysMod\garrysmod`.
-4. Ative `Allow experimental rendering`, necessário para a maioria dos mapas personalizados.
-5. Clique em `Generate cubemaps`, confira as prévias das faces e os avisos e depois valide o resultado com `Validate output`.
+3. Escolha seu `.bsp` ou arraste-o para a janela. A pasta do jogo é preenchida sozinha quando o mapa está dentro dela. Caso contrário, escolha-a você mesmo, como `GarrysMod\garrysmod`.
+4. Clique em `Generate cubemaps`.
+5. Confira a prévia e o resultado ao lado. Em `Options...` ficam iluminação, qualidade, água e pastas de conteúdo extras.
 6. Copie o novo `.bsp` para a pasta `maps` do seu jogo. **Não altere o nome de arquivo gerado**, porque os cubemaps ficam armazenados exatamente com esse nome.
 
 ## Linha de comando
@@ -56,7 +56,7 @@ Execute `sourcecubemap build --help` para ver a lista completa. `sourcecubemap i
 
 ## Quando o build é interrompido
 
-Por padrão, o SourceCubemap interrompe o build se um mapa usar algo que ele não consegue reproduzir e informa o que foi. Adicione `--experimental` para continuar com a alternativa mais próxima.
+Por padrão, o SourceCubemap interrompe o build se um mapa usar algo que ele não consegue reproduzir e informa o que foi. Adicione `--experimental` para continuar com a alternativa mais próxima. O programa para Windows já faz isso por padrão, e `Options...` permite desativar.
 
 Com `--experimental`, materiais ou texturas de cor ausentes são renderizados em cinza liso, e props sem modelo ficam de fora. Cada substituição aparece no relatório, então confira antes de confiar no resultado. Se faltarem muitos assets, monte com `--mount` o conteúdo de que o mapa precisa.
 

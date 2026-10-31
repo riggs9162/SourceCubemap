@@ -24,9 +24,9 @@ Du brauchst 64-Bit-Windows 10 oder 11, einen Grafiktreiber mit Vulkan 1.3 und ei
 
 1. Lade die neueste ZIP-Datei von der [Releases-Seite](https://github.com/riggs9162/SourceCubemap/releases) herunter und entpacke sie an einen beliebigen Ort. Lass alle Dateien beieinander.
 2. Starte `sourcecubemap-gui.exe`.
-3. Wähle deine `.bsp` und den Content-Ordner deines Spiels aus, zum Beispiel `GarrysMod\garrysmod`.
-4. Aktiviere `Allow experimental rendering`. Das brauchen die meisten Custom-Maps.
-5. Klicke auf `Generate cubemaps`, sieh dir die Vorschauen der Cubemap-Seiten und die Warnungen an und prüfe das Ergebnis dann mit `Validate output`.
+3. Wähle deine `.bsp` aus oder ziehe sie ins Fenster. Der Spielordner wird automatisch eingetragen, wenn die Map darin liegt. Sonst wähle ihn selbst aus, zum Beispiel `GarrysMod\garrysmod`.
+4. Klicke auf `Generate cubemaps`.
+5. Sieh dir die Vorschau und das Ergebnis daneben an. Unter `Options...` findest du Beleuchtung, Qualität, Wasser und zusätzliche Content-Ordner.
 6. Kopiere die neue `.bsp` in den `maps`-Ordner deines Spiels. **Ändere den erzeugten Dateinamen nicht**, denn die Cubemaps sind unter genau diesem Namen gespeichert.
 
 ## Kommandozeile
@@ -56,7 +56,7 @@ Führe `sourcecubemap build --help` aus, um die vollständige Liste zu sehen. `s
 
 ## Wenn ein Build abbricht
 
-Standardmäßig bricht SourceCubemap ab, wenn eine Map etwas verwendet, das es nicht nachbilden kann, und sagt dir, was es war. Mit `--experimental` macht es stattdessen mit der nächstbesten Entsprechung weiter.
+Standardmäßig bricht SourceCubemap ab, wenn eine Map etwas verwendet, das es nicht nachbilden kann, und sagt dir, was es war. Mit `--experimental` macht es stattdessen mit der nächstbesten Entsprechung weiter. Das Windows-Programm macht das standardmäßig, und unter `Options...` lässt es sich abschalten.
 
 Mit `--experimental` wird ein fehlendes Material oder eine fehlende Farbtextur einfarbig grau gerendert, und ein Prop mit fehlendem Modell wird weggelassen. Jeder Ersatz steht im Bericht, also sieh ihn dir an, bevor du dem Ergebnis vertraust. Wenn viele Assets fehlen, binde den Content, den die Map braucht, mit `--mount` ein.
 

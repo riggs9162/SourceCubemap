@@ -22,9 +22,9 @@ You need 64-bit Windows 10 or 11, a graphics driver with Vulkan 1.3, and a Sourc
 
 1. Download the latest zip from the [releases page](https://github.com/riggs9162/SourceCubemap/releases) and unzip it anywhere. Keep the files together.
 2. Run `sourcecubemap-gui.exe`.
-3. Choose your `.bsp` and your game's content folder, such as `GarrysMod\garrysmod`.
-4. Turn on experimental rendering, which most custom maps need.
-5. Generate, check the face previews and warnings, then validate the result.
+3. Choose your `.bsp`, or drop it onto the window. The game folder fills in by itself when the map is inside it. Otherwise choose it, such as `GarrysMod\garrysmod`.
+4. Click `Generate cubemaps`.
+5. Check the preview and the result beside it. `Options...` has lighting, quality, water, and extra content folders.
 6. Copy the new `.bsp` into your game's `maps` folder. **Keep its generated filename**, because the cubemaps are stored under it.
 
 ## Command line
@@ -54,7 +54,7 @@ Run `sourcecubemap build --help` for the full list. `sourcecubemap inspect map.b
 
 ## When a build stops
 
-By default, SourceCubemap stops if a map uses something it can't reproduce, and tells you what it was. Add `--experimental` to continue with the closest match instead.
+By default, SourceCubemap stops if a map uses something it can't reproduce, and tells you what it was. Add `--experimental` to continue with the closest match instead. The Windows program does this by default, and `Options...` turns it off.
 
 With `--experimental`, a missing material or color texture renders flat gray and a prop with a missing model is left out. Every substitution is listed in the report, so check it before trusting the result. If you see many missing assets, mount the content the map needs with `--mount`.
 

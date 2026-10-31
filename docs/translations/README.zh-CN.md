@@ -24,9 +24,9 @@ SourceCubemap 会读取编译好的 `.bsp` 和你已安装的游戏内容，用�
 
 1. 从[发布页面](https://github.com/riggs9162/SourceCubemap/releases)下载最新的 zip 压缩包，解压到任意位置。请把所有文件放在一起。
 2. 运行 `sourcecubemap-gui.exe`。
-3. 选择你的 `.bsp` 和游戏内容文件夹，例如 `GarrysMod\garrysmod`。
-4. 勾选 `Allow experimental rendering`，大多数自定义地图都需要它。
-5. 点击 `Generate cubemaps`，检查各个面的预览和警告，然后用 `Validate output` 验证结果。
+3. 选择你的 `.bsp`，或把它拖到窗口里。如果地图就在游戏文件夹内，游戏文件夹会自动填好；否则请手动选择，例如 `GarrysMod\garrysmod`。
+4. 点击 `Generate cubemaps`。
+5. 查看预览和旁边的结果。`Options...` 里可以设置光照、画质、水面和额外的内容文件夹。
 6. 把新的 `.bsp` 复制到游戏的 `maps` 文件夹。**不要更改生成的文件名**，因为立方体贴图正是按这个文件名存储的。
 
 ## 命令行
@@ -56,7 +56,7 @@ sourcecubemap validate map_built.bsp
 
 ## 构建中断时
 
-默认情况下，如果地图用到了 SourceCubemap 无法还原的内容，它会停下来并告诉你具体是什么。加上 `--experimental` 就会改用最接近的替代效果继续运行。
+默认情况下，如果地图用到了 SourceCubemap 无法还原的内容，它会停下来并告诉你具体是什么。加上 `--experimental` 就会改用最接近的替代效果继续运行。 Windows 程序默认就会这样做，可以在 `Options...` 里关闭。
 
 使用 `--experimental` 时，缺失的材质或颜色纹理会渲染成纯灰色，缺失模型的道具会被跳过。每一处替换都会列在报告里，所以在信任结果之前请先检查报告。如果缺失的资源很多，请用 `--mount` 挂载地图需要的内容。
 
