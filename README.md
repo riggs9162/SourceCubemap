@@ -10,7 +10,7 @@ Dependencies are pinned through `vcpkg.json` and the SourcePP commit in CMake. N
 
 Runtime requirements are Windows 10/11 x64 and a Vulkan 1.3 driver supporting dynamic rendering, BC texture compression, and the required floating-point texture formats. Keep the `shaders` directory beside the executable. Build a portable distribution, including dependency notices, with `tools/package.ps1 -Destination C:\Packages\SourceCubemap` using a new destination directory.
 
-Prebuilt Windows packages are on the [releases page](https://github.com/riggs9162/SourceCubemap/releases). They are built on a development machine with `tools/release.ps1`, not by a hosted workflow.
+Prebuilt Windows packages are on the [releases page](https://github.com/riggs9162/SourceCubemap/releases). Every release carries its own build and is numbered `AA.BB.CC`, two digits in each part. They are built on a development machine with `tools/release.ps1`, not by a hosted workflow.
 
 ## Current commands
 
