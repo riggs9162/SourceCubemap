@@ -1,6 +1,7 @@
 param([ValidateSet('release', 'debug')][string]$Preset = 'release', [switch]$ConfigureOnly, [switch]$Fresh, [switch]$SkipConfigure, [string[]]$Target)
 $ErrorActionPreference = 'Stop'
 $taskVswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+$env:PATH = (Split-Path $taskVswhere -Parent) + ';' + $env:PATH
 $taskVs = & $taskVswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (!$taskVs) { throw 'Install the Visual Studio Desktop development with C++ workload.' }
 $taskDevCmd = Join-Path $taskVs 'Common7\Tools\VsDevCmd.bat'
