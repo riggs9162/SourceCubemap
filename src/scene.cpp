@@ -164,7 +164,7 @@ private:
 };
 
 /// A texture whose asset is resolved and whose VTF decoding waits for the parallel pass at the end of the build.
-struct PendingTexture { uint32_t index; std::shared_ptr<const Asset> asset; bool srgb; int frame; std::vector<std::string> notes; };
+struct PendingTexture { uint32_t index; std::shared_ptr<const Asset> asset; bool srgb; int frame; bool compressedHdr; std::vector<std::string> notes; };
 class Builder {
 public:
     Builder(const Bsp& input, Assets& resolver, const SceneOptions& settings) : bsp(input), assets(resolver), options(settings) {
@@ -200,7 +200,8 @@ public:
         require(options.experimental, "{} Use --experimental to accept this approximation.", message);
         warn(std::move(message));
     }
-    uint32_t texture(std::string name, bool srgb, std::string_view requester, int frame = -1) {
+    /// Queues a texture for decoding. Only compressedHdr textures have their integer pixels expanded as compressed HDR; every other texture keeps its authored values in HDR captures.
+    uint32_t texture(std::string name, bool srgb, std::string_view requester, int frame = -1, bool compressedHdr = false) {
         if (name.empty()) { return 0; }
         name = assetPath(name);
         if (name.starts_with("_rt_") || name.starts_with("materials/_rt_")) {
@@ -209,7 +210,7 @@ public:
         }
         if (!name.starts_with("materials/")) { name = "materials/" + name; }
         if (!name.ends_with(".vtf")) { name += ".vtf"; }
-        std::string key = name + (srgb ? ":srgb" : ":linear") + std::format(":{}", frame);
+        std::string key = name + (srgb ? ":srgb" : ":linear") + (compressedHdr ? ":hdr" : "") + std::format(":{}", frame);
         if (textureIds.contains(key)) { return textureIds.at(key); }
         auto asset = options.experimental ? assets.find(name) : assets.get(name, requester);
         if (!asset) {
@@ -220,7 +221,7 @@ public:
         }
         uint32_t index = static_cast<uint32_t>(scene.images.size());
         scene.images.push_back({name});
-        pendingTextures.push_back({index, std::move(asset), srgb, frame});
+        pendingTextures.push_back({index, std::move(asset), srgb, frame, compressedHdr});
         textureIds.emplace(key, index);
         return index;
     }
@@ -236,7 +237,7 @@ public:
         const auto& name = image.name;
         const auto& bytes = pending.asset->bytes;
         validateVtf(bytes, name);
-        vtfpp::VTF vtf(bytes, false, options.hdr);
+        vtfpp::VTF vtf(bytes, false, pending.compressedHdr);
         require(static_cast<bool>(vtf), "Invalid texture {}.", name);
         int requestedFrame = pending.frame;
         if (vtf.getFrameCount() != 1 && requestedFrame < 0) { pending.notes.push_back(std::format("Animated VTF '{}' uses its first frame.", name)); }
@@ -445,8 +446,9 @@ public:
         std::replace(environment.begin(), environment.end(), '\\', '/');
         if (!environment.empty() && environment != "env_cubemap" && !environment.starts_with("maps/") && !environment.starts_with("materials/maps/")) { approximate(std::format("Static environment texture in '{}' is not rendered.", name)); }
         auto base = definition.value(options.hdr ? "$hdrbasetexture" : "$basetexture");
+        bool hdrBase = options.hdr && !base.empty();
         if (base.empty()) { base = definition.value("$basetexture"); }
-        material.base = texture(base, true, name, baseFrame);
+        material.base = texture(base, true, name, baseFrame, hdrBase);
         material.second = texture(definition.value(shader == "unlittwotexture" ? "$texture2" : "$basetexture2"), true, name);
         if (!definition.value("$blendmodulatetexture").empty()) {
             if (shader == "worldvertextransition" && !definition.flag("$maskedblending")) { if (auto mask = texture(definition.value("$blendmodulatetexture"), false, name)) { material.blendMask = mask; material.flags |= BlendModulation; } }

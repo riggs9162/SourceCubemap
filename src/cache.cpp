@@ -8,7 +8,7 @@
 
 namespace scm {
 namespace {
-constexpr uint32_t cacheVersion = 27;
+constexpr uint32_t cacheVersion = 28;
 uint64_t cacheBudget = 2ull << 30;
 constexpr uint64_t cacheReserve = 8ull << 30, maximumSceneCache = 512ull << 20, maximumQueuedBytes = 512ull << 20;
 std::mutex cacheUsageGuard;
