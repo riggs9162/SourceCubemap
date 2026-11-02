@@ -26,6 +26,10 @@ bool spriteEntity(std::string_view type) { return type == "env_sprite" || type =
 template<class V> glm::vec3 vec3(const V& value) { return {value[0], value[1], value[2]}; }
 template<class V> glm::vec4 vec4(const V& value) { return {value[0], value[1], value[2], value[3]}; }
 float linearColor(float value) { return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f); }
+/// Corrects sourcepp's BGRA8888 HDR output, which scales by the alpha byte rather than by alpha in the 0-1 range.
+void normalizeCompressedAlpha(std::span<glm::vec4> pixels) {
+    for (auto& pixel : pixels) { pixel.r /= 255; pixel.g /= 255; pixel.b /= 255; }
+}
 /// Linearizes sRGB pixels, rejects nonfinite values, and stores half floats unless a value needs full precision.
 void storeFloatPixels(Image& image, std::vector<glm::vec4> pixels) {
     bool halfPrecision = true;
@@ -247,7 +251,7 @@ public:
         }
         if (vtf.getFaceCount() != 1 || vtf.getDepth() != 1) { pending.notes.push_back(std::format("Non-2D texture '{}' uses its first face.", name)); }
         auto format = vtf.getFormat();
-        bool floating = format == vtfpp::ImageFormat::RGBA16161616F || format == vtfpp::ImageFormat::RGB323232F || format == vtfpp::ImageFormat::RGBA32323232F;
+        bool floating = format == vtfpp::ImageFormat::RGBA16161616F || format == vtfpp::ImageFormat::RGB323232F || format == vtfpp::ImageFormat::RGBA32323232F || vtfpp::ImageFormatDetails::compressedHDR(format);
         image.width = vtf.getWidth(); image.height = vtf.getHeight(); image.srgb = pending.srgb && !floating;
         image.mipCount = vtf.getMipCount();
         image.clamp = (vtf.getFlags() & (vtfpp::VTF::FLAG_V0_CLAMP_S | vtfpp::VTF::FLAG_V0_CLAMP_T)) != 0;
@@ -288,6 +292,7 @@ public:
             auto offset = pixels.size(); pixels.resize(offset + count);
             std::memcpy(pixels.data() + offset, converted.data(), converted.size());
         }
+        if (format == vtfpp::ImageFormat::SOURCEPP_BGRA8888_HDR) { normalizeCompressedAlpha(pixels); }
         storeFloatPixels(image, std::move(pixels));
     }
     void finishImages() {
