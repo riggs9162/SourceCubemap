@@ -92,7 +92,7 @@ void validateVtf(std::span<const std::byte> data, std::string_view name) {
 }
 std::string Probe::name() const { return std::format("c{}_{}_{}", origin.x, origin.y, origin.z); }
 
-/// Opens a map and loads its embedded files. Packing tools can leave one file in the ZIP twice, often under a different case or slash, so a later entry replaces an earlier one, as in any updated ZIP.
+/// Opens a map and loads its embedded files. Packing tools can leave one file in the ZIP twice, often under a different case or slash, so a later entry replaces an earlier one, as in any updated ZIP. VRAD++ stores identical lumps once when compiling with -both, so two lumps may name exactly the same range, while a partial overlap stays an error.
 Bsp::Bsp(const fs::path& filename) : path(fs::absolute(filename)), bytes(readFile(path)) {
     auto label = path.string();
     Reader header(bytes, label);
@@ -112,6 +112,7 @@ Bsp::Bsp(const fs::path& filename) : path(fs::absolute(filename)), bytes(readFil
         intervals.emplace_back(item.offset, uint64_t(item.offset) + item.length);
     }
     std::sort(intervals.begin(), intervals.end());
+    intervals.erase(std::unique(intervals.begin(), intervals.end()), intervals.end());
     for (size_t i = 1; i < intervals.size(); ++i) { require(intervals[i].first >= intervals[i - 1].second, "BSP lumps overlap."); }
     if (lumps[35].length) {
         require(lumps[35].uncompressed == 0, "An outer-compressed game-lump directory is not supported.");
